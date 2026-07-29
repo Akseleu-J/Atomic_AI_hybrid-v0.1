@@ -19,11 +19,6 @@ from utils import path_to_str
 def make_tpu_mesh():
     devices = jax.devices()
     n = len(devices)
-    # FIX: was hard-coded to (8,), assuming a TPU v5e-8 pod. That crashes with
-    # "Number of devices N must equal the product of mesh_shape (8,)" on ANY other
-    # device count -- including a 1-device CPU smoke test, which is exactly what
-    # produced this error. Always build the mesh to match whatever's actually available:
-    # 1 device for a CPU sanity check, 8 for the real TPU v5e-8 run, etc.
     mesh_devices = mesh_utils.create_device_mesh((n,), devices)
     return Mesh(mesh_devices, axis_names=("tpu_nodes",))
 
@@ -32,7 +27,6 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     mesh = make_tpu_mesh()
     n_devices = mesh.shape["tpu_nodes"]
 
-    # Fail fast with a clear message instead of a deep XLA ValueError three frames down.
     if batch_size % n_devices != 0:
         raise ValueError(
             f"batch_size={batch_size} must be divisible by the number of devices "
@@ -57,15 +51,21 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     data_sharding = NamedSharding(mesh, P("tpu_nodes", None))
 
     def _get_param_sharding(path, param):
+        # Если только одно устройство (например, CPU) – шардирование не нужно
+        if n_devices == 1:
+            return NamedSharding(mesh, P(None))
+        
         path_str = path_to_str(path)
-        if "experts_block" in path_str and experts_divide_evenly:
+        # Шардируем только 3D‑тензоры экспертов (num_experts, in, out)
+        if "experts_block" in path_str and experts_divide_evenly and param.ndim == 3:
             return NamedSharding(mesh, P("tpu_nodes", None, None))
+        # Все остальное реплицируем
         return NamedSharding(mesh, P(None))
 
     param_sharding = jax.tree_util.tree_map_with_path(_get_param_sharding, abstract_params)
 
-    # Optimizer state for expert weights is kept on the same chips as the expert weights
-    # themselves, to avoid unnecessary resharding/communication every step.
+    # ... остальной код без изменений
+
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
     opt_state_sharding = jax.tree_util.tree_map_with_path(_get_param_sharding, opt_state_abstract)
 
@@ -94,7 +94,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             param_sharding,
             opt_state_sharding,
             NamedSharding(mesh, P(None)),
-            NamedSharding(mesh, P(None)),  # aux_info (ce_loss/aux_loss/z_loss/expert_utilization)
+            NamedSharding(mesh, P(None)),
         ),
     )
     compiled_val = jax.jit(
@@ -106,11 +106,6 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
 
 def resolve_source_files(output_dir, prefix):
-    """Finds one dataset-prep run's output files regardless of whether it finished as
-    one merged file (prefix_input_ids.npy / prefix_labels.npy) or was left as
-    individual numbered shards (prefix_shard_ids_N.npy / prefix_shard_lbls_N.npy) --
-    e.g. because the final merge ran out of disk on a very large run, the way the
-    reasoning set did before it got combined by hand. Works with either state."""
     merged_ids = os.path.join(output_dir, f"{prefix}_input_ids.npy")
     merged_lbls = os.path.join(output_dir, f"{prefix}_labels.npy")
     if os.path.exists(merged_ids) and os.path.exists(merged_lbls):
@@ -134,9 +129,6 @@ def resolve_source_files(output_dir, prefix):
 
 
 def build_manifest(file_pairs):
-    """file_pairs: list of (ids_path, labels_path), from one or several dataset-prep
-    runs. Returns [(ids_path, labels_path, n_rows), ...] -- just reads each .npy
-    header via mmap (cheap), never loads the actual token data into RAM."""
     manifest = []
     total = 0
     for ids_path, lbls_path in file_pairs:
@@ -149,14 +141,6 @@ def build_manifest(file_pairs):
 
 
 def dataloader_multi_source(file_pairs, batch_size, data_sharding, val_split=0.05):
-    """Combines multiple (ids_path, labels_path) sources -- e.g. the separate agentic /
-    coding / reasoning dataset-prep outputs -- into ONE training pool, WITHOUT
-    physically concatenating them into a single file. That concatenation is exactly
-    what ran the reasoning-set prep out of disk before (2.62B tokens -> ~21GB for one
-    contiguous array). Instead this builds a global block index -> (source file, local
-    row) lookup and reads each batch's rows directly from the relevant memmapped .npy
-    files, so combining three (or any number of) large sources costs no extra disk or
-    RAM beyond what's already on disk."""
     manifest = build_manifest(file_pairs)
     sizes = np.array([n for _, _, n in manifest])
     offsets = np.concatenate([[0], np.cumsum(sizes)])
@@ -216,38 +200,51 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, val_split=0.0
     )
 
 
+# ============================================================
+# НОВАЯ main_execution с явными путями и ранней остановкой по шагам
+# ============================================================
 def main_execution():
     config = ModelConfig()
 
-    # Точки монтирования трёх отдельно подготовленных датасетов -- ПОПРАВЬТЕ пути под
-    # реальные имена ваших Kaggle Datasets (Add Data -> выбираете каждый из трёх выводов
-    # notebook'ов подготовки, Kaggle монтирует их под /kaggle/input/<slug>/...).
-    # resolve_source_files сам разберётся, попал ли каждый датасет в один объединённый
-    # файл или остался шардами -- ничего вручную склеивать не нужно.
-    DATASET_SOURCES = [
-        ("/kaggle/input/agentic-dataset/processed_jax_data", "agentic"),
-        ("/kaggle/input/coding-dataset/processed_jax_data", "coding"),
-        ("/kaggle/input/reasoning-dataset/processed_jax_data", "reasoning"),
+    # ===== ЯВНЫЕ ПУТИ К ТВОИМ ДАТАСЕТАМ (все три) =====
+    file_pairs = [
+        (
+            "/kaggle/input/datasets/akseleu1j/agentic-datasetids-and-labels/processed_jax_data/agentic_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/agentic-datasetids-and-labels/processed_jax_data/agentic_labels.npy"
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/coding-ids/coding_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/coding-labels/coding_labels.npy"
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/reasoning-ids/reasoning_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/reasoning-labels/reasoning_labels.npy"
+        ),
     ]
-    file_pairs = []
-    for output_dir, prefix in DATASET_SOURCES:
-        file_pairs.extend(resolve_source_files(output_dir, prefix))
 
-    manifest_preview = build_manifest(file_pairs)
-    total_blocks = sum(n for _, _, n in manifest_preview)
+    # Проверка существования файлов
+    for ids_path, lbls_path in file_pairs:
+        if not os.path.exists(ids_path):
+            raise FileNotFoundError(f"❌ Не найден файл: {ids_path}")
+        if not os.path.exists(lbls_path):
+            raise FileNotFoundError(f"❌ Не найден файл: {lbls_path}")
+    print("✅ Все файлы найдены!")
 
-    checkpoint_dir = "/kaggle/working/orbax_checkpoints"
-    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
-    mngr = ocp.CheckpointManager(checkpoint_dir, ocp.StandardCheckpointer(), options)
-    best_checkpoint_dir = "/kaggle/working/orbax_checkpoints_best"
-    best_options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
-    best_mngr = ocp.CheckpointManager(best_checkpoint_dir, ocp.StandardCheckpointer(), best_options)
+    # Собираем манифест (только заголовки, без загрузки данных)
+    manifest = build_manifest(file_pairs)
+    total_blocks = sum(n for _, _, n in manifest)
+    total_tokens = total_blocks * 8192
+    print(f"📊 Всего блоков: {total_blocks:,} (≈ {total_tokens / 1e9:.2f} млрд токенов)")
 
-    batch_size = 32
-    epochs = 6
-    # Early stopping: if val loss doesn't improve for this many epochs in a row, stop
-    # early instead of continuing to fit noise once the model has stopped generalizing.
-    early_stop_patience = 2
+    # ===== Параметры обучения =====
+    batch_size = 16                # безопасно для TPU v5e-8 (делится на 8)
+    epochs = 3                     # максимум 3 эпохи, ранняя остановка сократит при необходимости
+    early_stop_patience = 2        # по эпохам
+
+    # ===== Ранняя остановка по шагам =====
+    eval_every_steps = 1000
+    eval_patience = 3              # сколько проверок подряд без улучшения -> остановка
+    eval_batches = 50              # число батчей для быстрой валидации
 
     train_steps_per_epoch = (int(total_blocks * 0.95)) // batch_size
     total_train_steps = train_steps_per_epoch * epochs
@@ -270,9 +267,20 @@ def main_execution():
         file_pairs, batch_size, data_sharding
     )
 
+    # Папки для чекпоинтов
+    checkpoint_dir = "/kaggle/working/orbax_checkpoints"
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+    mngr = ocp.CheckpointManager(checkpoint_dir, ocp.StandardCheckpointer(), options)
+    best_checkpoint_dir = "/kaggle/working/orbax_checkpoints_best"
+    best_options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
+    best_mngr = ocp.CheckpointManager(best_checkpoint_dir, ocp.StandardCheckpointer(), best_options)
+
+    # Переменные для ранней остановки
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     global_step = 0
+    best_eval_loss = float("inf")
+    eval_no_improve_count = 0
 
     for epoch in range(epochs):
         with mesh:
@@ -283,6 +291,7 @@ def main_execution():
                 params, opt_state, train_loss, aux_info = compiled_train(params, opt_state, batch, step_rng)
                 global_step += 1
 
+                # Логирование каждые 10 шагов
                 if step % 10 == 0:
                     print(
                         f"Epoch: {epoch} | Step: {step}/{train_steps} | "
@@ -291,13 +300,8 @@ def main_execution():
                         f"aux={jax.device_get(aux_info['aux_loss']):.4f} "
                         f"z={jax.device_get(aux_info['z_loss']):.5f})"
                     )
-                    # Anti-routing-collapse monitoring: if any expert's utilization share
-                    # spikes far above 1/num_experts (or drops near 0) across layers, the
-                    # router is collapsing -- this shows up here well before val loss
-                    # visibly suffers. A perfectly balanced router would print ~1/num_experts
-                    # for every entry.
                     if aux_info["expert_utilization"] is not None:
-                        util = jax.device_get(aux_info["expert_utilization"])  # (num_layers, num_experts)
+                        util = jax.device_get(aux_info["expert_utilization"])
                         util_std_per_layer = util.std(axis=-1)
                         worst_layer = int(util_std_per_layer.argmax())
                         print(
@@ -305,6 +309,39 @@ def main_execution():
                             f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts}"
                         )
 
+                # Ранняя остановка по шагам (каждые eval_every_steps)
+                if global_step % eval_every_steps == 0:
+                    val_stream = val_factory()
+                    eval_loss = 0.0
+                    for _ in range(eval_batches):
+                        try:
+                            eval_batch = next(val_stream)
+                            eval_loss += jax.device_get(compiled_val(params, eval_batch))
+                        except StopIteration:
+                            break
+                    eval_loss /= eval_batches
+                    print(f"[EVAL] Step {global_step}: val loss = {eval_loss:.4f}")
+
+                    if eval_loss < best_eval_loss:
+                        best_eval_loss = eval_loss
+                        eval_no_improve_count = 0
+                    else:
+                        eval_no_improve_count += 1
+                        if eval_no_improve_count >= eval_patience:
+                            print(
+                                f"[EARLY STOP] Валидационный лосс не улучшался {eval_patience} проверок подряд. "
+                                "Останавливаю обучение."
+                            )
+                            break
+                if eval_no_improve_count >= eval_patience:
+                    break  # выход из цикла шагов
+
+            # Если ранняя остановка сработала, прерываем эпоху
+            if eval_no_improve_count >= eval_patience:
+                print("[EARLY STOP] Прерывание обучения по шаговой валидации.")
+                break
+
+            # Конец эпохи: полная валидация
             print(f"--- Эпоха {epoch} завершена. Запуск распределенной кросс-валидации ---")
             val_stream = val_factory()
             total_val_loss = 0.0
@@ -314,9 +351,11 @@ def main_execution():
             mean_val_loss = total_val_loss / val_steps
             print(f"===> Эпоха: {epoch} | ИТОГОВЫЙ СРЕДНИЙ VALIDATION LOSS: {mean_val_loss:.4f} <===")
 
+            # Сохраняем чекпоинт
             mngr.save(global_step, args=ocp.args.StandardSave(params))
             print(f"[ORBAX] Чекпоинт для шага {global_step} успешно зафиксирован.")
 
+            # Ранняя остановка по эпохам
             if mean_val_loss < best_val_loss:
                 best_val_loss = mean_val_loss
                 epochs_without_improvement = 0
@@ -334,6 +373,8 @@ def main_execution():
                         f"{early_stop_patience} эпохи подряд. Лучшие веса лежат в {best_checkpoint_dir}."
                     )
                     break
+
+    print("✅ Обучение завершено!")
 
 
 if __name__ == "__main__":
