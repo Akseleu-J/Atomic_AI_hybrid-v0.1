@@ -65,9 +65,7 @@ class MLAJ(nn.Module):
 
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
         Q = Q.reshape(b, l, n_heads, d_head)
-        # Временно переставляем для RoPE: (b, n_heads, l, d_head)
         Q_rope = apply_rope(Q.transpose(0, 2, 1, 3), cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        # Возвращаем в (b, l, n_heads, d_head)
         Q_rope = Q_rope.transpose(0, 2, 1, 3)
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
@@ -78,14 +76,14 @@ class MLAJ(nn.Module):
         K_rope = apply_rope(K.transpose(0, 2, 1, 3), cos[None, None, :, :d_head], sin[None, None, :, :d_head])
         K_rope = K_rope.transpose(0, 2, 1, 3)
 
-        V = V.reshape(b, l, n_heads, d_head)   # V не требует RoPE
+        V = V.reshape(b, l, n_heads, d_head)
 
         from ejkernel.modules import FlashMLA
 
-        flash_mla = FlashMLA(
-            causal=True,
-            dropout_rate=self.cfg.dropout_rate if not deterministic else 0.0,
-        )
+        # Создаём экземпляр без аргументов (используем значения по умолчанию)
+        flash_mla = FlashMLA()
+
+        # Вызываем с маской и dropout_rng
         out = flash_mla(
             Q_rope, K_rope, V,
             mask=causal_mask,
