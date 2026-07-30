@@ -59,7 +59,7 @@ class MLAJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True):
+    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
@@ -77,12 +77,13 @@ class MLAJ(nn.Module):
         V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
         from flax.linen import dot_product_attention
-
+        dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else None
         out = dot_product_attention(
             Q_rope, K_rope, V,
-            mask=causal_mask,                      # (1, 1, l, l)
+            mask=causal_mask,
             deterministic=deterministic,
             dropout_rate=self.cfg.dropout_rate,
+            dropout_rng=dropout_rng,
         )  # (b, n_heads, l, d_head)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
