@@ -52,48 +52,50 @@ def apply_rope(x, cos, sin):
 # ==========================================
 # Multi-head Latent Attention
 # ==========================================
-from flax.linen import dot_product_attention
-
+from ejkernel.modules import FlashMLA
 
 class MLAJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
     def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
+        # FlashMLA ожидает входы в формате (batch, seq_len, heads, head_dim)
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
 
+        # Стандартные проекции Q, K, V
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)   # (b, n_heads, l, d_head)
-        Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        # Reshape для FlashMLA: (batch, seq_len, heads, head_dim)
+        Q = Q.reshape(b, l, n_heads, d_head)
+        Q = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
         K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up")(kv_latent)
         V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up")(kv_latent)
 
-        K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
-        K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
+        K = K.reshape(b, l, n_heads, d_head)
+        K = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        V = V.reshape(b, l, n_heads, d_head)
 
-        # scores: (b, n_heads, l, l)
-        scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) / jnp.sqrt(d_head)
-        # causal_mask имеет форму (1, 1, l, l) – broadcast к (b, n_heads, l, l)
-        scores = jnp.where(causal_mask, scores, -1e9)
-        attn = jax.nn.softmax(scores, axis=-1)
+        # Используем FlashMLA
+        # Он сам обрабатывает causal mask и dropout (если передать rng)
+        flash_mla = FlashMLA(
+            causal=True,
+            dropout_rate=self.cfg.dropout_rate if not deterministic else 0.0,
+        )
 
-        # Dropout вручную
-        if not deterministic:
-            if rngs is not None and 'dropout' in rngs:
-                dropout_rng = rngs['dropout']
-            else:
-                dropout_rng = self.make_rng('dropout')
-            keep_prob = 1.0 - self.cfg.dropout_rate
-            mask_drop = jax.random.bernoulli(dropout_rng, keep_prob, attn.shape)
-            attn = attn * mask_drop / keep_prob
+        # FlashMLA ожидает маску в формате (batch, 1, 1, seq_len) или (batch, 1, seq_len, seq_len)
+        # У нас causal_mask уже (1, 1, l, l) – broadcast будет работать
+        out = flash_mla(
+            Q, K, V,
+            mask=causal_mask,
+            rng=rngs['dropout'] if rngs is not None and 'dropout' in rngs else None,
+            deterministic=deterministic,
+        )  # (batch, seq_len, heads, head_dim)
 
-        out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
-        out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
+        # Возвращаем к исходному формату
+        out = out.reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
 # ==========================================
 # Mamba-2 (SSM)
