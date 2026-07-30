@@ -332,8 +332,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x)
         gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
-        mla_out = MLAJ(cfg=self.cfg, name="mla")(norm_1, causal_mask, cos, sin, deterministic=deterministic)
-
+        mla_out = MLAJ(cfg=self.cfg, name="mla")(norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs)
         alpha = jax.nn.softmax(self.param("alpha", nn.initializers.zeros, (3,)))
         current_delta = jnp.einsum("i,ibld->bld", alpha, jnp.stack([gdn_out, mamba_out, mla_out], axis=0))
 
