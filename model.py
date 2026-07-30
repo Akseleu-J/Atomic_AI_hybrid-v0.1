@@ -244,6 +244,9 @@ class GatedDeltaNet2J(nn.Module):
 # ==========================================
 # MoE (capacity-based sparse dispatch, JIT-safe: no dynamic-shape boolean indexing)
 # ==========================================
+# ==========================================
+# MoE (capacity-based sparse dispatch, JIT-safe: no dynamic-shape boolean indexing)
+# ==========================================
 class ExpertPack(nn.Module):
     cfg: ModelConfig
 
@@ -259,7 +262,7 @@ class MoEJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-     def __call__(self, x, deterministic: bool = True, rngs=None):
+    def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
         num_tokens = flat_x.shape[0]
@@ -267,11 +270,6 @@ class MoEJ(nn.Module):
 
         router_logits = nn.Dense(E, use_bias=False, name="router")(flat_x)
 
-        # Anti-routing-collapse measure #1: jitter noise on the router logits, training
-        # only (Switch Transformer / ST-MoE). Without this, a router can lock onto a
-        # small subset of experts very early (a few experts get slightly ahead in the
-        # random init, get more gradient signal, and the gap self-reinforces) and never
-        # recover, wasting the rest of the experts' capacity for the whole run.
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout")
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
@@ -279,7 +277,7 @@ class MoEJ(nn.Module):
             )
 
         router_probs = jax.nn.softmax(router_logits, axis=-1)
-        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K)  # (T, K)
+        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K)
 
         mask = jnp.zeros_like(router_probs)
         t_idx = jnp.arange(num_tokens)[:, None]
@@ -291,40 +289,25 @@ class MoEJ(nn.Module):
         expert_counts = jnp.mean(mask, axis=0)
         self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * expert_counts))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(jax.scipy.special.logsumexp(router_logits, axis=-1))))
-        # Anti-routing-collapse measure #2: log the actual per-expert utilization (not
-        # just the aux-loss scalar) so a collapse is directly OBSERVABLE in training logs
-        # -- e.g. print jnp.std(sowed["losses"]["expert_utilization"]) per epoch; a
-        # healthy router keeps this low and roughly flat across experts, a collapsing one
-        # shows a growing spike on one or two experts well before val loss visibly suffers.
         self.sow("losses", "expert_utilization", expert_counts)
 
-        # ---- Capacity-based sparse dispatch (GShard / Switch Transformer style) ----
-        # All shapes below are STATIC (known at trace time), so this is safe under jax.jit,
-        # unlike boolean-mask indexing on a data-dependent number of tokens.
         capacity = max(1, int(self.cfg.moe_capacity_factor * num_tokens * K / E))
 
-        flat_expert_idx = top_k_idx.reshape(-1)                        # (T*K,)
-        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K)          # (T*K,)
-        flat_gate = mask[flat_token_idx, flat_expert_idx]                # (T*K,)
+        flat_expert_idx = top_k_idx.reshape(-1)
+        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K)
+        flat_gate = mask[flat_token_idx, flat_expert_idx]
 
-        one_hot_expert = jax.nn.one_hot(flat_expert_idx, E)              # (T*K, E)
-        # 0-indexed slot of this assignment within its expert's queue
+        one_hot_expert = jax.nn.one_hot(flat_expert_idx, E)
         position_in_expert = jnp.sum(
             (jnp.cumsum(one_hot_expert, axis=0) - 1) * one_hot_expert, axis=-1
-        ).astype(jnp.int32)                                              # (T*K,)
+        ).astype(jnp.int32)
 
-        # assignments beyond `capacity` silently overflow (dropped) -- standard MoE behaviour
-        dispatch_pos = jax.nn.one_hot(position_in_expert, capacity)      # (T*K, C)
-        dispatch_tensor = one_hot_expert[:, :, None] * dispatch_pos[:, None, :]  # (T*K, E, C)
+        dispatch_pos = jax.nn.one_hot(position_in_expert, capacity)
+        dispatch_tensor = one_hot_expert[:, :, None] * dispatch_pos[:, None, :]
 
-        assignment_x = flat_x[flat_token_idx]                            # static gather, JIT-safe
-        expert_inputs = jnp.einsum("nec,nd->ecd", dispatch_tensor, assignment_x)  # (E, C, D)
+        assignment_x = flat_x[flat_token_idx]
+        expert_inputs = jnp.einsum("nec,nd->ecd", dispatch_tensor, assignment_x)
 
-        # FIX: nn.vmap silently drops kwargs ("kwargs are not supported in vmap" warning),
-        # so `deterministic=deterministic` here was being ignored -- ExpertPack always fell
-        # back to its default deterministic=True, meaning dropout inside every expert never
-        # actually activated during training. Pass it positionally instead, with in_axes=None
-        # so this non-array flag is broadcast to every expert rather than vmapped over.
         run_experts = nn.vmap(
             ExpertPack,
             variable_axes={"params": 0},
@@ -332,14 +315,13 @@ class MoEJ(nn.Module):
             in_axes=(0, None),
             out_axes=0,
         )(cfg=self.cfg, name="experts_block")
-        expert_outputs = run_experts(expert_inputs, deterministic)  # (E, C, D)
+        expert_outputs = run_experts(expert_inputs, deterministic)
 
         combine_tensor = dispatch_tensor * flat_gate[:, None, None]
-        per_assignment_out = jnp.einsum("nec,ecd->nd", combine_tensor, expert_outputs)  # (T*K, D)
+        per_assignment_out = jnp.einsum("nec,ecd->nd", combine_tensor, expert_outputs)
 
         flat_outputs = jnp.zeros_like(flat_x).at[flat_token_idx].add(per_assignment_out)
         return flat_outputs.reshape(b, l, d)
-
 
 # ==========================================
 # Delta-Attention Residual Block
