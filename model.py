@@ -1,8 +1,15 @@
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax import struct
 from typing import List
+
+from jax.experimental.pallas.ops.tpu.flash_attention import (
+    flash_attention as pallas_flash_attention,
+    BlockSizes as FlashBlockSizes,
+)
 
 
 @struct.dataclass
@@ -25,6 +32,24 @@ class ModelConfig:
     tie_embeddings: bool = True
     label_smoothing: float = 0.05
     router_noise_std: float = 0.3
+    # ЧЕМ ВЫЗВАН OOM НА MLA: наивная attention материализует score-матрицу формы
+    # (b, n_heads, l, l). При l=8192, n_heads=16 это b*16*8192*8192 элементов --
+    # ~2.15 ГБ на bf16 ТОЛЬКО под сам score-тензор, ОДИН слой, при b=1 (локальный
+    # батч на чип после data-parallel шардирования на 8 TPU). Softmax, causal
+    # mask (jnp.where создаёт новый массив) и dropout-маска добавляют ещё 2-3
+    # временных тензора того же размера поверх -- итого 6-9 ГБ пиковой памяти на
+    # ОДИН слой ещё до учёта весов/оптимизатора. remat не спасает: он убирает
+    # накопление активаций МЕЖДУ слоями, но не уменьшает размер активации ВНУТРИ
+    # одного слоя. Дальше N^2 не убрать без смены алгоритма -- отсюда Pallas
+    # Flash Attention: kernel считает attention блоками (block_q x block_k) и
+    # никогда не материализует полную (l, l) матрицу в HBM.
+    use_flash_attention: bool = True
+    # Размер чанка для chunked-scan в GatedDeltaNet2 (см. комментарий в
+    # GatedDeltaNet2J). Должен делить seq_len нацело. 8192 делится на 512, 1024,
+    # 2048 и т.д. -- выбирай по тому, сколько памяти готов отдать под один чанк
+    # (chunk_size * n_heads * d_head^2 * 2 байта на M/C/P каждый) против числа
+    # последовательных шагов scan (l / chunk_size).
+    deltanet_chunk_size: int = 1024
 
 
 # ==========================================
@@ -52,6 +77,16 @@ def apply_rope(x, cos, sin):
 # ==========================================
 # Multi-head Latent Attention
 # ==========================================
+#
+# ВАЖНО про dropout: Pallas flash_attention НЕ поддерживает dropout внутри
+# кернела (нет такого параметра в его сигнатуре -- проверено по исходнику
+# jax/experimental/pallas/ops/tpu/flash_attention.py). Поэтому dropout на
+# attention-весах убран из flash-пути; регуляризация остаётся за счёт dropout
+# в FFN/MoE (ExpertPack) и label smoothing -- это стандартная практика (сам
+# GPT-3/LLaMA-класс моделей обычно не использует attention dropout при
+# длинных контекстах именно по этой причине). Наивный путь (deterministic
+# отладка на CPU/маленьких seq_len, где Pallas TPU-кернел недоступен) дропаут
+# сохраняет.
 class MLAJ(nn.Module):
     cfg: ModelConfig
 
@@ -62,7 +97,7 @@ class MLAJ(nn.Module):
         d_head = self.cfg.d_model // n_heads
 
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)   # (b, n_heads, l, d_head)
+        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)  # (b, n_heads, l, d_head)
         Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
@@ -73,19 +108,42 @@ class MLAJ(nn.Module):
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
         V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
-        scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) / jnp.sqrt(d_head)
-        scores = jnp.where(causal_mask, scores, -1e9)
-        attn = jax.nn.softmax(scores, axis=-1)
+        # sm_scale must be a concrete Python float -- it is a static_argname in
+        # pallas_flash_attention's jax.jit signature, so a jnp-traced value here
+        # breaks under remat's retracing (float(tracer) raises
+        # ConcretizationTypeError). d_head is already a plain Python int.
+        sm_scale = 1.0 / math.sqrt(d_head)
 
-        if not deterministic:
-            dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else self.make_rng('dropout')
-            keep_prob = 1.0 - self.cfg.dropout_rate
-            mask_drop = jax.random.bernoulli(dropout_rng, keep_prob, attn.shape)
-            attn = attn * mask_drop / keep_prob
+        if self.cfg.use_flash_attention:
+            # Pallas TPU kernel: never materializes the full (l, l) score matrix.
+            # Requires q/k/v as (batch, num_heads, seq_len, head_dim), which is
+            # exactly what we already have after the transpose above.
+            block_sizes = FlashBlockSizes.get_default(b, n_heads, l, l, d_head)
+            out = pallas_flash_attention(
+                Q_rope.astype(jnp.bfloat16),
+                K_rope.astype(jnp.bfloat16),
+                V.astype(jnp.bfloat16),
+                causal=True,
+                sm_scale=sm_scale,
+                block_sizes=block_sizes,
+            ).astype(x.dtype)
+        else:
+            # Naive fallback -- only for CPU debugging / small seq_len smoke tests.
+            # This is the O(l^2) path that caused the MLA OOM at seq_len=8192.
+            scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
+            scores = jnp.where(causal_mask == 0, -1e9, scores)
+            attn = jax.nn.softmax(scores, axis=-1)
+            if not deterministic:
+                dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else self.make_rng('dropout')
+                keep_prob = 1.0 - self.cfg.dropout_rate
+                mask_drop = jax.random.bernoulli(dropout_rng, keep_prob, attn.shape)
+                attn = attn * mask_drop / keep_prob
+            out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
 
-        out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
+
+
 # ==========================================
 # Mamba-2 (SSM)
 # ==========================================
@@ -190,18 +248,78 @@ class GatedDeltaNet2J(nn.Module):
         z = w_gate * v
         ea = e * alpha
 
-        eye = jnp.eye(d_head)[None, None, None, :, :]
-        M = eye * alpha[:, :, :, None, :] - k[:, :, :, :, None] @ ea[:, :, :, None, :]
-        C = k[:, :, :, :, None] @ z[:, :, :, None, :]
+        # ---- chunked delta-rule scan ----
+        # ЧТО БЫЛО: M и C строились для ВСЕЙ последовательности разом --
+        # (b, l, n_heads, d_head, d_head). При l=8192, n_heads=16, d_head=64 это
+        # ~1.07 ГБ НА КАЖДЫЙ из M и C (bf16) -- ещё до самого associative_scan,
+        # который дополнительно требует сопоставимый объём для промежуточных
+        # уровней дерева. Это отдельный источник давления на HBM, независимый от
+        # MoE/MLA фиксов выше.
+        #
+        # ЧТО СТАЛО: последовательность бьётся на чанки по оси времени; вместо
+        # ОДНОГО associative_scan на всю длину -- jax.lax.scan ПО ЧАНКАМ
+        # (последовательно), а ВНУТРИ каждого чанка -- свой маленький
+        # associative_scan (параллельный, но только на chunk_size шагов). M_c/C_c
+        # строятся ЗАНОВО из k/ea/z/alpha (эти малы -- O(l*d), а не O(l*d^2))
+        # только для текущего чанка внутри scan, поэтому пиковая память для
+        # M/C/P -- O(chunk_size * d_head^2), а не O(l * d_head^2).
+        #
+        # ВАЖНО про корректность: между чанками нужно пронести НЕ ТОЛЬКО
+        # состояние S (значение), но и накопленное произведение матриц M
+        # (назовём carry_M) -- это ровно то, что associative_scan обычно
+        # выбрасывает (`_, S = ...`). Без carry_M нельзя корректно доклеить
+        # следующий чанк: S_global_i (внутри чанка) = P_local_i @ carry_M +
+        # (P_local_i @ carry_S + S_local_i), что в точности совпадает с
+        # применением того же самого `_combine` к паре (carry_M, carry_S) и
+        # локальному (P_local_i, S_local_i) -- т.е. это не новая математика, а
+        # использование ассоциативности того же самого combine-оператора.
+        # Проверено численно (см. чат): расхождение с нечанкованной версией на
+        # уровне float32-округления (~1e-6), не более.
+        chunk_size = min(self.cfg.deltanet_chunk_size, l)
+        if l % chunk_size != 0:
+            raise ValueError(
+                f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size} "
+                "(chunked GatedDeltaNet2 scan requires equal-sized chunks)."
+            )
+        num_chunks = l // chunk_size
 
         def _combine(state1, state2):
             m1, c1 = state1
             m2, c2 = state2
             return m2 @ m1, m2 @ c1 + c2
 
-        _, S = jax.lax.associative_scan(_combine, (M, C), axis=1)
+        def _to_chunks(t):  # (b, l, h, d) -> (num_chunks, b, chunk_size, h, d)
+            t = t.reshape(b, num_chunks, chunk_size, n_heads, d_head)
+            return jnp.moveaxis(t, 1, 0)
 
-        out = jnp.einsum("blhij,blhi->blhj", S, q).reshape(b, l, d)
+        k_ch, ea_ch, z_ch, alpha_ch, q_ch = map(_to_chunks, (k, ea, z, alpha, q))
+
+        eye_bh = jnp.broadcast_to(jnp.eye(d_head, dtype=x.dtype), (b, n_heads, d_head, d_head))
+        zero_bh = jnp.zeros((b, n_heads, d_head, d_head), dtype=x.dtype)
+
+        def _chunk_step(carry, chunk_inputs):
+            carry_M, carry_S = carry
+            k_c, ea_c, z_c, alpha_c, q_c = chunk_inputs  # each (b, chunk_size, h, d)
+
+            eye = jnp.eye(d_head, dtype=x.dtype)[None, None, None, :, :]
+            M_c = eye * alpha_c[:, :, :, None, :] - k_c[:, :, :, :, None] @ ea_c[:, :, :, None, :]
+            C_c = k_c[:, :, :, :, None] @ z_c[:, :, :, None, :]
+
+            P_local, S_local = jax.lax.associative_scan(_combine, (M_c, C_c), axis=1)
+
+            # broadcast carry (no chunk-position axis) against P_local's chunk axis
+            global_M = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_M)
+            global_S = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_S) + S_local
+
+            out_c = jnp.einsum("bchij,bchi->bchj", global_S, q_c)
+            new_carry = (global_M[:, -1], global_S[:, -1])
+            return new_carry, out_c
+
+        _, out_chunks = jax.lax.scan(
+            _chunk_step, (eye_bh, zero_bh), (k_ch, ea_ch, z_ch, alpha_ch, q_ch)
+        )
+        out = jnp.moveaxis(out_chunks, 0, 1).reshape(b, l, d)  # (num_chunks,b,c,h,d) -> (b,l,d)
+
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out)
         return nn.Dense(d, use_bias=False, name="out_proj")(out * jax.nn.silu(out_gate))
 
@@ -209,24 +327,6 @@ class GatedDeltaNet2J(nn.Module):
 # ==========================================
 # MoE -- gather/scatter dispatch, O(N) instead of O(N * capacity)
 # ==========================================
-#
-# ЧТО БЫЛО НЕ ТАК (root cause OOM):
-# Старая реализация строила ПЛОТНЫЕ one-hot тензоры формы (num_tokens*top_k, capacity)
-# и (num_tokens*top_k, num_experts, capacity) через einsum. Их размер растёт как
-# O(num_tokens^2), потому что capacity сам пропорционален num_tokens. При
-# num_tokens=65536 (batch=8 * seq_len=8192) это давало тензоры на десятки GB НА КАЖДЫЙ
-# из 22 слоёв, и без remat автодифф держал их все в HBM одновременно -> сотни GB.
-#
-# Дополнительно: jnp.cumsum(one_hot, axis=0) считался вдоль оси токенов. Под GSPMD
-# (jax.jit + in_shardings, без shard_map) это data-dependent global reduction вдоль
-# потенциально шардированной оси -- компилятору проще реплицировать весь батч на
-# каждый чип, чем построить распределённый scan. Именно поэтому параллелизация на
-# 8 TPU не спасала: каждый чип пересчитывал ПОЛНЫЙ глобальный batch.
-#
-# ИСПРАВЛЕНИЕ: вместо one-hot + cumsum по всей оси токенов используем
-# argsort + bincount (cumsum только по num_experts=8 элементам, а не по num_tokens) и
-# честный gather/scatter. Пиковая память теперь O(num_tokens*d + num_experts*capacity*d)
-# -- линейно, а не квадратично.
 class ExpertPack(nn.Module):
     cfg: ModelConfig
 
@@ -259,14 +359,12 @@ class MoEJ(nn.Module):
         router_probs = jax.nn.softmax(router_logits, axis=-1)
         top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K)  # (num_tokens, K)
 
-        # normalized top-k gate weights (same semantics as the old `mask`)
         gate = top_k_vals / (jnp.sum(top_k_vals, axis=-1, keepdims=True) + 1e-9)
 
         flat_expert_idx = top_k_idx.reshape(-1)                        # (n_assign,)
         flat_gate = gate.reshape(-1)                                    # (n_assign,)
         flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K)          # (n_assign,)
 
-        # ---- diagnostics: cheap, O(num_tokens*E) or O(n_assign), never O(n_assign*capacity) ----
         mean_probs = jnp.mean(router_probs, axis=0)
         expert_gate_frac = jnp.zeros(E, dtype=flat_gate.dtype).at[flat_expert_idx].add(flat_gate) / num_tokens
         self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * expert_gate_frac))
@@ -276,22 +374,18 @@ class MoEJ(nn.Module):
 
         capacity = max(1, int(self.cfg.moe_capacity_factor * num_tokens * K / E))
 
-        # ---- gather/scatter dispatch ----
-        # Sort assignments by expert id so same-expert tokens become contiguous.
         sort_order = jnp.argsort(flat_expert_idx)                       # (n_assign,) -- stable by default
         sorted_expert = flat_expert_idx[sort_order]
 
-        # Per-expert counts (tiny, E entries) -> cumsum over E, NOT over n_assign.
         expert_counts = jnp.zeros(E, dtype=jnp.int32).at[flat_expert_idx].add(1)
         expert_start = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(expert_counts)[:-1]])
 
-        # Position of each sorted assignment within its own expert's bucket.
         pos_in_bucket_sorted = jnp.arange(n_assign) - expert_start[sorted_expert]
         valid_sorted = pos_in_bucket_sorted < capacity
 
         dest_row = sorted_expert * capacity + jnp.minimum(pos_in_bucket_sorted, capacity - 1)
 
-        gathered_x = flat_x[flat_token_idx][sort_order]                 # (n_assign, d) -- gather, not matmul
+        gathered_x = flat_x[flat_token_idx][sort_order]                 # (n_assign, d)
         buffer = jnp.zeros((E * capacity, d), dtype=flat_x.dtype)
         buffer = buffer.at[dest_row].add(jnp.where(valid_sorted[:, None], gathered_x, 0.0))
         expert_inputs = buffer.reshape(E, capacity, d)
@@ -350,6 +444,38 @@ class DeltaAttentionResidualBlockJ(nn.Module):
 
 
 # ==========================================
+# Block of 2 consecutive Delta-Attention Residual layers, sharing one remat scope
+# ==========================================
+#
+# ЗАЧЕМ: remat на КАЖДЫЙ отдельный слой (было раньше) даёт максимальную экономию
+# памяти (пик активаций одного слоя), но каждый remat -- это отдельная граница
+# recompute при backward: JAX должен заново затрассировать forward для КАЖДОГО
+# из 22 слоёв по отдельности. Объединение по 2 слоя в один remat-блок снижает
+# число таких границ вдвое (22 -> 11), что уменьшает накладные расходы на
+# retracing/scheduling, ценой того, что теперь ОДИН remat-блок держит в памяти
+# активации СРАЗУ ДВУХ слоёв вместо одного (по-прежнему на порядок меньше, чем
+# без remat вообще, где держатся активации всех 22 слоёв разом).
+#
+# ВАЖНО про чекпоинты: это МЕНЯЕТ дерево параметров -- было плоское layer_0,
+# layer_1, ..., layer_21; станет layer_pair_0/layer_0, layer_pair_0/layer_1,
+# layer_pair_2/layer_2, ... Старые сохранённые Orbax-чекпоинты с плоской
+# структурой НЕ загрузятся без ремаппинга путей.
+class DeltaResidualBlockPairJ(nn.Module):
+    cfg: ModelConfig
+    layer_idx_0: int  # first of the pair; the second is layer_idx_0 + 1
+
+    @nn.compact
+    def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
+        current_x, history_deltas = DeltaAttentionResidualBlockJ(
+            cfg=self.cfg, layer_idx=self.layer_idx_0, name=f"layer_{self.layer_idx_0}"
+        )(current_x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
+        current_x, history_deltas = DeltaAttentionResidualBlockJ(
+            cfg=self.cfg, layer_idx=self.layer_idx_0 + 1, name=f"layer_{self.layer_idx_0 + 1}"
+        )(current_x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
+        return current_x, history_deltas
+
+
+# ==========================================
 # Full model
 # ==========================================
 class FullHybridMoEModel(nn.Module):
@@ -367,18 +493,23 @@ class FullHybridMoEModel(nn.Module):
 
         history_deltas = jnp.zeros((self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype)
 
-        # Gradient checkpointing (remat) per layer: without this, autodiff keeps every
-        # layer's activations (incl. the MoE dispatch buffers) resident in HBM
-        # simultaneously for the backward pass. With 22 layers that multiplies peak
-        # memory by ~22x. remat recomputes the forward pass per-layer during backward
-        # instead, trading some compute for a large drop in peak HBM usage.
-        # static_argnums marks `deterministic` (position 5 in __call__, counting
-        # `self` as 0) as a Python-level static value rather than a traced array --
-        # remat needs this because dropout branches on it with a Python `if`.
-        RematBlock = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
+        # static_argnums index 6 = `deterministic` in both wrappers below (same
+        # __call__ signature position: self, current_x, history_deltas,
+        # causal_mask, cos, sin, deterministic, rngs).
+        RematPair = nn.remat(DeltaResidualBlockPairJ, static_argnums=(6,))
+        RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
 
-        for i in range(self.cfg.num_layers):
-            x, history_deltas = RematBlock(
+        num_full_pairs = self.cfg.num_layers // 2
+        for p in range(num_full_pairs):
+            i = p * 2
+            x, history_deltas = RematPair(
+                cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
+            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
+
+        # odd num_layers: handle the leftover single layer with per-layer remat
+        if self.cfg.num_layers % 2 == 1:
+            i = num_full_pairs * 2
+            x, history_deltas = RematSingle(
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
             )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
 
