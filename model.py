@@ -74,13 +74,14 @@ class MLAJ(nn.Module):
 
         K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
+        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)   # (b, n_heads, l, d_head)
 
         from flax.linen import dot_product_attention
         dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else None
+
         out = dot_product_attention(
             Q_rope, K_rope, V,
-            mask=causal_mask,
+            mask=causal_mask,  # (1, 1, l, l) – broadcast к (b, n_heads, l, l)
             deterministic=deterministic,
             dropout_rate=self.cfg.dropout_rate,
             dropout_rng=dropout_rng,
