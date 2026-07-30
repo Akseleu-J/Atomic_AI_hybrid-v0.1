@@ -74,19 +74,25 @@ class MLAJ(nn.Module):
 
         K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)   # (b, n_heads, l, d_head)
+        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
-        from flax.linen import dot_product_attention
-        dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else None
+        # scores: (b, n_heads, l, l)
+        scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) / jnp.sqrt(d_head)
+        # causal_mask имеет форму (1, 1, l, l) – broadcast к (b, n_heads, l, l)
+        scores = jnp.where(causal_mask, scores, -1e9)
+        attn = jax.nn.softmax(scores, axis=-1)
 
-        out = dot_product_attention(
-            Q_rope, K_rope, V,
-            mask=causal_mask,  # (1, 1, l, l) – broadcast к (b, n_heads, l, l)
-            deterministic=deterministic,
-            dropout_rate=self.cfg.dropout_rate,
-            dropout_rng=dropout_rng,
-        )  # (b, n_heads, l, d_head)
+        # Dropout вручную
+        if not deterministic:
+            if rngs is not None and 'dropout' in rngs:
+                dropout_rng = rngs['dropout']
+            else:
+                dropout_rng = self.make_rng('dropout')
+            keep_prob = 1.0 - self.cfg.dropout_rate
+            mask_drop = jax.random.bernoulli(dropout_rng, keep_prob, attn.shape)
+            attn = attn * mask_drop / keep_prob
 
+        out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
 # ==========================================
