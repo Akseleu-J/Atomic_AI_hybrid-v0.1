@@ -52,8 +52,6 @@ def apply_rope(x, cos, sin):
 # ==========================================
 # Multi-head Latent Attention
 # ==========================================
-from ejkernel.modules import FlashMLA
-
 class MLAJ(nn.Module):
     cfg: ModelConfig
 
@@ -64,34 +62,29 @@ class MLAJ(nn.Module):
         d_head = self.cfg.d_model // n_heads
 
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        Q = Q.reshape(b, l, n_heads, d_head)
-        Q_rope = apply_rope(Q.transpose(0, 2, 1, 3), cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        Q_rope = Q_rope.transpose(0, 2, 1, 3)
+        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)   # (b, n_heads, l, d_head)
+        Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
         K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up")(kv_latent)
         V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up")(kv_latent)
 
-        K = K.reshape(b, l, n_heads, d_head)
-        K_rope = apply_rope(K.transpose(0, 2, 1, 3), cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        K_rope = K_rope.transpose(0, 2, 1, 3)
+        K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
+        K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
-        V = V.reshape(b, l, n_heads, d_head)
+        scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) / jnp.sqrt(d_head)
+        scores = jnp.where(causal_mask, scores, -1e9)
+        attn = jax.nn.softmax(scores, axis=-1)
 
-        from ejkernel.modules import FlashMLA
+        if not deterministic:
+            dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else self.make_rng('dropout')
+            keep_prob = 1.0 - self.cfg.dropout_rate
+            mask_drop = jax.random.bernoulli(dropout_rng, keep_prob, attn.shape)
+            attn = attn * mask_drop / keep_prob
 
-        # Создаём экземпляр без аргументов (используем значения по умолчанию)
-        flash_mla = FlashMLA()
-
-        # Вызываем с маской и dropout_rng
-        out = flash_mla(
-            Q_rope, K_rope, V,
-            mask=causal_mask,
-            rng=rngs['dropout'] if rngs is not None and 'dropout' in rngs else None,
-            deterministic=deterministic,
-        )  # (b, l, n_heads, d_head)
-
-        out = out.reshape(b, l, self.cfg.d_model)
+        out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
+        out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
 # ==========================================
 # Mamba-2 (SSM)
