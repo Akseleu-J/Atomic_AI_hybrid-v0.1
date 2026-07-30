@@ -1,6 +1,7 @@
 import glob
 import os
 import re
+import time
 
 import jax
 import jax.numpy as jnp
@@ -32,13 +33,6 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             f"batch_size={batch_size} must be divisible by the number of devices "
             f"({n_devices}); data is sharded along the batch axis across devices."
         )
-    experts_divide_evenly = (config.num_experts % n_devices == 0)
-    if not experts_divide_evenly:
-        print(
-            f"[WARN] num_experts={config.num_experts} is not divisible by n_devices={n_devices}; "
-            "expert weights will be REPLICATED instead of sharded across devices for this run "
-            "(fine for a CPU/small-scale smoke test, but check pod topology before a real TPU run)."
-        )
 
     tx = make_hybrid_optimizer(total_steps=total_steps)
     model = FullHybridMoEModel(cfg=config)
@@ -50,21 +44,30 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
     data_sharding = NamedSharding(mesh, P("tpu_nodes", None))
 
+    # Pure data parallelism: EVERY param (including MoE expert weights) is fully
+    # replicated on every chip.
+    #
+    # Раньше `experts_block` веса шардировались по первой оси (по числу экспертов),
+    # что подразумевает expert-parallelism: каждый чип держит только часть экспертов,
+    # а токены с других чипов должны физически доехать до "своего" эксперта через
+    # all-to-all communication. Этот all-to-all нигде не был реализован -- MoEJ
+    # обрабатывал только локальный на данном чипе батч. В результате код требовал от
+    # компилятора невозможного: посчитать все E=8 экспертов "как будто" каждый чип
+    # видит их все, но при этом веса экспертов физически лежали лишь частично на
+    # каждом чипе. Это одна из причин, по которой параллелизация на 8 TPU не давала
+    # никакого выигрыша по памяти -- компилятор был вынужден реплицировать/собирать
+    # данные, а не честно шардировать вычисление.
+    #
+    # Замена на полную репликацию весов экспертов -- самый простой рабочий вариант:
+    # каждый чип независимо считает MoE-роутинг для своего локального шардированного
+    # батча (data parallel), без какой-либо кросс-чиповой коммуникации токенов.
+    # Настоящий expert-parallelism (все-to-all + шардирование весов экспертов) можно
+    # добавить позже отдельным, более сложным шагом, если 8x репликация памяти
+    # экспертов станет узким местом -- пока модель всего 1.76B, это не так.
     def _get_param_sharding(path, param):
-        # Если только одно устройство (например, CPU) – шардирование не нужно
-        if n_devices == 1:
-            return NamedSharding(mesh, P(None))
-        
-        path_str = path_to_str(path)
-        # Шардируем только 3D‑тензоры экспертов (num_experts, in, out)
-        if "experts_block" in path_str and experts_divide_evenly and param.ndim == 3:
-            return NamedSharding(mesh, P("tpu_nodes", None, None))
-        # Все остальное реплицируем
-        return NamedSharding(mesh, P(None))
+        return NamedSharding(mesh, P(*([None] * param.ndim)))
 
     param_sharding = jax.tree_util.tree_map_with_path(_get_param_sharding, abstract_params)
-
-    # ... остальной код без изменений
 
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
     opt_state_sharding = jax.tree_util.tree_map_with_path(_get_param_sharding, opt_state_abstract)
@@ -93,8 +96,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         out_shardings=(
             param_sharding,
             opt_state_sharding,
-            NamedSharding(mesh, P(None)),
-            NamedSharding(mesh, P(None)),
+            NamedSharding(mesh, P()),
+            NamedSharding(mesh, P()),
         ),
     )
     compiled_val = jax.jit(
@@ -200,51 +203,42 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, val_split=0.0
     )
 
 
-# ============================================================
-# НОВАЯ main_execution с явными путями и ранней остановкой по шагам
-# ============================================================
 def main_execution():
     config = ModelConfig()
 
-    # ===== ЯВНЫЕ ПУТИ К ТВОИМ ДАТАСЕТАМ (все три) =====
     file_pairs = [
         (
             "/kaggle/input/datasets/akseleu1j/agentic-datasetids-and-labels/processed_jax_data/agentic_input_ids.npy",
-            "/kaggle/input/datasets/akseleu1j/agentic-datasetids-and-labels/processed_jax_data/agentic_labels.npy"
+            "/kaggle/input/datasets/akseleu1j/agentic-datasetids-and-labels/processed_jax_data/agentic_labels.npy",
         ),
         (
             "/kaggle/input/datasets/akseleu1j/coding-ids/coding_input_ids.npy",
-            "/kaggle/input/datasets/akseleu1j/coding-labels/coding_labels.npy"
+            "/kaggle/input/datasets/akseleu1j/coding-labels/coding_labels.npy",
         ),
         (
             "/kaggle/input/datasets/akseleu1j/reasoning-ids/reasoning_input_ids.npy",
-            "/kaggle/input/datasets/akseleu1j/reasoning-labels/reasoning_labels.npy"
+            "/kaggle/input/datasets/akseleu1j/reasoning-labels/reasoning_labels.npy",
         ),
     ]
 
-    # Проверка существования файлов
     for ids_path, lbls_path in file_pairs:
         if not os.path.exists(ids_path):
-            raise FileNotFoundError(f"❌ Не найден файл: {ids_path}")
+            raise FileNotFoundError(f"Не найден файл: {ids_path}")
         if not os.path.exists(lbls_path):
-            raise FileNotFoundError(f"❌ Не найден файл: {lbls_path}")
-    print("✅ Все файлы найдены!")
+            raise FileNotFoundError(f"Не найден файл: {lbls_path}")
+    print("Все файлы найдены.")
 
-    # Собираем манифест (только заголовки, без загрузки данных)
     manifest = build_manifest(file_pairs)
     total_blocks = sum(n for _, _, n in manifest)
     total_tokens = total_blocks * 8192
-    print(f"📊 Всего блоков: {total_blocks:,} (≈ {total_tokens / 1e9:.2f} млрд токенов)")
+    print(f"Всего блоков: {total_blocks:,} (~= {total_tokens / 1e9:.2f} млрд токенов)")
 
-    # ===== Параметры обучения =====
-    batch_size = 16                # безопасно для TPU v5e-8 (делится на 8)
-    epochs = 3                     # максимум 3 эпохи, ранняя остановка сократит при необходимости
-    early_stop_patience = 2        # по эпохам
-
-    # ===== Ранняя остановка по шагам =====
+    batch_size = 8
+    epochs = 4
+    early_stop_patience = 2
     eval_every_steps = 1000
-    eval_patience = 3              # сколько проверок подряд без улучшения -> остановка
-    eval_batches = 50              # число батчей для быстрой валидации
+    eval_batches = 150
+    eval_patience = 4
 
     train_steps_per_epoch = (int(total_blocks * 0.95)) // batch_size
     total_train_steps = train_steps_per_epoch * epochs
@@ -253,21 +247,28 @@ def main_execution():
     compiled_train, compiled_val, mesh, tx, model, param_sharding, opt_state_sharding, data_sharding = (
         make_shard_and_compile(config, total_train_steps, batch_size)
     )
-
-    global_rng = jax.random.PRNGKey(42)
-    with mesh:
-        init_params_fn = jax.jit(
-            lambda rng: model.init(rng, jnp.zeros((batch_size, 8192), dtype=jnp.int32))["params"],
-            out_shardings=param_sharding,
-        )
-        params = init_params_fn(global_rng)
-        opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
+    print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (данные шардируются по батчу).")
 
     train_stream, val_factory, train_steps, val_steps = dataloader_multi_source(
         file_pairs, batch_size, data_sharding
     )
 
-    # Папки для чекпоинтов
+    global_rng = jax.random.PRNGKey(42)
+    with jax.set_mesh(mesh):
+        init_params_fn = jax.jit(
+            lambda rng: model.init(rng, jnp.zeros((batch_size, 8192), dtype=jnp.int32))["params"],
+            out_shardings=param_sharding,
+        )
+        params = init_params_fn(global_rng)
+        print(f"[MEM] Доступно памяти на чипе 0: {jax.local_devices()[0].memory_stats()}")
+        total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
+        print(f"Общее количество параметров: {total_params:,} (≈ {total_params / 1e9:.2f} млрд)")
+
+        weights_bytes = sum(x.nbytes for x in jax.tree_util.tree_leaves(params))
+        print(f"Размер весов модели (на чип, при полной репликации): {weights_bytes / 1e9:.2f} ГБ")
+
+        opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
+
     checkpoint_dir = "/kaggle/working/orbax_checkpoints"
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
     mngr = ocp.CheckpointManager(checkpoint_dir, ocp.StandardCheckpointer(), options)
@@ -275,23 +276,26 @@ def main_execution():
     best_options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
     best_mngr = ocp.CheckpointManager(best_checkpoint_dir, ocp.StandardCheckpointer(), best_options)
 
-    # Переменные для ранней остановки
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     global_step = 0
     best_eval_loss = float("inf")
     eval_no_improve_count = 0
+    stopped_early = False
+
+    total_tokens_processed = 0
+    epoch_start_time = time.perf_counter()
 
     for epoch in range(epochs):
-        with mesh:
+        with jax.set_mesh(mesh):
             for step in range(train_steps):
                 global_rng, step_rng = jax.random.split(global_rng)
                 batch = next(train_stream)
+                total_tokens_processed += batch_size * 8192
 
                 params, opt_state, train_loss, aux_info = compiled_train(params, opt_state, batch, step_rng)
                 global_step += 1
 
-                # Логирование каждые 10 шагов
                 if step % 10 == 0:
                     print(
                         f"Epoch: {epoch} | Step: {step}/{train_steps} | "
@@ -309,18 +313,19 @@ def main_execution():
                             f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts}"
                         )
 
-                # Ранняя остановка по шагам (каждые eval_every_steps)
                 if global_step % eval_every_steps == 0:
                     val_stream = val_factory()
                     eval_loss = 0.0
+                    n_batches_done = 0
                     for _ in range(eval_batches):
                         try:
                             eval_batch = next(val_stream)
-                            eval_loss += jax.device_get(compiled_val(params, eval_batch))
                         except StopIteration:
                             break
-                    eval_loss /= eval_batches
-                    print(f"[EVAL] Step {global_step}: val loss = {eval_loss:.4f}")
+                        eval_loss += jax.device_get(compiled_val(params, eval_batch))
+                        n_batches_done += 1
+                    eval_loss /= max(n_batches_done, 1)
+                    print(f"[EVAL] Step {global_step}: val loss (частичный, {n_batches_done} батчей) = {eval_loss:.4f}")
 
                     if eval_loss < best_eval_loss:
                         best_eval_loss = eval_loss
@@ -329,19 +334,18 @@ def main_execution():
                         eval_no_improve_count += 1
                         if eval_no_improve_count >= eval_patience:
                             print(
-                                f"[EARLY STOP] Валидационный лосс не улучшался {eval_patience} проверок подряд. "
-                                "Останавливаю обучение."
+                                f"[EARLY STOP] Частичный val loss не улучшался {eval_patience} "
+                                "проверок подряд. Останавливаю обучение немедленно."
                             )
+                            mngr.save(global_step, args=ocp.args.StandardSave(params))
+                            best_mngr.save(global_step, args=ocp.args.StandardSave(params))
+                            print(f"[ORBAX] Финальный чекпоинт (шаг {global_step}) сохранён в оба каталога.")
+                            stopped_early = True
                             break
-                if eval_no_improve_count >= eval_patience:
-                    break  # выход из цикла шагов
 
-            # Если ранняя остановка сработала, прерываем эпоху
-            if eval_no_improve_count >= eval_patience:
-                print("[EARLY STOP] Прерывание обучения по шаговой валидации.")
+            if stopped_early:
                 break
 
-            # Конец эпохи: полная валидация
             print(f"--- Эпоха {epoch} завершена. Запуск распределенной кросс-валидации ---")
             val_stream = val_factory()
             total_val_loss = 0.0
@@ -351,11 +355,15 @@ def main_execution():
             mean_val_loss = total_val_loss / val_steps
             print(f"===> Эпоха: {epoch} | ИТОГОВЫЙ СРЕДНИЙ VALIDATION LOSS: {mean_val_loss:.4f} <===")
 
-            # Сохраняем чекпоинт
+            epoch_elapsed = time.perf_counter() - epoch_start_time
+            tokens_per_sec = total_tokens_processed / epoch_elapsed
+            print(f"Средняя скорость эпохи: {tokens_per_sec / 1e6:.2f} млн токенов/сек")
+            total_tokens_processed = 0
+            epoch_start_time = time.perf_counter()
+
             mngr.save(global_step, args=ocp.args.StandardSave(params))
             print(f"[ORBAX] Чекпоинт для шага {global_step} успешно зафиксирован.")
 
-            # Ранняя остановка по эпохам
             if mean_val_loss < best_val_loss:
                 best_val_loss = mean_val_loss
                 epochs_without_improvement = 0
@@ -374,7 +382,7 @@ def main_execution():
                     )
                     break
 
-    print("✅ Обучение завершено!")
+    print("Обучение завершено.")
 
 
 if __name__ == "__main__":
