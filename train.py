@@ -85,6 +85,17 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     def distributed_val_step(p, b):
         return compute_loss(p, model.apply, b, config, rngs=None, deterministic=True)
 
+    # FIX: aux_info is a DICT with MIXED ranks -- ce_loss/aux_loss/z_loss are scalars
+    # (rank 0, P() is correct), but expert_utilization has shape (num_layers,
+    # num_experts) -- rank 2. A single NamedSharding(mesh, P()) applied to the whole
+    # aux_info pytree would try to use a rank-0 spec for that rank-2 leaf -- the exact
+    # same class of error as the earlier P(None)-on-a-scalar crash, just inverted.
+    aux_info_sharding = {
+        "ce_loss": NamedSharding(mesh, P()),
+        "aux_loss": NamedSharding(mesh, P()),
+        "z_loss": NamedSharding(mesh, P()),
+        "expert_utilization": NamedSharding(mesh, P(None, None)),
+    }
     compiled_train = jax.jit(
         distributed_train_step,
         in_shardings=(
@@ -97,7 +108,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             param_sharding,
             opt_state_sharding,
             NamedSharding(mesh, P()),
-            NamedSharding(mesh, P()),
+            aux_info_sharding,
         ),
     )
     compiled_val = jax.jit(
