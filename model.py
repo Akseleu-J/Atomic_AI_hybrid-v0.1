@@ -110,35 +110,33 @@ class Mamba2J(nn.Module):
         in_proj = nn.Dense(d_inner * 2, use_bias=False, name="in_proj")(x)
         x_bc, res = jnp.split(in_proj, 2, axis=-1)
 
-        # FIX: nn.initializers.normal uses `stddev`, not `std`
         conv_w = self.param("conv_w", nn.initializers.normal(stddev=0.02), (d_inner, self.cfg.d_conv))
         conv_b = self.param("conv_b", nn.initializers.zeros, (d_inner,))
 
-        x_for_conv = x_bc.transpose(0, 2, 1)
+        rhs = conv_w.T[:, :, None]  # (d_conv, d_inner, 1)
         res_conv = jax.lax.conv_general_dilated(
-            lhs=x_for_conv,
-            rhs=conv_w[:, None, :],
+            lhs=x_bc,
+            rhs=rhs,
             window_strides=(1,),
             padding=[(self.cfg.d_conv - 1, 0)],
             feature_group_count=d_inner,
         )
-        x_conv = jax.nn.silu((res_conv + conv_b[:, None]).transpose(0, 2, 1))
+        x_conv = jax.nn.silu(res_conv + conv_b[None, None, :])
 
         A = -jnp.exp(self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,)))
         B = nn.Dense(self.cfg.d_state, use_bias=False, name="B_proj")(x_bc)
         C = nn.Dense(self.cfg.d_state, use_bias=False, name="C_proj")(x_bc)
         dt = jax.nn.softplus(nn.Dense(d_inner, use_bias=True, name="dt_proj")(x_bc))
 
-        dA = jnp.exp(jnp.einsum("bld,d->bld", dt, A))          # (b, l, d_inner)
-        dB = jnp.einsum("bld,bls->blds", dt, B)                 # (b, l, d_inner, d_state)
+        dA = jnp.exp(jnp.einsum("bld,d->bld", dt, A))
+        dB = jnp.einsum("bld,bls->blds", dt, B)
 
         def _associative_scan_mamba(a, b_val):
             da1, db1, xc1 = a
             da2, db2, xc2 = b_val
-            da2e = da2[..., None]  # broadcast (b,l,d_inner) -> (b,l,d_inner,1) against the state dim
+            da2e = da2[..., None]
             return da2 * da1, da2e * db1 + db2, da2e * xc1 + xc2
 
-        # FIX: scan must run along the SEQUENCE axis (axis=1), not the default axis=0 (batch)
         _, _, h = jax.lax.associative_scan(
             _associative_scan_mamba, (dA, dB, x_conv[..., None]), axis=1
         )
@@ -181,15 +179,14 @@ class GatedDeltaNet2J(nn.Module):
         eps = 1e-6
 
         def short_causal_conv(name, u):
-            # depthwise causal conv, kernel size cfg.d_conv -- matches Fig. 1's Conv step
             conv_w = self.param(f"{name}_conv_w", nn.initializers.normal(stddev=0.02), (d, self.cfg.d_conv))
             conv_b = self.param(f"{name}_conv_b", nn.initializers.zeros, (d,))
-            u_t = u.transpose(0, 2, 1)
+            rhs = conv_w.T[:, :, None]  # (d_conv, d, 1)
             out = jax.lax.conv_general_dilated(
-                lhs=u_t, rhs=conv_w[:, None, :], window_strides=(1,),
+                lhs=u, rhs=rhs, window_strides=(1,),
                 padding=[(self.cfg.d_conv - 1, 0)], feature_group_count=d,
             )
-            return (out + conv_b[:, None]).transpose(0, 2, 1)
+            return out + conv_b[None, None, :]
 
         q_lin = nn.Dense(d, use_bias=False, name="q_proj")(x)
         k_lin = nn.Dense(d, use_bias=False, name="k_proj")(x)
