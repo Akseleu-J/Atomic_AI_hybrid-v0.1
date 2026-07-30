@@ -120,6 +120,7 @@ class Mamba2J(nn.Module):
             window_strides=(1,),
             padding=[(self.cfg.d_conv - 1, 0)],
             feature_group_count=d_inner,
+            dimension_numbers=('NHC', 'HIO', 'NHC')
         )
         x_conv = jax.nn.silu(res_conv + conv_b[None, None, :])
 
@@ -183,8 +184,12 @@ class GatedDeltaNet2J(nn.Module):
             conv_b = self.param(f"{name}_conv_b", nn.initializers.zeros, (d,))
             rhs = conv_w.T[:, None, :]  # (d_conv, 1, d)
             out = jax.lax.conv_general_dilated(
-                lhs=u, rhs=rhs, window_strides=(1,),
-                padding=[(self.cfg.d_conv - 1, 0)], feature_group_count=d,
+                lhs=u,
+                rhs=rhs,
+                window_strides=(1,),
+                padding=[(self.cfg.d_conv - 1, 0)],
+                feature_group_count=d,
+                dimension_numbers=('NHC', 'HIO', 'NHC')
             )
             return out + conv_b[None, None, :]
 
