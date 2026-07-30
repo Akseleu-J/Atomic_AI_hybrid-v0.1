@@ -52,6 +52,8 @@ def apply_rope(x, cos, sin):
 # ==========================================
 # Multi-head Latent Attention
 # ==========================================
+from flax.linen import dot_product_attention
+
 class MLAJ(nn.Module):
     cfg: ModelConfig
 
@@ -62,23 +64,25 @@ class MLAJ(nn.Module):
         d_head = self.cfg.d_model // n_heads
 
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
-        Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        Q = Q.reshape(b, l, n_heads, d_head)
+        Q = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
         K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up")(kv_latent)
         V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up")(kv_latent)
 
-        K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
-        K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
+        K = K.reshape(b, l, n_heads, d_head)
+        K = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        V = V.reshape(b, l, n_heads, d_head)
 
-        scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) / jnp.sqrt(d_head)
-        scores = jnp.where(causal_mask == 0, -1e9, scores)
-        attn = jax.nn.softmax(scores, axis=-1)
-        attn = nn.Dropout(rate=self.cfg.dropout_rate)(attn, deterministic=deterministic)
+        # Используем dot_product_attention из flax.linen
+        out = dot_product_attention(
+            Q, K, V,
+            mask=causal_mask,           # (1, 1, l, l) или (b, 1, l, l)
+            deterministic=deterministic,
+            dropout_rate=self.cfg.dropout_rate,
+        )  # (b, n_heads, l, d_head)
 
-        out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
 
