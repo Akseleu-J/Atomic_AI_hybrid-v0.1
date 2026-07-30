@@ -4,6 +4,11 @@ from flax import linen as nn
 from flax import struct
 from typing import List
 
+ 
+from jax.experimental.pallas.ops.tpu.flash_attention import (
+    flash_attention as pallas_flash_attention,
+    BlockSizes as FlashBlockSizes,
+)
 
 @struct.dataclass
 class ModelConfig:
@@ -25,7 +30,11 @@ class ModelConfig:
     tie_embeddings: bool = True
     label_smoothing: float = 0.05
     router_noise_std: float = 0.3
-
+   
+    use_flash_attention: bool = True
+   
+    deltanet_chunk_size: int = 1024
+ 
 
 # ==========================================
 # RoPE
@@ -54,35 +63,60 @@ def apply_rope(x, cos, sin):
 # ==========================================
 class MLAJ(nn.Module):
     cfg: ModelConfig
-
+ 
     @nn.compact
-    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True):
+    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
-
+ 
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
+        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)  # (b, n_heads, l, d_head)
         Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-
+ 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
         K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up")(kv_latent)
         V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up")(kv_latent)
-
+ 
         K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
         V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
-
-        scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) / jnp.sqrt(d_head)
-        scores = jnp.where(causal_mask == 0, -1e9, scores)
-        attn = jax.nn.softmax(scores, axis=-1)
-        attn = nn.Dropout(rate=self.cfg.dropout_rate)(attn, deterministic=deterministic)
-
-        out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
+ 
+        # sm_scale must be a concrete Python float -- it is a static_argname in
+        # pallas_flash_attention's jax.jit signature, so a jnp-traced value here
+        # breaks under remat's retracing (float(tracer) raises
+        # ConcretizationTypeError). d_head is already a plain Python int.
+        sm_scale = 1.0 / math.sqrt(d_head)
+ 
+        if self.cfg.use_flash_attention:
+            # Pallas TPU kernel: never materializes the full (l, l) score matrix.
+            # Requires q/k/v as (batch, num_heads, seq_len, head_dim), which is
+            # exactly what we already have after the transpose above.
+            block_sizes = FlashBlockSizes.get_default(b, n_heads, l, l, d_head)
+            out = pallas_flash_attention(
+                Q_rope.astype(jnp.bfloat16),
+                K_rope.astype(jnp.bfloat16),
+                V.astype(jnp.bfloat16),
+                causal=True,
+                sm_scale=sm_scale,
+                block_sizes=block_sizes,
+            ).astype(x.dtype)
+        else:
+            # Naive fallback -- only for CPU debugging / small seq_len smoke tests.
+            # This is the O(l^2) path that caused the MLA OOM at seq_len=8192.
+            scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
+            scores = jnp.where(causal_mask == 0, -1e9, scores)
+            attn = jax.nn.softmax(scores, axis=-1)
+            if not deterministic:
+                dropout_rng = rngs['dropout'] if rngs is not None and 'dropout' in rngs else self.make_rng('dropout')
+                keep_prob = 1.0 - self.cfg.dropout_rate
+                mask_drop = jax.random.bernoulli(dropout_rng, keep_prob, attn.shape)
+                attn = attn * mask_drop / keep_prob
+            out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
+ 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
-
-
+ 
 # ==========================================
 # Mamba-2 (SSM)
 # ==========================================
