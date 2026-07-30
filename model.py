@@ -259,7 +259,7 @@ class MoEJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
+    def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
         num_tokens = flat_x.shape[0]
@@ -349,7 +349,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
     layer_idx: int
 
     @nn.compact
-    def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True):
+    def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
         norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x)
         gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
@@ -376,7 +376,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
 
         moe_in = current_x + jnp.einsum("blv,vbld->bld", routing_weights, updated_history)
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(moe_in)
-        moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic)
+        moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
         return moe_in + moe_out, updated_history
 
 
@@ -387,7 +387,7 @@ class FullHybridMoEModel(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, input_ids, deterministic: bool = True):
+    def __call__(self, input_ids, deterministic: bool = True, rngs=None):
         b, l = input_ids.shape
         embed_layer = nn.Embed(num_embeddings=self.cfg.vocab_size, features=self.cfg.d_model, name="embed")
         x = embed_layer(input_ids)
@@ -401,8 +401,8 @@ class FullHybridMoEModel(nn.Module):
         for i in range(self.cfg.num_layers):
             x, history_deltas = DeltaAttentionResidualBlockJ(
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic=deterministic)
-
+            )(x, history_deltas, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs)
+            
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
         if self.cfg.tie_embeddings:
             # embed_layer.attend(x) == x @ embedding_matrix.T -- reuses the SAME (vocab,
