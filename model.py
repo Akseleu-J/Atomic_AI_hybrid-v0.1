@@ -113,7 +113,7 @@ class Mamba2J(nn.Module):
         conv_w = self.param("conv_w", nn.initializers.normal(stddev=0.02), (d_inner, self.cfg.d_conv))
         conv_b = self.param("conv_b", nn.initializers.zeros, (d_inner,))
 
-        rhs = conv_w.T[:, :, None]  # (d_conv, d_inner, 1)
+        rhs = conv_w.T[:, None, :]  # (d_conv, 1, d_inner)
         res_conv = jax.lax.conv_general_dilated(
             lhs=x_bc,
             rhs=rhs,
@@ -181,7 +181,7 @@ class GatedDeltaNet2J(nn.Module):
         def short_causal_conv(name, u):
             conv_w = self.param(f"{name}_conv_w", nn.initializers.normal(stddev=0.02), (d, self.cfg.d_conv))
             conv_b = self.param(f"{name}_conv_b", nn.initializers.zeros, (d,))
-            rhs = conv_w.T[:, :, None]  # (d_conv, d, 1)
+            rhs = conv_w.T[:, None, :]  # (d_conv, 1, d)
             out = jax.lax.conv_general_dilated(
                 lhs=u, rhs=rhs, window_strides=(1,),
                 padding=[(self.cfg.d_conv - 1, 0)], feature_group_count=d,
