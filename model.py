@@ -59,42 +59,40 @@ class MLAJ(nn.Module):
 
     @nn.compact
     def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
-        # FlashMLA ожидает входы в формате (batch, seq_len, heads, head_dim)
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
 
-        # Стандартные проекции Q, K, V
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        # Reshape для FlashMLA: (batch, seq_len, heads, head_dim)
         Q = Q.reshape(b, l, n_heads, d_head)
-        Q = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        # Временно переставляем для RoPE: (b, n_heads, l, d_head)
+        Q_rope = apply_rope(Q.transpose(0, 2, 1, 3), cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        # Возвращаем в (b, l, n_heads, d_head)
+        Q_rope = Q_rope.transpose(0, 2, 1, 3)
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
         K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up")(kv_latent)
         V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up")(kv_latent)
 
         K = K.reshape(b, l, n_heads, d_head)
-        K = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
-        V = V.reshape(b, l, n_heads, d_head)
+        K_rope = apply_rope(K.transpose(0, 2, 1, 3), cos[None, None, :, :d_head], sin[None, None, :, :d_head])
+        K_rope = K_rope.transpose(0, 2, 1, 3)
 
-        # Используем FlashMLA
-        # Он сам обрабатывает causal mask и dropout (если передать rng)
+        V = V.reshape(b, l, n_heads, d_head)   # V не требует RoPE
+
+        from ejkernel.modules import FlashMLA
+
         flash_mla = FlashMLA(
             causal=True,
             dropout_rate=self.cfg.dropout_rate if not deterministic else 0.0,
         )
-
-        # FlashMLA ожидает маску в формате (batch, 1, 1, seq_len) или (batch, 1, seq_len, seq_len)
-        # У нас causal_mask уже (1, 1, l, l) – broadcast будет работать
         out = flash_mla(
-            Q, K, V,
+            Q_rope, K_rope, V,
             mask=causal_mask,
             rng=rngs['dropout'] if rngs is not None and 'dropout' in rngs else None,
             deterministic=deterministic,
-        )  # (batch, seq_len, heads, head_dim)
+        )  # (b, l, n_heads, d_head)
 
-        # Возвращаем к исходному формату
         out = out.reshape(b, l, self.cfg.d_model)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
 # ==========================================
