@@ -224,6 +224,17 @@ class GatedDeltaNet2J(nn.Module):
 # argsort + bincount (cumsum только по num_experts=8 элементам, а не по num_tokens) и
 # честный gather/scatter. Пиковая память теперь O(num_tokens*d + num_experts*capacity*d)
 # -- линейно, а не квадратично.
+class ExpertPack(nn.Module):
+    cfg: ModelConfig
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        h = nn.Dense(self.cfg.d_ff, name="w1")(x)
+        h = jax.nn.gelu(h)
+        h = nn.Dropout(rate=self.cfg.dropout_rate)(h, deterministic=deterministic)
+        return nn.Dense(self.cfg.d_model, name="w2")(h)
+
+
 class MoEJ(nn.Module):
     cfg: ModelConfig
 
@@ -233,10 +244,9 @@ class MoEJ(nn.Module):
         flat_x = x.reshape(-1, d)
         num_tokens = flat_x.shape[0]
         E, K = self.cfg.num_experts, self.cfg.top_k
+        n_assign = num_tokens * K
 
-        # ----- 1. Router -----
         router_logits = nn.Dense(E, use_bias=False, name="router")(flat_x)
-
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout")
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
@@ -244,69 +254,63 @@ class MoEJ(nn.Module):
             )
 
         router_probs = jax.nn.softmax(router_logits, axis=-1)
-        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K)
+        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K)  # (num_tokens, K)
 
-        mask = jnp.zeros_like(router_probs)
-        t_idx = jnp.arange(num_tokens)[:, None]
-        for i in range(K):
-            mask = mask.at[t_idx, top_k_idx[:, [i]]].set(top_k_vals[:, [i]])
-        mask = mask / (mask.sum(axis=-1, keepdims=True) + 1e-9)
+        # normalized top-k gate weights (same semantics as the old `mask`)
+        gate = top_k_vals / (jnp.sum(top_k_vals, axis=-1, keepdims=True) + 1e-9)
 
+        flat_expert_idx = top_k_idx.reshape(-1)                        # (n_assign,)
+        flat_gate = gate.reshape(-1)                                    # (n_assign,)
+        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K)          # (n_assign,)
+
+        # ---- diagnostics: cheap, O(num_tokens*E) or O(n_assign), never O(n_assign*capacity) ----
         mean_probs = jnp.mean(router_probs, axis=0)
-        expert_counts = jnp.mean(mask, axis=0)
-        self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * expert_counts))
+        expert_gate_frac = jnp.zeros(E, dtype=flat_gate.dtype).at[flat_expert_idx].add(flat_gate) / num_tokens
+        self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * expert_gate_frac))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(jax.scipy.special.logsumexp(router_logits, axis=-1))))
-        self.sow("losses", "expert_utilization", expert_counts)
+        expert_assign_frac = jnp.zeros(E, dtype=flat_gate.dtype).at[flat_expert_idx].add(1.0) / n_assign
+        self.sow("losses", "expert_utilization", expert_assign_frac)
 
-        # ----- 2. Создаём веса для каждого эксперта (без nn.vmap) -----
-        # Для каждого эксперта создаём w1 и w2 вручную
-        w1_list = []
-        w2_list = []
-        for e in range(E):
-            w1 = self.param(f"w1_{e}", nn.initializers.glorot_uniform(), (d, self.cfg.d_ff))
-            w2 = self.param(f"w2_{e}", nn.initializers.glorot_uniform(), (self.cfg.d_ff, d))
-            w1_list.append(w1)
-            w2_list.append(w2)
+        capacity = max(1, int(self.cfg.moe_capacity_factor * num_tokens * K / E))
 
-        # ----- 3. Назначаем токены экспертам -----
-        flat_expert_idx = top_k_idx.reshape(-1)  # (T*K,)
-        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K)  # (T*K,)
-        flat_gate = mask[flat_token_idx, flat_expert_idx]  # (T*K,)
+        # ---- gather/scatter dispatch ----
+        # Sort assignments by expert id so same-expert tokens become contiguous.
+        sort_order = jnp.argsort(flat_expert_idx)                       # (n_assign,) -- stable by default
+        sorted_expert = flat_expert_idx[sort_order]
 
-        tokens_for_expert = flat_x[flat_token_idx]  # (T*K, d)
+        # Per-expert counts (tiny, E entries) -> cumsum over E, NOT over n_assign.
+        expert_counts = jnp.zeros(E, dtype=jnp.int32).at[flat_expert_idx].add(1)
+        expert_start = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(expert_counts)[:-1]])
 
-        # Массив для выходов (по каждому назначению)
-        expert_outputs = jnp.zeros((num_tokens * K, d), dtype=x.dtype)
+        # Position of each sorted assignment within its own expert's bucket.
+        pos_in_bucket_sorted = jnp.arange(n_assign) - expert_start[sorted_expert]
+        valid_sorted = pos_in_bucket_sorted < capacity
 
-        # ----- 4. Обработка каждого эксперта (цикл по E) -----
-        for e in range(E):
-            mask_e = flat_expert_idx == e
-            if not jnp.any(mask_e):
-                continue
+        dest_row = sorted_expert * capacity + jnp.minimum(pos_in_bucket_sorted, capacity - 1)
 
-            tokens_e = tokens_for_expert[mask_e]  # (n_e, d)
-            w1 = w1_list[e]  # (d, d_ff)
-            w2 = w2_list[e]  # (d_ff, d)
+        gathered_x = flat_x[flat_token_idx][sort_order]                 # (n_assign, d) -- gather, not matmul
+        buffer = jnp.zeros((E * capacity, d), dtype=flat_x.dtype)
+        buffer = buffer.at[dest_row].add(jnp.where(valid_sorted[:, None], gathered_x, 0.0))
+        expert_inputs = buffer.reshape(E, capacity, d)
 
-            # Вычисление эксперта: линейный слой -> GELU -> dropout -> линейный слой
-            h = jax.nn.gelu(tokens_e @ w1)  # (n_e, d_ff)
+        run_experts = nn.vmap(
+            ExpertPack,
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            in_axes=(0, None),
+            out_axes=0,
+        )(cfg=self.cfg, name="experts_block")
+        expert_outputs = run_experts(expert_inputs, deterministic)      # (E, capacity, d)
 
-            if not deterministic:
-                # Dropout с использованием переданного rngs или локального
-                if rngs is not None and "dropout" in rngs:
-                    rng_drop = rngs["dropout"]
-                else:
-                    rng_drop = self.make_rng("dropout")
-                keep_prob = 1.0 - self.cfg.dropout_rate
-                mask_drop = jax.random.bernoulli(rng_drop, keep_prob, h.shape)
-                h = h * mask_drop / keep_prob
+        flat_expert_outputs = expert_outputs.reshape(E * capacity, d)
+        gathered_out_sorted = flat_expert_outputs[dest_row]             # (n_assign, d)
+        gathered_out_sorted = jnp.where(valid_sorted[:, None], gathered_out_sorted, 0.0)
 
-            out_e = h @ w2  # (n_e, d)
-            expert_outputs = expert_outputs.at[mask_e].set(out_e)
+        unsort_order = jnp.argsort(sort_order)                          # inverse permutation
+        gathered_out = gathered_out_sorted[unsort_order]                # back to assignment order
+        weighted_out = gathered_out * flat_gate[:, None]
 
-        # ----- 5. Сборка финального выхода -----
-        # Умножаем на гейты и добавляем к flat_x (как residual, но без отдельного сложения)
-        flat_outputs = jnp.zeros_like(flat_x).at[flat_token_idx].add(expert_outputs * flat_gate[:, None])
+        flat_outputs = jnp.zeros_like(flat_x).at[flat_token_idx].add(weighted_out)
         return flat_outputs.reshape(b, l, d)
 
 
