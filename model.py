@@ -311,7 +311,7 @@ class MoEJ(nn.Module):
         run_experts = nn.vmap(
             ExpertPack,
             variable_axes={"params": 0},
-            split_rngs={"params": True},
+            split_rngs={"params": True, "dropout": True},
             in_axes=(0, None),
             out_axes=0,
         )(cfg=self.cfg, name="experts_block")
