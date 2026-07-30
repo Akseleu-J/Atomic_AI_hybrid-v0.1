@@ -259,7 +259,7 @@ class MoEJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True, rngs=None):
+     def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
         num_tokens = flat_x.shape[0]
@@ -358,18 +358,12 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         alpha = jax.nn.softmax(self.param("alpha", nn.initializers.zeros, (3,)))
         current_delta = jnp.einsum("i,ibld->bld", alpha, jnp.stack([gdn_out, mamba_out, mla_out], axis=0))
 
-        # FIX: history_deltas is a static (num_layers, b, l, d) array now, not a python list.
-        # Write into this layer's own slot instead of broadcast-adding to every slot.
-        # `layer_idx` is a static python int (the layer loop is unrolled at trace time),
-        # so `.at[self.layer_idx]` is safe under jit.
         updated_history = history_deltas.at[self.layer_idx].set(current_delta)
 
         q_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_route")(current_x)
         k_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="k_route")(updated_history)
         routing_scores = jnp.einsum("bld,vbld->blv", q_route, k_route) / jnp.sqrt(self.cfg.d_latent)
 
-        # FIX: mask out layers deeper than the current one -- their slots are still
-        # zero-initialized placeholders and must not be attended to.
         depth_mask = jnp.arange(self.cfg.num_layers) <= self.layer_idx
         routing_scores = jnp.where(depth_mask[None, None, :], routing_scores, -1e9)
         routing_weights = jax.nn.softmax(routing_scores, axis=-1)
@@ -402,13 +396,9 @@ class FullHybridMoEModel(nn.Module):
             x, history_deltas = DeltaAttentionResidualBlockJ(
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
             )(x, history_deltas, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs)
-            
+
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
         if self.cfg.tie_embeddings:
-            # embed_layer.attend(x) == x @ embedding_matrix.T -- reuses the SAME (vocab,
-            # d_model) table instead of allocating a second one, saving
-            # vocab_size*d_model (~155M at this config's dims) and regularizing the
-            # embedding table itself (it now has to serve both input and output roles).
             logits = embed_layer.attend(final)
         else:
             logits = nn.Dense(self.cfg.vocab_size, use_bias=False, name="lm_head")(final)
