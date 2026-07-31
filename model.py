@@ -149,7 +149,7 @@ class MLAJ(nn.Module):
             if self.cfg.use_flash_attention and mesh is not None:
                 sharded_flash = jax.shard_map(
                     _flash_call,
-                    mesh = mesh
+                    mesh = mesh,
                     in_specs=P("tpu_nodes", None, None, None),
                     out_specs=P("tpu_nodes", None, None, None),
                     check_vma=False,
