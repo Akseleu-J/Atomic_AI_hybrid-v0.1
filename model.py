@@ -13,43 +13,28 @@ from jax.experimental.pallas.ops.tpu.flash_attention import (
 
 
 @struct.dataclass
+
 class ModelConfig:
-    d_model: int = 1024
-    d_state: int = 64
+    d_model: int = 384                # уменьшено с 1024
+    d_state: int = 32                 # уменьшено с 64
     d_conv: int = 4
     expand: int = 2
-    n_heads: int = 16
-    d_latent: int = 256
-    d_ff: int = 3072
-    num_experts: int = 8
+    n_heads: int = 6                  # d_model // n_heads = 64 (сохраняем d_head=64)
+    d_latent: int = 128               # уменьшено с 256
+    d_ff: int = 1536                  # 4 * d_model
+    num_experts: int = 4              # уменьшено с 8
     top_k: int = 2
-    num_layers: int = 22
-    vocab_size: int = 151936
+    num_layers: int = 6               # уменьшено с 22
+    vocab_size: int = 151936          # НЕ ИЗМЕНЯЕМ (фиксирован)
     dropout_rate: float = 0.1
     router_aux_loss_coef: float = 0.01
     router_z_loss_coef: float = 0.0001
     moe_capacity_factor: float = 1.25
-    tie_embeddings: bool = True
+    tie_embeddings: bool = True       # экономит память
     label_smoothing: float = 0.05
     router_noise_std: float = 0.3
-    # ЧЕМ ВЫЗВАН OOM НА MLA: наивная attention материализует score-матрицу формы
-    # (b, n_heads, l, l). При l=8192, n_heads=16 это b*16*8192*8192 элементов --
-    # ~2.15 ГБ на bf16 ТОЛЬКО под сам score-тензор, ОДИН слой, при b=1 (локальный
-    # батч на чип после data-parallel шардирования на 8 TPU). Softmax, causal
-    # mask (jnp.where создаёт новый массив) и dropout-маска добавляют ещё 2-3
-    # временных тензора того же размера поверх -- итого 6-9 ГБ пиковой памяти на
-    # ОДИН слой ещё до учёта весов/оптимизатора. remat не спасает: он убирает
-    # накопление активаций МЕЖДУ слоями, но не уменьшает размер активации ВНУТРИ
-    # одного слоя. Дальше N^2 не убрать без смены алгоритма -- отсюда Pallas
-    # Flash Attention: kernel считает attention блоками (block_q x block_k) и
-    # никогда не материализует полную (l, l) матрицу в HBM.
-    use_flash_attention: bool = True
-    # Размер чанка для chunked-scan в GatedDeltaNet2 (см. комментарий в
-    # GatedDeltaNet2J). Должен делить seq_len нацело. 8192 делится на 512, 1024,
-    # 2048 и т.д. -- выбирай по тому, сколько памяти готов отдать под один чанк
-    # (chunk_size * n_heads * d_head^2 * 2 байта на M/C/P каждый) против числа
-    # последовательных шагов scan (l / chunk_size).
-    deltanet_chunk_size: int = 1024
+    use_flash_attention: bool = False # отключаем пока (используем наивное внимание)
+    deltanet_chunk_size: int = 1024   # оставляем (но можно не менять)
 
 
 # ==========================================
