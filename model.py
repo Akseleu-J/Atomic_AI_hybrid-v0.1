@@ -83,7 +83,7 @@ class MLAJ(nn.Module):
         d_head = self.cfg.d_model // n_heads
 
         Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
-        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)  # (b, n_heads, l, d_head)
+        Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
         Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
 
         kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
@@ -94,37 +94,9 @@ class MLAJ(nn.Module):
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
         V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
-        # sm_scale must be a concrete Python float -- it is a static_argname in
-        # pallas_flash_attention's jax.jit signature, so a jnp-traced value here
-        # breaks under remat's retracing (float(tracer) raises
-        # ConcretizationTypeError). d_head is already a plain Python int.
         sm_scale = 1.0 / math.sqrt(d_head)
 
         if self.cfg.use_flash_attention:
-            # ЧТО ЗНАЧИТ ЭТА ОШИБКА: "Mosaic kernels cannot be automatically
-            # partitioned. Please wrap the call in a shard_map." Pallas/Mosaic
-            # kernели -- это opaque custom-call для XLA: GSPMD (jax.jit +
-            # in_shardings) не умеет заглянуть внутрь и решить, как разбить его
-            # между чипами, в отличие от обычных jnp-операций (einsum, cumsum и
-            # т.д.), для которых GSPMD ищет разбиение сам. Явный shard_map --
-            # единственный способ сказать "вот так шардировать", а не "прикинь
-            # сам".
-            #
-            # Здесь шардируем ТОЛЬКО batch-ось (op "tpu_nodes") -- каждый чип
-            # запускает kernel на своём локальном шарде батча, всё остальное
-            # (n_heads, l, d_head) реплицировано, что совпадает с тем, как уже
-            # шардированы данные в train.py (data_sharding = P("tpu_nodes", None)).
-            #
-            # ВАЖНО: block_sizes должен считаться от ЛОКАЛЬНОГО batch (внутри
-            # shard_map), а не от глобального `b` из внешней области видимости --
-            # kernel реально увидит только свой локальный шард. Проверено
-            # отдельно на CPU (4 симулированных устройства): функция внутри
-            # shard_map получает shape с локальным batch=1 при глобальном
-            # batch=4, а не глобальный размер.
-            #
-            # mesh берётся из ambient jax.set_mesh(mesh), который уже
-            # используется в train.py вокруг тренировочного цикла -- явно
-            # передавать mesh в модель не нужно.
             def _flash_call(q_local, k_local, v_local):
                 local_b = q_local.shape[0]
                 block_sizes = FlashBlockSizes.get_default(local_b, n_heads, l, l, d_head)
@@ -132,7 +104,8 @@ class MLAJ(nn.Module):
                     q_local, k_local, v_local,
                     causal=True, sm_scale=sm_scale, block_sizes=block_sizes,
                 )
-            if self.cfg.use_flash_attention and mesh is not None:
+
+            if mesh is not None:
                 sharded_flash = jax.shard_map(
                     _flash_call,
                     mesh=mesh,
@@ -141,18 +114,19 @@ class MLAJ(nn.Module):
                     check_vma=False,
                 )
                 out = sharded_flash(
-                        Q_rope.astype(jnp.bfloat16), K_rope.astype(jnp.bfloat16), V.astype(jnp.bfloat16)
-                    ).astype(x.dtype)
+                    Q_rope.astype(jnp.bfloat16),
+                    K_rope.astype(jnp.bfloat16),
+                    V.astype(jnp.bfloat16)
+                ).astype(x.dtype)
             else:
+                # CPU / single-device debug path
                 out = _flash_call(
                     Q_rope.astype(jnp.bfloat16),
                     K_rope.astype(jnp.bfloat16),
                     V.astype(jnp.bfloat16)
                 ).astype(x.dtype)
-                
         else:
-            # Naive fallback -- only for CPU debugging / small seq_len smoke tests.
-            # This is the O(l^2) path that caused the MLA OOM at seq_len=8192.
+            # Naive fallback — only for CPU debugging / small seq_len smoke tests.
             scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
             scores = jnp.where(causal_mask == 0, -1e9, scores)
             attn = jax.nn.softmax(scores, axis=-1)
@@ -447,10 +421,8 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
         mla_out = MLAJ(cfg=self.cfg, name="mla")(
-            norm_1, causal_mask, cos, sin, 
-            deterministic=deterministic, rngs=rngs
+            norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs
         )
-
         alpha = jax.nn.softmax(self.param("alpha", nn.initializers.zeros, (3,)))
         current_delta = jnp.einsum("i,ibld->bld", alpha, jnp.stack([gdn_out, mamba_out, mla_out], axis=0))
 
@@ -520,16 +492,12 @@ class FullHybridMoEModel(nn.Module):
 
         history_deltas = jnp.zeros((self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype)
 
-        # static_argnums index 6 = `deterministic` in both wrappers below (same
-        # __call__ signature position: self, current_x, history_deltas,
-        # causal_mask, cos, sin, deterministic, rngs).
         RematPair = nn.remat(DeltaResidualBlockPairJ, static_argnums=(6,))
         RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
 
         num_full_pairs = self.cfg.num_layers // 2
         for p in range(num_full_pairs):
             i = p * 2
-            # Добавляем mesh в rngs
             if rngs is not None:
                 rngs_with_mesh = dict(rngs)
                 rngs_with_mesh["mesh"] = mesh
@@ -539,7 +507,6 @@ class FullHybridMoEModel(nn.Module):
                 cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
             )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
 
-        # odd num_layers: handle the leftover single layer with per-layer remat
         if self.cfg.num_layers % 2 == 1:
             i = num_full_pairs * 2
             rngs_with_mesh = dict(rngs) if rngs is not None else {}
@@ -547,6 +514,7 @@ class FullHybridMoEModel(nn.Module):
             x, history_deltas = RematSingle(
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
             )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
+
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
         if self.cfg.tie_embeddings:
             logits = embed_layer.attend(final)
