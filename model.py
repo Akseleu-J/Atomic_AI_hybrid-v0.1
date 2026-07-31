@@ -91,7 +91,7 @@ class MLAJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
+    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None, mesh=None):
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
@@ -146,13 +146,14 @@ class MLAJ(nn.Module):
                     q_local, k_local, v_local,
                     causal=True, sm_scale=sm_scale, block_sizes=block_sizes,
                 )
-
-            sharded_flash = jax.shard_map(
-                _flash_call,
-                in_specs=P("tpu_nodes", None, None, None),
-                out_specs=P("tpu_nodes", None, None, None),
-                check_vma=False,
-            )
+            if self.cfg.use_flash_attention and mesh is not None:
+                sharded_flash = jax.shard_map(
+                    _flash_call,
+                    mesh = mesh
+                    in_specs=P("tpu_nodes", None, None, None),
+                    out_specs=P("tpu_nodes", None, None, None),
+                    check_vma=False,
+                )
             out = sharded_flash(
                 Q_rope.astype(jnp.bfloat16), K_rope.astype(jnp.bfloat16), V.astype(jnp.bfloat16)
             ).astype(x.dtype)
@@ -452,7 +453,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x)
         gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
-        mla_out = MLAJ(cfg=self.cfg, name="mla")(norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs)
+        mla_out = MLAJ(cfg=self.cfg, name="mla")(norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs, mesh=jax.current_mesh())
         alpha = jax.nn.softmax(self.param("alpha", nn.initializers.zeros, (3,)))
         current_delta = jnp.einsum("i,ibld->bld", alpha, jnp.stack([gdn_out, mamba_out, mla_out], axis=0))
 
@@ -511,7 +512,7 @@ class FullHybridMoEModel(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, input_ids, deterministic: bool = True, rngs=None):
+    def __call__(self, input_ids, deterministic: bool = True, rngs=None, mesh=None):
         b, l = input_ids.shape
         embed_layer = nn.Embed(num_embeddings=self.cfg.vocab_size, features=self.cfg.d_model, name="embed")
         x = embed_layer(input_ids)
@@ -533,7 +534,7 @@ class FullHybridMoEModel(nn.Module):
             i = p * 2
             x, history_deltas = RematPair(
                 cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
+            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs, mesh=mesh)
 
         # odd num_layers: handle the leftover single layer with per-layer remat
         if self.cfg.num_layers % 2 == 1:
