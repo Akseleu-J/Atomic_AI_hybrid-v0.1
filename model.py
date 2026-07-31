@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax import struct
 from typing import List
-
+from jax.sharding import PartitionSpec as P
 from jax.experimental.pallas.ops.tpu.flash_attention import (
     flash_attention as pallas_flash_attention,
     BlockSizes as FlashBlockSizes,
