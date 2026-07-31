@@ -532,16 +532,16 @@ class FullHybridMoEModel(nn.Module):
 
         num_full_pairs = self.cfg.num_layers // 2
        for p in range(num_full_pairs):
-        i = p * 2
+            i = p * 2
         # Добавляем mesh в rngs
-        if rngs is not None:
-            rngs_with_mesh = dict(rngs)
-            rngs_with_mesh["mesh"] = mesh
-        else:
-            rngs_with_mesh = {"mesh": mesh}
-        x, history_deltas = RematPair(
-            cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
-        )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
+            if rngs is not None:
+                rngs_with_mesh = dict(rngs)
+                rngs_with_mesh["mesh"] = mesh
+            else:
+                rngs_with_mesh = {"mesh": mesh}
+            x, history_deltas = RematPair(
+                cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
+            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
 
         # odd num_layers: handle the leftover single layer with per-layer remat
             if self.cfg.num_layers % 2 == 1:
