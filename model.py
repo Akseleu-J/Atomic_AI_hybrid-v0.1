@@ -531,9 +531,9 @@ class FullHybridMoEModel(nn.Module):
         RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
 
         num_full_pairs = self.cfg.num_layers // 2
-       for p in range(num_full_pairs):
+        for p in range(num_full_pairs):
             i = p * 2
-        # Добавляем mesh в rngs
+            # Добавляем mesh в rngs
             if rngs is not None:
                 rngs_with_mesh = dict(rngs)
                 rngs_with_mesh["mesh"] = mesh
