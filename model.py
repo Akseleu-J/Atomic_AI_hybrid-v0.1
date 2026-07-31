@@ -10,7 +10,14 @@ from jax.experimental.pallas.ops.tpu.flash_attention import (
     flash_attention as pallas_flash_attention,
     BlockSizes as FlashBlockSizes,
 )
+_model_mesh = None
 
+def set_model_mesh(mesh):
+    global _model_mesh
+    _model_mesh = mesh
+
+def get_model_mesh():
+    return _model_mesh
 
 @struct.dataclass
 
@@ -77,7 +84,7 @@ class MLAJ(nn.Module):
 
     @nn.compact
     def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
-        mesh = rngs.get("mesh") if rngs is not None else None
+        mesh = get_model_mesh()
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
@@ -440,8 +447,6 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(moe_in)
         moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
         return moe_in + moe_out, updated_history
-
-
 # ==========================================
 # Block of 2 consecutive Delta-Attention Residual layers, sharing one remat scope
 # ==========================================
@@ -481,7 +486,7 @@ class FullHybridMoEModel(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, input_ids, deterministic: bool = True, rngs=None, mesh=None):
+    def __call__(self, input_ids, deterministic: bool = True, rngs=None):
         b, l = input_ids.shape
         embed_layer = nn.Embed(num_embeddings=self.cfg.vocab_size, features=self.cfg.d_model, name="embed")
         x = embed_layer(input_ids)
@@ -498,22 +503,15 @@ class FullHybridMoEModel(nn.Module):
         num_full_pairs = self.cfg.num_layers // 2
         for p in range(num_full_pairs):
             i = p * 2
-            if rngs is not None:
-                rngs_with_mesh = dict(rngs)
-                rngs_with_mesh["mesh"] = mesh
-            else:
-                rngs_with_mesh = {"mesh": mesh}
             x, history_deltas = RematPair(
                 cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
+            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
 
         if self.cfg.num_layers % 2 == 1:
             i = num_full_pairs * 2
-            rngs_with_mesh = dict(rngs) if rngs is not None else {}
-            rngs_with_mesh["mesh"] = mesh
             x, history_deltas = RematSingle(
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
+            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
 
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
         if self.cfg.tie_embeddings:
