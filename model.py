@@ -91,7 +91,8 @@ class MLAJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
-    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None, mesh=None):
+    def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
+        mesh = rngs.get("mesh") if rngs is not None else None
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
@@ -149,14 +150,14 @@ class MLAJ(nn.Module):
             if self.cfg.use_flash_attention and mesh is not None:
                 sharded_flash = jax.shard_map(
                     _flash_call,
-                    mesh = mesh,
+                    mesh=mesh,
                     in_specs=P("tpu_nodes", None, None, None),
                     out_specs=P("tpu_nodes", None, None, None),
                     check_vma=False,
                 )
-            out = sharded_flash(
-                Q_rope.astype(jnp.bfloat16), K_rope.astype(jnp.bfloat16), V.astype(jnp.bfloat16)
-            ).astype(x.dtype)
+                out = sharded_flash(
+                        Q_rope.astype(jnp.bfloat16), K_rope.astype(jnp.bfloat16), V.astype(jnp.bfloat16)
+                    ).astype(x.dtype)
         else:
             # Naive fallback -- only for CPU debugging / small seq_len smoke tests.
             # This is the O(l^2) path that caused the MLA OOM at seq_len=8192.
@@ -530,19 +531,26 @@ class FullHybridMoEModel(nn.Module):
         RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
 
         num_full_pairs = self.cfg.num_layers // 2
-        for p in range(num_full_pairs):
-            i = p * 2
-            x, history_deltas = RematPair(
-                cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs, mesh=mesh)
+       for p in range(num_full_pairs):
+        i = p * 2
+        # Добавляем mesh в rngs
+        if rngs is not None:
+            rngs_with_mesh = dict(rngs)
+            rngs_with_mesh["mesh"] = mesh
+        else:
+            rngs_with_mesh = {"mesh": mesh}
+        x, history_deltas = RematPair(
+            cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
+        )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
 
         # odd num_layers: handle the leftover single layer with per-layer remat
-        if self.cfg.num_layers % 2 == 1:
-            i = num_full_pairs * 2
-            x, history_deltas = RematSingle(
-                cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
-
+            if self.cfg.num_layers % 2 == 1:
+                i = num_full_pairs * 2
+                rngs_with_mesh = dict(rngs) if rngs is not None else {}
+                rngs_with_mesh["mesh"] = mesh
+                x, history_deltas = RematSingle(
+                    cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
+                )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs_with_mesh)
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
         if self.cfg.tie_embeddings:
             logits = embed_layer.attend(final)
