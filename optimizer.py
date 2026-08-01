@@ -100,11 +100,104 @@ def make_hybrid_optimizer(total_steps: int):
 # ==========================================
 # Loss
 # ==========================================
-def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, deterministic=False, return_aux=False):
+def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size):
+    """One token-chunk of label-smoothed CE. Wrapped in jax.checkpoint by the
+    caller so its forward tensors (chunk_size, vocab) are recomputed during
+    backward instead of being kept alive for the whole scan -- see
+    chunked_cross_entropy below for why this exists."""
+    sum_loss, sum_mask = carry
+    hidden_chunk, label_chunk = chunk  # (chunk_size, d_model), (chunk_size,)
+
+    logits_chunk = hidden_chunk @ w  # (chunk_size, vocab) -- the only large tensor,
+                                       # and only for ONE chunk at a time
+    log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
+
+    labels_safe = jnp.clip(label_chunk, 0, vocab_size - 1)  # -100 (ignore_index) -> valid
+                                                               # gather index; zeroed by mask below
+    nll = -jnp.take_along_axis(log_probs, labels_safe[:, None], axis=-1).squeeze(-1)
+
+    if smooth_negative is not None:
+        sum_log_probs = jnp.sum(log_probs, axis=-1)
+        loss_vec = nll * (smooth_positive - smooth_negative) - smooth_negative * sum_log_probs
+    else:
+        loss_vec = nll
+
+    mask = (label_chunk != -100).astype(jnp.float32)
+    new_carry = (sum_loss + jnp.sum(loss_vec * mask), sum_mask + jnp.sum(mask))
+    return new_carry, None  # (carry, y) -- the shape jax.lax.scan's step fn must return
+
+
+def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=256):
+    """Same label-smoothed cross-entropy as before, but the (batch, seq, vocab)
+    logits/log_probs tensor is NEVER materialized in full.
+
+    ЧТО БЫЛО (две итерации назад): jax.nn.one_hot(labels, vocab_size) строил
+    плотный таргет (batch, seq, vocab) -- ~2.5 ГБ на fp32 при batch=2, seq=2048,
+    vocab=151936, и таких тензоров строилось 3-4 разом.
+
+    ЧТО СТАЛО ПОТОМ (прошлая правка): убрали one-hot через take_along_axis --
+    но это не сдвинуло OOM (16.76 -> 16.77 ГБ), потому что сам `logits` и
+    `log_probs` -- тензоры ТОЙ ЖЕ формы (batch, seq, vocab) -- строились самой
+    моделью (`embed_layer.attend(final)` в model.py) ДО того, как loss вообще
+    начинал считаться, и это происходит вне nn.remat-скоупов модели (remat там
+    оборачивает только transformer-блоки, не финальную проекцию). На стыке
+    forward/backward нужно ОДНОВРЕМЕННО держать forward-тензор и backward-тензор
+    того же размера -- отсюда ~8-10 ГБ только на этот узел, и remat здесь не
+    помогает (нечего "растягивать" -- промежуток между вычислением и
+    использованием и так короткий).
+
+    ЧТО СТАЛО ТЕПЕРЬ: model.py возвращает `final` (b, l, d_model) вместо
+    `logits` (return_hidden=True) -- маленький тензор, не зависящий от vocab_size.
+    Проекция в vocab-пространство и вся loss-арифметика делается здесь, чанками
+    по `chunk_size` токенов через jax.lax.scan, и тело каждого чанка обёрнуто в
+    jax.checkpoint: во время backward JAX пересчитывает logits/log_probs для
+    ОДНОГО чанка за раз и сразу их выбрасывает, вместо того чтобы хранить все
+    чанки разом. Пиковая память по этому узлу падает с O(batch*seq*vocab) до
+    O(chunk_size*vocab) -- при chunk_size=256 это ~148 МБ вместо ~2.5 ГБ.
+    Градиент по `w` (embedding-таблица/lm_head) накапливается через обычный
+    autodiff по scan (JAX суммирует вклад каждой итерации в grad замкнутого
+    аргумента корректно, это стандартное поведение, не что-то специальное).
+    Численно эквивалентно прежней формуле -- то же разложение, тот же
+    take_along_axis + sum(log_probs), просто по кускам вместо разом.
+    """
+    b, l, d = final_hidden.shape
+    vocab_size = w.shape[-1]
+
+    flat_hidden = final_hidden.reshape(b * l, d)
+    flat_labels = labels.reshape(b * l)
+
+    n_tokens = flat_hidden.shape[0]
+    pad = (-n_tokens) % chunk_size
+    if pad:
+        flat_hidden = jnp.pad(flat_hidden, ((0, pad), (0, 0)))
+        flat_labels = jnp.pad(flat_labels, (0, pad), constant_values=-100)
+
+    n_chunks = flat_hidden.shape[0] // chunk_size
+    hidden_chunks = flat_hidden.reshape(n_chunks, chunk_size, d)
+    label_chunks = flat_labels.reshape(n_chunks, chunk_size)
+
+    smooth_positive = 1.0 - label_smoothing
+    smooth_negative = (label_smoothing / (vocab_size - 1)) if label_smoothing > 0 else None
+
+    # jax.checkpoint on the per-chunk step itself: during backward, jax.lax.scan
+    # recomputes logits_chunk/log_probs for one chunk at a time from the (small,
+    # cheap-to-keep) hidden_chunk, uses them, then discards them -- instead of
+    # every chunk's (chunk_size, vocab) tensor being kept alive simultaneously
+    # for the whole scan.
+    scan_step = jax.checkpoint(
+        lambda carry, chunk: _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size)
+    )
+
+    (sum_loss, sum_mask), _ = jax.lax.scan(scan_step, (0.0, 0.0), (hidden_chunks, label_chunks))
+    return sum_loss / (sum_mask + 1e-9)
+
+
+def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, deterministic=False, return_aux=False,
+                  ce_chunk_size=256):
     input_ids = batch["input_ids"]
     labels = batch["labels"]
 
-    kwargs = {"deterministic": deterministic}
+    kwargs = {"deterministic": deterministic, "return_hidden": True}
     if rngs is not None:
         kwargs["rngs"] = rngs
 
@@ -114,7 +207,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
 
     expert_util_stacked = None
     if not deterministic:
-        logits, sowed_vars = outputs
+        final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
         z_losses = collect_by_leaf_name(sowed_vars["losses"], "z_loss")
         expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
@@ -123,45 +216,18 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         if expert_utils:
             expert_util_stacked = jnp.stack(expert_utils)
     else:
-        logits = outputs
+        final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
 
-    vocab_size = logits.shape[-1]
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-
-    # ЧТО БЫЛО: jax.nn.one_hot(labels, vocab_size) строил ПЛОТНЫЙ таргет формы
-    # (batch, seq, vocab_size). При vocab_size=151936 (сознательно не уменьшенном
-    # для теста) один такой тензор -- уже ~2.5 ГБ на fp32 при batch=2, seq=2048.
-    # А их строилось МИНИМУМ 3-4 разом: one_hot_labels, сглаженный one_hot_labels,
-    # и log_probs*one_hot_labels перед суммированием -- 10+ ГБ только на loss, пока
-    # сама модель (d_model=384, num_layers=6) занимает памяти на порядок меньше.
-    # Это и объясняет OOM "в притык" (16.76 ГБ нужно / 15.75 ГБ доступно) при
-    # уже уменьшенном конфиге -- урезали всё, кроме vocab_size, а именно он тут
-    # доминировал.
-    #
-    # ЧТО СТАЛО: та же самая label-smoothed cross-entropy, но без one-hot --
-    # gather нужного log_prob через take_along_axis (O(batch*seq), не
-    # O(batch*seq*vocab)) плюс sum(log_probs) для члена сглаживания (это
-    # редукция уже вычисленного log_probs, а не новый большой массив). Разложение:
-    #   loss = -sum_v target[v] * log_probs[v]
-    #        = -log_probs[label]*(smooth_pos - smooth_neg) - smooth_neg*sum_v(log_probs[v])
-    # Проверено численно против старой one-hot формулы (разные label_smoothing,
-    # включая ignore_index=-100): совпадает с точностью float32 (~5e-7), градиенты
-    # -- та же точность.
-    labels_safe = jnp.clip(labels, 0, vocab_size - 1)  # -100 (ignore_index) -> валидный индекс для gather;
-                                                          # реальное значение всё равно обнулится через `mask` ниже
-    nll = -jnp.take_along_axis(log_probs, labels_safe[..., None], axis=-1).squeeze(-1)
-
-    if cfg.label_smoothing > 0:
-        smooth_positive = 1.0 - cfg.label_smoothing
-        smooth_negative = cfg.label_smoothing / (vocab_size - 1)
-        sum_log_probs = jnp.sum(log_probs, axis=-1)
-        loss_matrix = nll * (smooth_positive - smooth_negative) - smooth_negative * sum_log_probs
+    # w must be (d_model, vocab) for `hidden_chunk @ w` in chunked_cross_entropy.
+    # Tied embeddings: nn.Embed's kernel is stored (vocab, d_model) -- transpose.
+    # Untied: nn.Dense("lm_head") kernel is already (d_model, vocab).
+    if cfg.tie_embeddings:
+        w = params["embed"]["embedding"].T
     else:
-        loss_matrix = nll
+        w = params["lm_head"]["kernel"]
 
-    mask = (labels != -100).astype(jnp.float32)
-    ce_loss = jnp.sum(loss_matrix * mask) / (jnp.sum(mask) + 1e-9)
+    ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
 
     total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
     if return_aux:
