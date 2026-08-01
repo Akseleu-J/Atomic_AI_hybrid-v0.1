@@ -72,7 +72,13 @@ def make_hybrid_optimizer(total_steps: int):
         path_str = path_to_str(path)
         if "embed" in path_str or "lm_head" in path_str:
             return "adamw_decay"
-        if "rmsnorm" in path_str or "bias" in path_str:
+        # ФИКС: слои нормализации в model.py называются norm_1/norm_2/out_norm/
+        # final_norm -- подстрока "rmsnorm" никогда не встречается в пути, поэтому
+        # все scale-векторы RMSNorm (1D) проскальзывали мимо этой ветки и падали в
+        # `else: return "lion"` ниже -- обучались Lion'ом с weight decay вместо
+        # AdamW без decay, как задумывалось. Проверено на коллизии: "norm" не
+        # цепляет router/q_route/k_route/decay_proj/out_proj и т.д.
+        if "norm" in path_str or "bias" in path_str:
             return "adamw_nodecay"
         if param.ndim >= 2:
             if "mamba" in path_str:
