@@ -6,10 +6,27 @@ from flax import linen as nn
 from flax import struct
 from typing import List
 from jax.sharding import PartitionSpec as P
-from jax.experimental.pallas.ops.tpu.flash_attention import (
-    flash_attention as pallas_flash_attention,
-    BlockSizes as FlashBlockSizes,
-)
+
+# Lazy/fault-tolerant: this import chain (jax.experimental.pallas.ops...) has been
+# breaking on some Kaggle TPU environments with
+#   AttributeError: module 'jax' has no attribute '_src'
+# raised from INSIDE jax's own jax/experimental/pallas/ops/__init__.py -- a
+# jax/jaxlib version-skew issue, not something in this file. pallas_flash_attention
+# is only ever called behind `if self.cfg.use_flash_attention:` further down, so a
+# broken/unavailable Pallas import should not prevent the whole module (and every
+# other config with use_flash_attention=False) from loading. If use_flash_attention
+# is turned on later and this import genuinely failed, MLAJ raises a clear error at
+# that point instead of at module-import time.
+try:
+    from jax.experimental.pallas.ops.tpu.flash_attention import (
+        flash_attention as pallas_flash_attention,
+        BlockSizes as FlashBlockSizes,
+    )
+    _PALLAS_FLASH_ATTENTION_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001 -- deliberately broad: import-time failures
+    pallas_flash_attention = None
+    FlashBlockSizes = None
+    _PALLAS_FLASH_ATTENTION_IMPORT_ERROR = _e
 
 _model_mesh = None
 _batch_axis = None  # None -> batch axis is fully replicated; "tpu_nodes" -> sharded across the mesh
@@ -112,6 +129,15 @@ class MLAJ(nn.Module):
         sm_scale = 1.0 / math.sqrt(d_head)
 
         if self.cfg.use_flash_attention:
+            if pallas_flash_attention is None:
+                raise ImportError(
+                    "cfg.use_flash_attention=True but jax.experimental.pallas.ops.tpu."
+                    "flash_attention failed to import (see model.py's module-level "
+                    "try/except) -- original error: "
+                    f"{_PALLAS_FLASH_ATTENTION_IMPORT_ERROR!r}. Either fix the jax/"
+                    "jaxlib environment, or set use_flash_attention=False."
+                )
+
             def _flash_call(q_local, k_local, v_local):
                 local_b = q_local.shape[0]
                 block_sizes = FlashBlockSizes.get_default(local_b, n_heads, l, l, d_head)
@@ -534,11 +560,14 @@ class FullHybridMoEModel(nn.Module):
 
         # return_hidden=True skips the vocab projection entirely. (batch, seq,
         # vocab) logits + log_probs together dominate memory at vocab_size=151936
-        # and this projection sits outside the nn.remat scopes above (those only
-        # cover the transformer block pairs) -- compute_loss's
-        # chunked_cross_entropy does the projection itself, chunk by chunk,
-        # straight from `final`. Default False so other callers (generation, eval
-        # scripts) keep getting full logits unchanged.
+        # (~2.5GB EACH at batch=2, seq=2048, fp32) and this projection sits outside
+        # the nn.remat scopes above (those only cover the transformer block pairs),
+        # so nothing here gets recomputed instead of stored during backward. The
+        # only way to avoid materializing the full tensor is to never build it in
+        # the first place -- compute_loss's chunked_cross_entropy does the
+        # projection itself, chunk by chunk, straight from `final`. Default is
+        # False so any other caller (generation, eval scripts, etc.) keeps getting
+        # full logits unchanged.
         if return_hidden:
             return final
 
