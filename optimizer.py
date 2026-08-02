@@ -212,12 +212,19 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
+        # Всегда массив фиксированной формы (num_layers, num_experts), никогда
+        # None -- aux_info_sharding объявляет NamedSharding(mesh, P(None, None))
+        # для expert_utilization, а не Optional[array]; передать туда None было
+        # бы рассогласованием со specом на выходе jax.jit.
         expert_util_stacked = jnp.stack(expert_utils) if expert_utils else jnp.zeros((cfg.num_layers, cfg.num_experts))
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
         expert_util_stacked = jnp.zeros((cfg.num_layers, cfg.num_experts))
 
+    # w must be (d_model, vocab) for `hidden_chunk @ w` in chunked_cross_entropy.
+    # Tied embeddings: nn.Embed's kernel is stored (vocab, d_model) -- transpose.
+    # Untied: nn.Dense("lm_head") kernel is already (d_model, vocab).
     if cfg.tie_embeddings:
         w = params["embed"]["embedding"].T
     else:
