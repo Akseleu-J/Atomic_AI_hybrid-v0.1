@@ -516,7 +516,7 @@ class FullHybridMoEModel(nn.Module):
 
         RematPair = nn.remat(DeltaResidualBlockPairJ, static_argnums=(6,))
         RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
-        
+
         num_full_pairs = self.cfg.num_layers // 2
         for p in range(num_full_pairs):
             i = p * 2
@@ -534,14 +534,11 @@ class FullHybridMoEModel(nn.Module):
 
         # return_hidden=True skips the vocab projection entirely. (batch, seq,
         # vocab) logits + log_probs together dominate memory at vocab_size=151936
-        # (~2.5GB EACH at batch=2, seq=2048, fp32) and this projection sits outside
-        # the nn.remat scopes above (those only cover the transformer block pairs),
-        # so nothing here gets recomputed instead of stored during backward. The
-        # only way to avoid materializing the full tensor is to never build it in
-        # the first place -- compute_loss's chunked_cross_entropy does the
-        # projection itself, chunk by chunk, straight from `final`. Default is
-        # False so any other caller (generation, eval scripts, etc.) keeps getting
-        # full logits unchanged.
+        # and this projection sits outside the nn.remat scopes above (those only
+        # cover the transformer block pairs) -- compute_loss's
+        # chunked_cross_entropy does the projection itself, chunk by chunk,
+        # straight from `final`. Default False so other callers (generation, eval
+        # scripts) keep getting full logits unchanged.
         if return_hidden:
             return final
 
