@@ -514,8 +514,8 @@ class FullHybridMoEModel(nn.Module):
 
         history_deltas = jnp.zeros((self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype)
 
-        RematPair = DeltaResidualBlockPairJ
-        RematSingle = DeltaAttentionResidualBlockJ
+        RematPair = nn.remat(DeltaResidualBlockPairJ, static_argnums=(6,))
+        RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
         
         num_full_pairs = self.cfg.num_layers // 2
         for p in range(num_full_pairs):
