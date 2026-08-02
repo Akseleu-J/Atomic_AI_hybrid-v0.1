@@ -201,27 +201,14 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     if rngs is not None:
         kwargs["rngs"] = rngs
 
+    # УБРАНО mutable=["losses"] — чистый forward без side-effects
     outputs = model_fn(
-        {"params": params}, input_ids, **kwargs, mutable=["losses"] if not deterministic else False
+        {"params": params}, input_ids, **kwargs
     )
 
-    expert_util_stacked = None
-    if not deterministic:
-        final_hidden, sowed_vars = outputs
-        aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
-        z_losses = collect_by_leaf_name(sowed_vars["losses"], "z_loss")
-        expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
-        aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
-        z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
-        if expert_utils:
-            expert_util_stacked = jnp.stack(expert_utils)
-    else:
-        final_hidden = outputs
-        aux_loss, z_loss = 0.0, 0.0
+    final_hidden = outputs  # теперь не tuple, т.к. mutable=False
 
-    # w must be (d_model, vocab) for `hidden_chunk @ w` in chunked_cross_entropy.
-    # Tied embeddings: nn.Embed's kernel is stored (vocab, d_model) -- transpose.
-    # Untied: nn.Dense("lm_head") kernel is already (d_model, vocab).
+    # w берём как раньше
     if cfg.tie_embeddings:
         w = params["embed"]["embedding"].T
     else:
@@ -229,13 +216,14 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
 
     ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
 
-    total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
+    # Aux-loss временно обнуляем — только для проверки OOM
+    total_loss = ce_loss
     if return_aux:
         aux_info = {
             "ce_loss": ce_loss,
-            "aux_loss": aux_loss,
-            "z_loss": z_loss,
-            "expert_utilization": expert_util_stacked,
+            "aux_loss": 0.0,
+            "z_loss": 0.0,
+            "expert_utilization": None,
         }
         return total_loss, aux_info
     return total_loss
