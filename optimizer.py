@@ -83,7 +83,7 @@ def make_hybrid_optimizer(total_steps: int):
         if param.ndim >= 2:
             if "mamba" in path_str:
                 return "lion"
-            return "muon"
+            return "adamw_nodecay"
         return "lion"
 
     def label_fn(params):
