@@ -201,27 +201,22 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     if rngs is not None:
         kwargs["rngs"] = rngs
 
-   
     outputs = model_fn(
         {"params": params}, input_ids, **kwargs, mutable=["losses"] if not deterministic else False
     )
 
-    expert_util_stacked = None
     if not deterministic:
-        logits, sowed_vars = outputs
+        final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
         z_losses = collect_by_leaf_name(sowed_vars["losses"], "z_loss")
         expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
-        if expert_utils:
-            expert_util_stacked = jnp.stack(expert_utils)
+        expert_util_stacked = jnp.stack(expert_utils) if expert_utils else jnp.zeros((cfg.num_layers, cfg.num_experts))
     else:
-        logits = outputs
+        final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
-
-    # ... chunked_cross_entropy как было ...
-    expert_util_stacked = jnp.zeros((cfg.num_layers, cfg.num_experts))
+        expert_util_stacked = jnp.zeros((cfg.num_layers, cfg.num_experts))
 
     if cfg.tie_embeddings:
         w = params["embed"]["embedding"].T
