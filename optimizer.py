@@ -201,29 +201,19 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     if rngs is not None:
         kwargs["rngs"] = rngs
 
-    # УБРАНО mutable=["losses"] — чистый forward без side-effects
-    outputs = model_fn(
+    # УБРАНО mutable=["losses"] — чистый forward
+    final_hidden = model_fn(
         {"params": params}, input_ids, **kwargs
     )
 
-    final_hidden = outputs  # теперь не tuple, т.к. mutable=False
-
-    # w берём как раньше
     if cfg.tie_embeddings:
         w = params["embed"]["embedding"].T
     else:
         w = params["lm_head"]["kernel"]
 
     ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
-
-    # Aux-loss временно обнуляем — только для проверки OOM
-    total_loss = ce_loss
+    
+    # Aux-loss временно обнулён — только для проверки OOM
     if return_aux:
-        aux_info = {
-            "ce_loss": ce_loss,
-            "aux_loss": 0.0,
-            "z_loss": 0.0,
-            "expert_utilization": None,
-        }
-        return total_loss, aux_info
-    return total_loss
+        return ce_loss, {"ce_loss": ce_loss, "aux_loss": 0.0, "z_loss": 0.0, "expert_utilization": None}
+    return ce_loss
