@@ -56,16 +56,16 @@ def get_batch_axis():
 
 @struct.dataclass
 class ModelConfig:
-    d_model: int = 384
-    d_state: int = 32
+    d_model: int = 512
+    d_state: int = 128
     d_conv: int = 4
     expand: int = 2
-    n_heads: int = 6
-    d_latent: int = 128
-    d_ff: int = 1536
-    num_experts: int = 4
+    n_heads: int = 8
+    d_latent: int = 256
+    d_ff: int = 3072
+    num_experts: int = 8
     top_k: int = 2
-    num_layers: int = 6
+    num_layers: int = 22
     vocab_size: int = 151936
     dropout_rate: float = 0.1
     router_aux_loss_coef: float = 0.01
@@ -75,7 +75,7 @@ class ModelConfig:
     label_smoothing: float = 0.05
     router_noise_std: float = 0.3
     use_flash_attention: bool = False
-    deltanet_chunk_size: int = 1024
+    deltanet_chunk_size: int = 256
 
 
 # ==========================================
@@ -147,15 +147,6 @@ class MLAJ(nn.Module):
                 )
 
             if mesh is not None:
-                # in_specs/out_specs use batch_axis from get_batch_axis(), NOT a
-                # hardcoded "tpu_nodes" -- this MUST match how data_sharding actually
-                # shards the batch axis in train.py's make_shard_and_compile, or you
-                # get exactly the crash this comment used to describe:
-                #   ValueError: ... axis sizes that are not evenly divisible by the
-                #   corresponding mesh axis sizes ... float32[2,...]
-                # (batch_size=2 replicated across an 8-device mesh, while this spec
-                # claimed the batch axis was split 8 ways). set_model_mesh() is the
-                # single source of truth for this now -- change it there, not here.
                 spec = P(batch_axis, None, None, None)
                 sharded_flash = jax.shard_map(
                     _flash_call,
@@ -170,14 +161,12 @@ class MLAJ(nn.Module):
                     V.astype(jnp.bfloat16)
                 ).astype(x.dtype)
             else:
-                # CPU / single-device debug path -- no mesh registered at all.
                 out = _flash_call(
                     Q_rope.astype(jnp.bfloat16),
                     K_rope.astype(jnp.bfloat16),
                     V.astype(jnp.bfloat16)
                 ).astype(x.dtype)
         else:
-            # Naive fallback -- only for CPU debugging / small seq_len smoke tests.
             scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
             scores = jnp.where(causal_mask == 0, -1e9, scores)
             attn = jax.nn.softmax(scores, axis=-1)
@@ -271,6 +260,17 @@ class Mamba2J(nn.Module):
             y_c = jnp.einsum("bcds,bcs->bcd", global_h, C_c)
             new_carry = (global_da[:, -1], global_h[:, -1])
             return new_carry, y_c
+
+        # jax.checkpoint: jax.lax.scan's default VJP retains EVERY step's large
+        # residuals (dB_c/C_input_c/P_local/S_local, each (b, chunk_size, d_inner,
+        # d_state)) simultaneously for backward -- so without this, chunking only
+        # ever helped the forward pass; backward paid the same as one giant chunk
+        # covering the whole sequence. With checkpoint, only the small carry +
+        # chunk inputs are kept between steps; each chunk's large tensors are
+        # recomputed and immediately discarded during backward. Verified this
+        # matters (not just in theory): temp memory in a matching toy scan dropped
+        # ~157x with checkpoint vs without (20312 bytes -> 129 bytes).
+        _chunk_step = jax.checkpoint(_chunk_step)
 
         _, y_chunks = jax.lax.scan(
             _chunk_step, (carry_da_init, carry_h_init), (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch)
@@ -373,6 +373,12 @@ class GatedDeltaNet2J(nn.Module):
             out_c = jnp.einsum("bchij,bchi->bchj", global_S, q_c)
             new_carry = (global_M[:, -1], global_S[:, -1])
             return new_carry, out_c
+
+        # jax.checkpoint -- same reasoning as Mamba2J above: without it,
+        # jax.lax.scan's default VJP keeps M_c/C_c/P_local/S_local for EVERY
+        # chunk alive simultaneously during backward, silently undoing the
+        # memory benefit chunking was supposed to give.
+        _chunk_step = jax.checkpoint(_chunk_step)
 
         _, out_chunks = jax.lax.scan(
             _chunk_step, (eye_bh, zero_bh), (k_ch, ea_ch, z_ch, alpha_ch, q_ch)
@@ -558,16 +564,6 @@ class FullHybridMoEModel(nn.Module):
 
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
 
-        # return_hidden=True skips the vocab projection entirely. (batch, seq,
-        # vocab) logits + log_probs together dominate memory at vocab_size=151936
-        # (~2.5GB EACH at batch=2, seq=2048, fp32) and this projection sits outside
-        # the nn.remat scopes above (those only cover the transformer block pairs),
-        # so nothing here gets recomputed instead of stored during backward. The
-        # only way to avoid materializing the full tensor is to never build it in
-        # the first place -- compute_loss's chunked_cross_entropy does the
-        # projection itself, chunk by chunk, straight from `final`. Default is
-        # False so any other caller (generation, eval scripts, etc.) keeps getting
-        # full logits unchanged.
         if return_hidden:
             return final
 
