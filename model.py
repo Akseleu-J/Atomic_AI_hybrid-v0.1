@@ -129,9 +129,6 @@ class MLAJ(nn.Module):
         sm_scale = 1.0 / math.sqrt(d_head)
 
         if self.cfg.use_flash_attention:
-            
-            print("[MLA] ✅ Используется FlashAttention")
-
             if pallas_flash_attention is None:
                 raise ImportError(
                     "cfg.use_flash_attention=True but jax.experimental.pallas.ops.tpu."
@@ -140,8 +137,7 @@ class MLAJ(nn.Module):
                     f"{_PALLAS_FLASH_ATTENTION_IMPORT_ERROR!r}. Either fix the jax/"
                     "jaxlib environment, or set use_flash_attention=False."
                 )
-        else:
-            print("[MLA] ❌ FlashAttention НЕ используется, падаем на наивный путь")
+
             def _flash_call(q_local, k_local, v_local):
                 local_b = q_local.shape[0]
                 block_sizes = FlashBlockSizes.get_default(local_b, n_heads, l, l, d_head)
