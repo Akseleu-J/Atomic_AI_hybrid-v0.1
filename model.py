@@ -56,16 +56,16 @@ def get_batch_axis():
 
 @struct.dataclass
 class ModelConfig:
-    d_model: int = 512
-    d_state: int = 128
+    d_model: int = 384
+    d_state: int = 32
     d_conv: int = 4
     expand: int = 2
-    n_heads: int = 8
-    d_latent: int = 256
-    d_ff: int = 3072
-    num_experts: int = 8
+    n_heads: int = 6
+    d_latent: int = 128
+    d_ff: int = 1536
+    num_experts: int = 4
     top_k: int = 2
-    num_layers: int = 22
+    num_layers: int = 6
     vocab_size: int = 151936
     dropout_rate: float = 0.1
     router_aux_loss_coef: float = 0.01
@@ -75,7 +75,7 @@ class ModelConfig:
     label_smoothing: float = 0.05
     router_noise_std: float = 0.3
     use_flash_attention: bool = False
-    deltanet_chunk_size: int = 256
+    deltanet_chunk_size: int = 1024
 
 
 # ==========================================
@@ -114,13 +114,13 @@ class MLAJ(nn.Module):
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
 
-        Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q")(x)
+        Q = nn.Dense(self.cfg.d_model, use_bias=False, name="W_q", dtype=jnp.bfloat16)(x)
         Q = Q.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
         Q_rope = apply_rope(Q, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
 
-        kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down")(x)
-        K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up")(kv_latent)
-        V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up")(kv_latent)
+        kv_latent = nn.Dense(self.cfg.d_latent, use_bias=False, name="W_kv_down", dtype=jnp.bfloat16)(x)
+        K = nn.Dense(self.cfg.d_model, use_bias=False, name="W_k_up", dtype=jnp.bfloat16)(kv_latent)
+        V = nn.Dense(self.cfg.d_model, use_bias=False, name="W_v_up", dtype=jnp.bfloat16)(kv_latent)
 
         K = K.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
@@ -147,6 +147,15 @@ class MLAJ(nn.Module):
                 )
 
             if mesh is not None:
+                # in_specs/out_specs use batch_axis from get_batch_axis(), NOT a
+                # hardcoded "tpu_nodes" -- this MUST match how data_sharding actually
+                # shards the batch axis in train.py's make_shard_and_compile, or you
+                # get exactly the crash this comment used to describe:
+                #   ValueError: ... axis sizes that are not evenly divisible by the
+                #   corresponding mesh axis sizes ... float32[2,...]
+                # (batch_size=2 replicated across an 8-device mesh, while this spec
+                # claimed the batch axis was split 8 ways). set_model_mesh() is the
+                # single source of truth for this now -- change it there, not here.
                 spec = P(batch_axis, None, None, None)
                 sharded_flash = jax.shard_map(
                     _flash_call,
@@ -161,12 +170,14 @@ class MLAJ(nn.Module):
                     V.astype(jnp.bfloat16)
                 ).astype(x.dtype)
             else:
+                # CPU / single-device debug path -- no mesh registered at all.
                 out = _flash_call(
                     Q_rope.astype(jnp.bfloat16),
                     K_rope.astype(jnp.bfloat16),
                     V.astype(jnp.bfloat16)
                 ).astype(x.dtype)
         else:
+            # Naive fallback -- only for CPU debugging / small seq_len smoke tests.
             scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
             scores = jnp.where(causal_mask == 0, -1e9, scores)
             attn = jax.nn.softmax(scores, axis=-1)
@@ -178,7 +189,7 @@ class MLAJ(nn.Module):
             out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
-        return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o")(out)
+        return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o", dtype=jnp.bfloat16)(out)
 
 
 # ==========================================
@@ -193,7 +204,7 @@ class Mamba2J(nn.Module):
         d_inner = d * self.cfg.expand
         d_state = self.cfg.d_state
 
-        in_proj = nn.Dense(d_inner * 2, use_bias=False, name="in_proj")(x)
+        in_proj = nn.Dense(d_inner * 2, use_bias=False, name="in_proj", dtype=jnp.bfloat16)(x)
         x_bc, res = jnp.split(in_proj, 2, axis=-1)
 
         conv_w = self.param("conv_w", nn.initializers.normal(stddev=0.02), (d_inner, self.cfg.d_conv))
@@ -211,9 +222,9 @@ class Mamba2J(nn.Module):
         x_conv = jax.nn.silu(res_conv + conv_b[None, None, :])
 
         A = -jnp.exp(self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,)))
-        B = nn.Dense(d_state, use_bias=False, name="B_proj")(x_bc)
-        C = nn.Dense(d_state, use_bias=False, name="C_proj")(x_bc)
-        dt = jax.nn.softplus(nn.Dense(d_inner, use_bias=True, name="dt_proj")(x_bc))
+        B = nn.Dense(d_state, use_bias=False, name="B_proj", dtype=jnp.bfloat16)(x_bc)
+        C = nn.Dense(d_state, use_bias=False, name="C_proj", dtype=jnp.bfloat16)(x_bc)
+        dt = jax.nn.softplus(nn.Dense(d_inner, use_bias=True, name="dt_proj", dtype=jnp.bfloat16)(x_bc))
 
         dA = jnp.exp(jnp.einsum("bld,d->bld", dt, A))
 
@@ -261,24 +272,13 @@ class Mamba2J(nn.Module):
             new_carry = (global_da[:, -1], global_h[:, -1])
             return new_carry, y_c
 
-        # jax.checkpoint: jax.lax.scan's default VJP retains EVERY step's large
-        # residuals (dB_c/C_input_c/P_local/S_local, each (b, chunk_size, d_inner,
-        # d_state)) simultaneously for backward -- so without this, chunking only
-        # ever helped the forward pass; backward paid the same as one giant chunk
-        # covering the whole sequence. With checkpoint, only the small carry +
-        # chunk inputs are kept between steps; each chunk's large tensors are
-        # recomputed and immediately discarded during backward. Verified this
-        # matters (not just in theory): temp memory in a matching toy scan dropped
-        # ~157x with checkpoint vs without (20312 bytes -> 129 bytes).
-        _chunk_step = jax.checkpoint(_chunk_step)
-
         _, y_chunks = jax.lax.scan(
             _chunk_step, (carry_da_init, carry_h_init), (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch)
         )
         y = jnp.moveaxis(y_chunks, 0, 1).reshape(b, l, d_inner)
 
         out = y * jax.nn.silu(res)
-        return nn.Dense(d, use_bias=False, name="out_proj")(out)
+        return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out)
 
 
 # ==========================================
@@ -310,9 +310,9 @@ class GatedDeltaNet2J(nn.Module):
             )
             return out + conv_b[None, None, :]
 
-        q_lin = nn.Dense(d, use_bias=False, name="q_proj")(x)
-        k_lin = nn.Dense(d, use_bias=False, name="k_proj")(x)
-        v_lin = nn.Dense(d, use_bias=False, name="v_proj")(x)
+        q_lin = nn.Dense(d, use_bias=False, name="q_proj", dtype=jnp.bfloat16)(x)
+        k_lin = nn.Dense(d, use_bias=False, name="k_proj", dtype=jnp.bfloat16)(x)
+        v_lin = nn.Dense(d, use_bias=False, name="v_proj", dtype=jnp.bfloat16)(x)
 
         q = jax.nn.silu(short_causal_conv("q", q_lin)).reshape(b, l, n_heads, d_head)
         k = jax.nn.silu(short_causal_conv("k", k_lin)).reshape(b, l, n_heads, d_head)
@@ -321,15 +321,15 @@ class GatedDeltaNet2J(nn.Module):
         q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + eps)
         k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + eps)
 
-        b_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="erase_gate")(x)).reshape(b, l, n_heads, d_head)
-        w_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="write_gate")(x)).reshape(b, l, n_heads, d_head)
+        b_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="erase_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
+        w_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="write_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
 
         a_param = self.param("decay_a", nn.initializers.zeros, (n_heads,))
-        f_proj = nn.Dense(d, use_bias=True, name="decay_proj")(x).reshape(b, l, n_heads, d_head)
+        f_proj = nn.Dense(d, use_bias=True, name="decay_proj", dtype=jnp.bfloat16)(x).reshape(b, l, n_heads, d_head)
         g = -jnp.exp(a_param)[None, None, :, None] * jax.nn.softplus(f_proj)
         alpha = jnp.exp(g)
 
-        out_gate = nn.Dense(d, use_bias=False, name="out_gate")(x)
+        out_gate = nn.Dense(d, use_bias=False, name="out_gate", dtype=jnp.bfloat16)(x)
 
         e = b_gate * k
         z = w_gate * v
@@ -374,19 +374,13 @@ class GatedDeltaNet2J(nn.Module):
             new_carry = (global_M[:, -1], global_S[:, -1])
             return new_carry, out_c
 
-        # jax.checkpoint -- same reasoning as Mamba2J above: without it,
-        # jax.lax.scan's default VJP keeps M_c/C_c/P_local/S_local for EVERY
-        # chunk alive simultaneously during backward, silently undoing the
-        # memory benefit chunking was supposed to give.
-        _chunk_step = jax.checkpoint(_chunk_step)
-
         _, out_chunks = jax.lax.scan(
             _chunk_step, (eye_bh, zero_bh), (k_ch, ea_ch, z_ch, alpha_ch, q_ch)
         )
         out = jnp.moveaxis(out_chunks, 0, 1).reshape(b, l, d)
 
-        out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out)
-        return nn.Dense(d, use_bias=False, name="out_proj")(out * jax.nn.silu(out_gate))
+        out = nn.RMSNorm(epsilon=1e-6, name="out_norm", dtype=jnp.float32)(out)
+        return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
 
 
 # ==========================================
@@ -397,10 +391,10 @@ class ExpertPack(nn.Module):
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True):
-        h = nn.Dense(self.cfg.d_ff, name="w1")(x)
+        h = nn.Dense(self.cfg.d_ff, name="w1", dtype=jnp.bfloat16)(x)
         h = jax.nn.gelu(h)
         h = nn.Dropout(rate=self.cfg.dropout_rate)(h, deterministic=deterministic)
-        return nn.Dense(self.cfg.d_model, name="w2")(h)
+        return nn.Dense(self.cfg.d_model, name="w2", dtype=jnp.bfloat16)(h)
 
 
 class MoEJ(nn.Module):
@@ -414,7 +408,7 @@ class MoEJ(nn.Module):
         E, K = self.cfg.num_experts, self.cfg.top_k
         n_assign = num_tokens * K
 
-        router_logits = nn.Dense(E, use_bias=False, name="router")(flat_x)
+        router_logits = nn.Dense(E, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout")
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
@@ -485,7 +479,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
 
     @nn.compact
     def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
-        norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x)
+        norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1", dtype=jnp.float32)(current_x)
         gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
         mla_out = MLAJ(cfg=self.cfg, name="mla")(
@@ -496,8 +490,8 @@ class DeltaAttentionResidualBlockJ(nn.Module):
 
         updated_history = history_deltas.at[self.layer_idx].set(current_delta)
 
-        q_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_route")(current_x)
-        k_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="k_route")(updated_history)
+        q_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_route", dtype=jnp.bfloat16)(current_x)
+        k_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="k_route", dtype=jnp.bfloat16)(updated_history)
         routing_scores = jnp.einsum("bld,vbld->blv", q_route, k_route) / jnp.sqrt(self.cfg.d_latent)
 
         depth_mask = jnp.arange(self.cfg.num_layers) <= self.layer_idx
@@ -505,7 +499,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         routing_weights = jax.nn.softmax(routing_scores, axis=-1)
 
         moe_in = current_x + jnp.einsum("blv,vbld->bld", routing_weights, updated_history)
-        norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(moe_in)
+        norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2", dtype=jnp.float32)(moe_in)
         moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
         return moe_in + moe_out, updated_history
 
@@ -537,7 +531,7 @@ class FullHybridMoEModel(nn.Module):
     @nn.compact
     def __call__(self, input_ids, deterministic: bool = True, rngs=None, return_hidden: bool = False):
         b, l = input_ids.shape
-        embed_layer = nn.Embed(num_embeddings=self.cfg.vocab_size, features=self.cfg.d_model, name="embed")
+        embed_layer = nn.Embed(num_embeddings=self.cfg.vocab_size, features=self.cfg.d_model, name="embed", dtype=jnp.bfloat16)
         x = embed_layer(input_ids)
         causal_mask = jnp.tril(jnp.ones((l, l))).astype(jnp.bool_)[None, None, :, :]
 
@@ -562,13 +556,23 @@ class FullHybridMoEModel(nn.Module):
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
             )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
 
-        final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x)
+        final = nn.RMSNorm(epsilon=1e-6, name="final_norm", dtype=jnp.float32)(x)
 
+        # return_hidden=True skips the vocab projection entirely. (batch, seq,
+        # vocab) logits + log_probs together dominate memory at vocab_size=151936
+        # (~2.5GB EACH at batch=2, seq=2048, fp32) and this projection sits outside
+        # the nn.remat scopes above (those only cover the transformer block pairs),
+        # so nothing here gets recomputed instead of stored during backward. The
+        # only way to avoid materializing the full tensor is to never build it in
+        # the first place -- compute_loss's chunked_cross_entropy does the
+        # projection itself, chunk by chunk, straight from `final`. Default is
+        # False so any other caller (generation, eval scripts, etc.) keeps getting
+        # full logits unchanged.
         if return_hidden:
             return final
 
         if self.cfg.tie_embeddings:
             logits = embed_layer.attend(final)
         else:
-            logits = nn.Dense(self.cfg.vocab_size, use_bias=False, name="lm_head")(final)
+            logits = nn.Dense(self.cfg.vocab_size, use_bias=False, name="lm_head", dtype=jnp.bfloat16)(final)
         return logits
