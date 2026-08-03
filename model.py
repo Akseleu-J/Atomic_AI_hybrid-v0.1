@@ -486,7 +486,7 @@ class DeltaAttentionResidualBlockJ(nn.Module):
     @nn.compact
     def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
         norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x)
-        gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
+        gdn_out = nn.Dense(self.cfg.d_model, name="gdn_dense")(norm_1) #GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
         mla_out = MLAJ(cfg=self.cfg, name="mla")(
             norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs
