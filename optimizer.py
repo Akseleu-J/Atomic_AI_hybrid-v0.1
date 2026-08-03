@@ -11,7 +11,7 @@ from utils import collect_by_leaf_name, path_to_str
 # ==========================================
 # Muon (Newton-Schulz orthogonalization)
 # ==========================================
-def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
+def muon_orthogonalize(w, g, lr, ns_steps: int = 3):
     """Orthogonalize the gradient via Newton-Schulz iteration, then take a step."""
     eps = 1e-7
     if w.ndim == 3:
@@ -36,16 +36,13 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     """muon_diagnostic_disable=True routes every normally-muon leaf to
     adamw_nodecay instead. This is a ONE-CALL diagnostic, not a real fix: it
     exists to answer a single question via memory_analysis() (compile-only, no
-    execution needed) -- is the HBM `temp` figure caused by Newton-Schulz needing
-    the FULL (all-gathered) matrix under FSDP for ~250+ muon-labeled leaves at
-    once, or is it something else?
-
-    РЕЗУЛЬТАТ (проверено): temp НЕ изменился (17.76 ГБ что с Muon, что с adamw
-    вместо него) -- гипотеза про Muon+FSDP all-gather ОПРОВЕРГНУТА. Причина
-    temp где-то в другом месте -- см. jax.checkpoint на _chunk_step в
-    GatedDeltaNet2J/Mamba2J (model.py) как следующего кандидата: без него
-    jax.lax.scan's default VJP держит residuals ВСЕХ чанков разом для backward,
-    что тихо сводило на нет память, которую chunking должен был экономить."""
+    execution needed) -- is the 17.57 GB `temp` figure caused by Newton-Schulz
+    needing the FULL (all-gathered) matrix under FSDP for ~250+ muon-labeled
+    leaves at once, or is it something else? If HBM temp collapses with this
+    flag on, the hypothesis is confirmed and we go fix Muon's update_fn
+    (sequence the all-gathers instead of leaving them to jax.tree_map's
+    unconstrained scheduling) rather than guessing further blind. If it does
+    NOT collapse, look elsewhere instead of chasing Muon."""
     warmup_steps = max(1, int(total_steps * 0.05))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
@@ -96,10 +93,6 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         if param.ndim >= 2:
             if "mamba" in path_str:
                 return "lion"
-            # ДИАГНОСТИКА muon_diagnostic_disable: РЕЗУЛЬТАТ УЖЕ ЕСТЬ -- temp не
-            # изменился (17.76 ГБ что с Muon, что без него), гипотеза про
-            # Muon+FSDP all-gather опровергнута. Флаг оставлен как готовый
-            # инструмент на будущее, а не потому что подозрение ещё актуально.
             if muon_diagnostic_disable:
                 return "adamw_nodecay"
             return "muon"
@@ -224,6 +217,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         {"params": params}, input_ids, **kwargs, mutable=["losses"] if not deterministic else False
     )
 
+    expert_util_stacked = None
     if not deterministic:
         final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
@@ -231,15 +225,11 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
-        # Всегда массив фиксированной формы (num_layers, num_experts), никогда
-        # None -- aux_info_sharding объявляет NamedSharding(mesh, P(None, None))
-        # для expert_utilization, а не Optional[array]; передать туда None было
-        # бы рассогласованием со specом на выходе jax.jit.
-        expert_util_stacked = jnp.stack(expert_utils) if expert_utils else jnp.zeros((cfg.num_layers, cfg.num_experts))
+        if expert_utils:
+            expert_util_stacked = jnp.stack(expert_utils)
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
-        expert_util_stacked = jnp.zeros((cfg.num_layers, cfg.num_experts))
 
     # w must be (d_model, vocab) for `hidden_chunk @ w` in chunked_cross_entropy.
     # Tied embeddings: nn.Embed's kernel is stored (vocab, d_model) -- transpose.
