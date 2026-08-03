@@ -120,8 +120,13 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
     sum_loss, sum_mask = carry
     hidden_chunk, label_chunk = chunk  # (chunk_size, d_model), (chunk_size,)
 
-    logits_chunk = hidden_chunk @ w  # (chunk_size, vocab) -- the only large tensor,
-                                       # and only for ONE chunk at a time
+    logits_chunk = (hidden_chunk.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+    # (chunk_size, vocab) -- the only large tensor, and only for ONE chunk at a
+    # time. Matmul itself runs in bf16 (biggest single matmul in the whole model:
+    # chunk_size x d_model x vocab, vocab=151936) for TPU MXU throughput; result
+    # upcast to fp32 immediately after, since log_softmax/label-smoothing sums
+    # over the full 151936-wide vocab axis are exactly the kind of reduction
+    # that's sensitive to bf16's ~3 decimal digits of precision.
     log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
 
     labels_safe = jnp.clip(label_chunk, 0, vocab_size - 1)  # -100 (ignore_index) -> valid
