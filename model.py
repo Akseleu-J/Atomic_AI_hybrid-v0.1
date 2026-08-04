@@ -210,7 +210,11 @@ class Mamba2J(nn.Module):
         conv_w = self.param("conv_w", nn.initializers.normal(stddev=0.02), (d_inner, self.cfg.d_conv))
         conv_b = self.param("conv_b", nn.initializers.zeros, (d_inner,))
 
-        rhs = conv_w.T[:, None, :]
+        rhs = conv_w.T[:, None, :].astype(x_bc.dtype)  # lax.conv_general_dilated needs
+                                                          # exact dtype match, unlike nn.Dense
+                                                          # -- conv_w is a raw fp32 self.param,
+                                                          # x_bc is bf16 (from the bf16 in_proj
+                                                          # Dense above)
         res_conv = jax.lax.conv_general_dilated(
             lhs=x_bc,
             rhs=rhs,
@@ -299,7 +303,8 @@ class GatedDeltaNet2J(nn.Module):
         def short_causal_conv(name, u):
             conv_w = self.param(f"{name}_conv_w", nn.initializers.normal(stddev=0.02), (d, self.cfg.d_conv))
             conv_b = self.param(f"{name}_conv_b", nn.initializers.zeros, (d,))
-            rhs = conv_w.T[:, None, :]
+            rhs = conv_w.T[:, None, :].astype(u.dtype)  # same dtype-match requirement as
+                                                           # Mamba2J's conv above
             out = jax.lax.conv_general_dilated(
                 lhs=u,
                 rhs=rhs,
