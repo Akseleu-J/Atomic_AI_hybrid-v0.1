@@ -496,7 +496,10 @@ class FullHybridMoEModel(nn.Module):
     def __call__(self, input_ids, deterministic: bool = True, rngs=None, return_hidden: bool = False):
         b, l = input_ids.shape
         embed_layer = nn.Embed(
-            num_embeddings=self.cfg.vocab_size, features=self.cfg.d_model, name="embed", dtype=jnp.bfloat16
+            num_embeddings=self.cfg.vocab_size,
+            features=self.cfg.d_model,
+            name="embed",
+            dtype=jnp.bfloat16,
         )
         x = embed_layer(input_ids)
         causal_mask = jnp.tril(jnp.ones((l, l))).astype(jnp.bool_)[None, None, :, :]
@@ -504,21 +507,16 @@ class FullHybridMoEModel(nn.Module):
         d_head = self.cfg.d_model // self.cfg.n_heads
         cos, sin = RoPEEmbedding(dim=d_head)(l)
 
-        history_deltas = jnp.zeros((self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype)
+        history_deltas = jnp.zeros(
+            (self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype
+        )
 
-        RematPair = nn.remat(DeltaResidualBlockPairJ, static_argnums=(6,))
-        RematSingle = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
+        # Один remat-скоуп на КАЖДЫЙ слой (вместо пары). Backward пересчитывает
+        # только текущий слой, а не два сразу. static_argnums=(6,) = deterministic.
+        RematBlock = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
 
-        num_full_pairs = self.cfg.num_layers // 2
-        for p in range(num_full_pairs):
-            i = p * 2
-            x, history_deltas = RematPair(
-                cfg=self.cfg, layer_idx_0=i, name=f"layer_pair_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
-
-        if self.cfg.num_layers % 2 == 1:
-            i = num_full_pairs * 2
-            x, history_deltas = RematSingle(
+        for i in range(self.cfg.num_layers):
+            x, history_deltas = RematBlock(
                 cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
             )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
 
@@ -530,5 +528,10 @@ class FullHybridMoEModel(nn.Module):
         if self.cfg.tie_embeddings:
             logits = embed_layer.attend(final)
         else:
-            logits = nn.Dense(self.cfg.vocab_size, use_bias=False, name="lm_head", dtype=jnp.bfloat16)(final)
+            logits = nn.Dense(
+                self.cfg.vocab_size,
+                use_bias=False,
+                name="lm_head",
+                dtype=jnp.bfloat16,
+            )(final)
         return logits
