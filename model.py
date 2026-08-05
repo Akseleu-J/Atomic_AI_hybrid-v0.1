@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax import struct
-from typing import List
+from typing import List, Tuple
 from jax.sharding import PartitionSpec as P
 
 try:
@@ -17,6 +17,8 @@ except Exception as _e:
     pallas_flash_attention = None
     FlashBlockSizes = None
     _PALLAS_FLASH_ATTENTION_IMPORT_ERROR = _e
+
+import jax.checkpoint_policies as policies
 
 _model_mesh = None
 _batch_axis = None
@@ -35,16 +37,17 @@ def get_batch_axis():
 
 @struct.dataclass
 class ModelConfig:
-    d_model: int = 384
-    d_state: int = 32
+    d_model: int = 512
+    d_state: int = 128
     d_conv: int = 4
     expand: int = 2
-    n_heads: int = 6
-    d_latent: int = 128
-    d_ff: int = 1536
-    num_experts: int = 4
+    n_heads: int = 8
+    d_latent: int = 384
+    d_ff: int = 3072
+    num_experts: int = 8
     top_k: int = 2
-    num_layers: int = 6
+    num_layers: int = 21          # 7 blocks × 3 layers
+    layers_per_block: int = 3
     vocab_size: int = 151936
     dropout_rate: float = 0.1
     router_aux_loss_coef: float = 0.01
@@ -53,8 +56,20 @@ class ModelConfig:
     tie_embeddings: bool = True
     label_smoothing: float = 0.05
     router_noise_std: float = 0.3
-    use_flash_attention: bool = False
-    deltanet_chunk_size: int = 1024
+    use_flash_attention: bool = True
+    deltanet_chunk_size: int = 256
+
+    # Layer type schedule: "gdn2", "mamba2", "mla"
+    # 21 layers: 16 gdn2, 2 mamba2, 3 mla
+    layer_types: Tuple[str, ...] = (
+        "gdn2", "gdn2", "mla",      # block 0
+        "gdn2", "mamba2", "gdn2",   # block 1
+        "gdn2", "gdn2", "gdn2",     # block 2
+        "gdn2", "gdn2", "mla",      # block 3
+        "gdn2", "mamba2", "gdn2",   # block 4
+        "gdn2", "gdn2", "gdn2",     # block 5
+        "gdn2", "gdn2", "mla",      # block 6
+    )
 
 
 # ==========================================
@@ -82,15 +97,13 @@ def apply_rope(x, cos, sin):
 
 
 # ==========================================
-# Multi-head Latent Attention
+# Multi-head Latent Attention (MLA)
 # ==========================================
 class MLAJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
     def __call__(self, x, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
-        mesh = get_model_mesh()
-        batch_axis = get_batch_axis()
         b, l, _ = x.shape
         n_heads = self.cfg.n_heads
         d_head = self.cfg.d_model // n_heads
@@ -119,24 +132,25 @@ class MLAJ(nn.Module):
 
             def _flash_call(q_local, k_local, v_local):
                 local_b = q_local.shape[0]
-                block_sizes = FlashBlockSizes.get_default(local_b, n_heads, l, l, d_head)
+                block_sizes = FlashBlockSizes(
+                    block_q=1024,
+                    block_k_major=1024,
+                    block_k=1024,
+                    block_b=local_b,
+                    block_q_major_dkv=1024,
+                    block_k_major_dkv=1024,
+                    block_k_dkv=256,
+                    block_q_dkv=1024,
+                    block_k_major_dq=512,
+                    block_k_dq=256,
+                    block_q_dq=1024,
+                )
                 return pallas_flash_attention(
                     q_local, k_local, v_local,
                     causal=True, sm_scale=sm_scale, block_sizes=block_sizes,
                 )
 
-            if mesh is not None:
-                spec = P(batch_axis, None, None, None)
-                sharded_flash = jax.shard_map(
-                    _flash_call,
-                    mesh=mesh,
-                    in_specs=spec,
-                    out_specs=spec,
-                    check_vma=False,
-                )
-                out = sharded_flash(Q_rope, K_rope, V).astype(x.dtype)
-            else:
-                out = _flash_call(Q_rope, K_rope, V).astype(x.dtype)
+            out = _flash_call(Q_rope, K_rope, V).astype(x.dtype)
         else:
             scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
             scores = jnp.where(causal_mask == 0, -1e9, scores)
@@ -190,9 +204,7 @@ class Mamba2J(nn.Module):
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
-            raise ValueError(
-                f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}."
-            )
+            raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
         num_chunks = l // chunk_size
 
         def _combine(state1, state2):
@@ -243,7 +255,7 @@ class Mamba2J(nn.Module):
 
 
 # ==========================================
-# Gated DeltaNet-2
+# Gated DeltaNet-2 (GDN-2)
 # ==========================================
 class GatedDeltaNet2J(nn.Module):
     cfg: ModelConfig
@@ -296,9 +308,7 @@ class GatedDeltaNet2J(nn.Module):
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
-            raise ValueError(
-                f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}."
-            )
+            raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
         num_chunks = l // chunk_size
 
         def _combine(state1, state2):
@@ -358,28 +368,6 @@ class ExpertPack(nn.Module):
 
 
 class MoEJ(nn.Module):
-    """num_experts total FFN-sized slots: 1 always-on SHARED expert (every token,
-    zero routing/dispatch -- just a plain FFN over flat_x) + (num_experts - 1)
-    ROUTED experts selected top-(top_k - 1) via the usual sort/scatter/gather
-    dispatch. This is the standard DeepSeekMoE/Qwen-MoE "shared expert isolation"
-    recipe.
-
-    Why: user's own microbenchmark (see chat) confirmed the sort/scatter/gather
-    dispatch machinery runs 2.6-6x SLOWER than an equivalent-sized plain matmul
-    on this hardware, and doesn't benefit from bf16 at all (it's index/sort work,
-    not matmul FLOPs). Dispatch cost scales with n_assign = num_tokens * K. The
-    shared expert removes one whole unit of K from the ROUTED dispatch (K_routed
-    = top_k - 1) while adding its own compute as one plain, dispatch-free matmul
-    -- net effect: same total active-expert compute per token as before, but the
-    expensive part (dispatch) processes HALF as many assignments (K_routed=1 vs
-    K=2, given top_k=2), and the shared expert's own contribution costs zero
-    dispatch at all.
-
-    Since the shared slot is fixed from initialization (not "the most useful"
-    expert picked after the fact -- the router starts near-uniform, so there's
-    nothing to pick from yet), it specializes on common/shared patterns during
-    training simply because it's the only slot that sees every token."""
-
     cfg: ModelConfig
 
     @nn.compact
@@ -389,19 +377,13 @@ class MoEJ(nn.Module):
         num_tokens = flat_x.shape[0]
         E, K = self.cfg.num_experts, self.cfg.top_k
         if K < 2:
-            raise ValueError(
-                f"top_k={K} must be >= 2 with a shared expert: 1 slot is always-on "
-                "(the shared expert), the remaining top_k-1 are routed. Set top_k=2 "
-                "for the original 'shared + 1 routed' behavior."
-            )
+            raise ValueError(f"top_k={K} must be >= 2 with a shared expert.")
         E_routed = E - 1
         K_routed = K - 1
         n_assign = num_tokens * K_routed
 
-        # --- Shared expert: every token, no sort/scatter/gather at all ---
         shared_out = ExpertPack(cfg=self.cfg, name="shared_expert")(flat_x, deterministic)
 
-        # --- Routed experts: top_k_routed among E_routed candidates ---
         router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout")
@@ -423,9 +405,6 @@ class MoEJ(nn.Module):
         self.sow("losses", "aux_loss", E_routed * jnp.sum(mean_probs * expert_gate_frac))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(jax.scipy.special.logsumexp(router_logits, axis=-1))))
         expert_assign_frac = jnp.zeros(E_routed, dtype=flat_gate.dtype).at[flat_expert_idx].add(1.0) / n_assign
-        # Pad back to E slots so the sown shape stays (num_layers, num_experts) --
-        # shared expert's slot reported as always-1.0-utilized (it sees every
-        # token by construction), prepended so index 0 is the shared expert.
         shared_util = jnp.ones((1,), dtype=flat_gate.dtype)
         self.sow("losses", "expert_utilization", jnp.concatenate([shared_util, expert_assign_frac], axis=0))
 
@@ -472,62 +451,176 @@ class MoEJ(nn.Module):
 
 
 # ==========================================
-# Delta-Attention Residual Block
+# Intra-block attention (lightweight mixing)
 # ==========================================
-class DeltaAttentionResidualBlockJ(nn.Module):
+class IntraBlockAttention(nn.Module):
+    """Mix sources via lightweight attention for quality.
+    sources: list of (B, L, D) tensors
+    block_input: (B, L, D) — the original block input, used as query
+    Returns: mixed (B, L, D)
+    """
     cfg: ModelConfig
-    layer_idx: int
 
     @nn.compact
-    def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
-        norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x).astype(current_x.dtype)
-        gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
-        mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
-        mla_out = MLAJ(cfg=self.cfg, name="mla")(
-            norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs
-        )
-        alpha = jax.nn.softmax(self.param("alpha", nn.initializers.zeros, (3,))).astype(current_x.dtype)
-        current_delta = jnp.einsum("i,ibld->bld", alpha, jnp.stack([gdn_out, mamba_out, mla_out], axis=0))
+    def __call__(self, sources, block_input):
+        # sources: list of (B, L, D)
+        n_sources = len(sources)
+        if n_sources == 1:
+            return sources[0]
 
-        updated_history = history_deltas.at[self.layer_idx].set(current_delta)
+        b, l, d = block_input.shape
 
-        q_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_route", dtype=jnp.bfloat16)(current_x)
-        k_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="k_route", dtype=jnp.bfloat16)(updated_history)
-        routing_scores = jnp.einsum("bld,vbld->blv", q_route, k_route) / jnp.sqrt(
+        # Query from block_input
+        q = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_proj", dtype=jnp.bfloat16)(block_input)
+
+        # Key for each source (separate projection per source for quality)
+        k_list = []
+        for i, src in enumerate(sources):
+            k_i = nn.Dense(self.cfg.d_latent, use_bias=False, name=f"k_proj_{i}", dtype=jnp.bfloat16)(src)
+            k_list.append(k_i)
+
+        # Stack keys: (N, B, L, d_latent)
+        k_stack = jnp.stack(k_list, axis=0)
+
+        # Scores: (N, B, L)
+        scores = jnp.einsum("bld,nbld->nbl", q, k_stack) / jnp.sqrt(jnp.array(self.cfg.d_latent, dtype=q.dtype))
+
+        # Softmax over sources
+        weights = jax.nn.softmax(scores, axis=0)  # (N, B, L)
+
+        # Stack sources: (N, B, L, D)
+        src_stack = jnp.stack(sources, axis=0)
+
+        # Weighted mix
+        mixed = jnp.einsum("nbl,nbld->bld", weights, src_stack)
+        return mixed.astype(block_input.dtype)
+
+
+# ==========================================
+# Specialized Sublayer (dispatches to GDN-2 / Mamba2 / MLA)
+# ==========================================
+class SpecializedSublayer(nn.Module):
+    cfg: ModelConfig
+    layer_type: str  # "gdn2", "mamba2", "mla"
+
+    @nn.compact
+    def __call__(self, x, causal_mask=None, cos=None, sin=None, deterministic=True, rngs=None):
+        if self.layer_type == "gdn2":
+            return GatedDeltaNet2J(cfg=self.cfg, name="gdn2")(x)
+        elif self.layer_type == "mamba2":
+            return Mamba2J(cfg=self.cfg, name="mamba2")(x)
+        elif self.layer_type == "mla":
+            return MLAJ(cfg=self.cfg, name="mla")(
+                x, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs
+            )
+        else:
+            raise ValueError(f"Unknown layer_type: {self.layer_type}")
+
+
+# ==========================================
+# Block-level DAR Layer
+# ==========================================
+class BlockDARLayer(nn.Module):
+    """One layer inside a block.
+    - Computes delta via specialized sublayer (GDN-2 / Mamba2 / MLA)
+    - Mixes [block_input] + local_deltas via intra-block attention
+    """
+    cfg: ModelConfig
+    layer_type: str
+
+    @nn.compact
+    def __call__(self, block_input, local_deltas, causal_mask, cos, sin, deterministic=True, rngs=None):
+        # sources = [block_input] + all previous local_deltas within this block
+        sources = [block_input] + list(local_deltas)
+
+        # Mix sources via intra-block attention
+        mixed = IntraBlockAttention(cfg=self.cfg, name="intra_attn")(sources, block_input)
+
+        # Apply specialized sublayer to mixed input
+        delta = SpecializedSublayer(
+            cfg=self.cfg, layer_type=self.layer_type, name="sublayer"
+        )(mixed, causal_mask=causal_mask, cos=cos, sin=sin, deterministic=deterministic, rngs=rngs)
+
+        return delta
+
+
+# ==========================================
+# Block-level DAR Block (3 consecutive layers)
+# ==========================================
+class BlockDAR(nn.Module):
+    """A block of N consecutive layers with:
+    - Intra-block attention mixing within the block
+    - Block delta aggregation (sum of layer deltas)
+    - Inter-block DAR attention after the block
+    - MoE after DAR
+    """
+    cfg: ModelConfig
+    block_idx: int
+    layer_idx_start: int
+
+    @nn.compact
+    def __call__(self, block_input, history_blocks, causal_mask, cos, sin, deterministic=True, rngs=None):
+        b, l, d = block_input.shape
+
+        # --- Intra-block layers ---
+        local_deltas = []
+        for i in range(self.cfg.layers_per_block):
+            layer_idx = self.layer_idx_start + i
+            layer_type = self.cfg.layer_types[layer_idx]
+
+            delta = BlockDARLayer(
+                cfg=self.cfg,
+                layer_type=layer_type,
+                name=f"layer_{layer_idx}"
+            )(block_input, local_deltas, causal_mask, cos, sin, deterministic, rngs)
+
+            local_deltas.append(delta)
+
+        # --- Aggregate block delta ---
+        block_delta = sum(local_deltas)  # (B, L, D)
+
+        # --- Update history ---
+        # history_blocks: (num_blocks_so_far, B, L, D)
+        # Append this block's delta
+        new_history = jnp.concatenate([history_blocks, block_delta[None, ...]], axis=0)
+
+        # --- Inter-block DAR attention ---
+        # Query from current block input
+        q_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_route", dtype=jnp.bfloat16)(block_input)
+
+        # Keys from all previous block deltas (including current)
+        k_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="k_route", dtype=jnp.bfloat16)(new_history)
+
+        # Scores: (num_blocks, B, L)
+        routing_scores = jnp.einsum("bld,nbld->nbl", q_route, k_route) / jnp.sqrt(
             jnp.array(self.cfg.d_latent, dtype=q_route.dtype)
         )
 
-        depth_mask = jnp.arange(self.cfg.num_layers) <= self.layer_idx
+        # Causal mask: only past blocks
+        num_blocks = new_history.shape[0]
+        depth_mask = jnp.arange(num_blocks) < self.block_idx  # strict < (past only)
+        # Current block (self.block_idx) is NOT included in retrieval
         neg_inf = jnp.array(-1e9, dtype=routing_scores.dtype)
-        routing_scores = jnp.where(depth_mask[None, None, :], routing_scores, neg_inf)
-        routing_weights = jax.nn.softmax(routing_scores, axis=-1)
+        routing_scores = jnp.where(depth_mask[:, None, None], routing_scores, neg_inf)
 
-        moe_in = current_x + jnp.einsum("blv,vbld->bld", routing_weights, updated_history)
+        routing_weights = jax.nn.softmax(routing_scores, axis=0)  # (num_blocks, B, L)
+
+        # Retrieve from history
+        retrieved = jnp.einsum("nbl,nbld->bld", routing_weights, new_history)
+
+        # Combine: block_input + retrieved + block_delta
+        moe_in = block_input + retrieved + block_delta
+
+        # --- MoE ---
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(moe_in).astype(moe_in.dtype)
         moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
-        return moe_in + moe_out, updated_history
+
+        output = moe_in + moe_out
+        return output, new_history
 
 
 # ==========================================
-# Block of 2 consecutive Delta-Attention Residual layers
-# ==========================================
-class DeltaResidualBlockPairJ(nn.Module):
-    cfg: ModelConfig
-    layer_idx_0: int
-
-    @nn.compact
-    def __call__(self, current_x, history_deltas, causal_mask, cos, sin, deterministic: bool = True, rngs=None):
-        current_x, history_deltas = DeltaAttentionResidualBlockJ(
-            cfg=self.cfg, layer_idx=self.layer_idx_0, name=f"layer_{self.layer_idx_0}"
-        )(current_x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
-        current_x, history_deltas = DeltaAttentionResidualBlockJ(
-            cfg=self.cfg, layer_idx=self.layer_idx_0 + 1, name=f"layer_{self.layer_idx_0 + 1}"
-        )(current_x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
-        return current_x, history_deltas
-
-
-# ==========================================
-# Full model
+# Full Model
 # ==========================================
 class FullHybridMoEModel(nn.Module):
     cfg: ModelConfig
@@ -547,16 +640,26 @@ class FullHybridMoEModel(nn.Module):
         d_head = self.cfg.d_model // self.cfg.n_heads
         cos, sin = RoPEEmbedding(dim=d_head)(l)
 
-        history_deltas = jnp.zeros(
-            (self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype
+        # History starts empty: (0, B, L, D)
+        history_blocks = jnp.zeros((0, b, l, self.cfg.d_model), dtype=x.dtype)
+
+        num_blocks = self.cfg.num_layers // self.cfg.layers_per_block
+
+        RematBlock = nn.remat(
+            BlockDAR,
+            static_argnums=(5,),
+            policy=policies.dots_saveable,
         )
 
-        RematBlock = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
+        for block_idx in range(num_blocks):
+            layer_idx_start = block_idx * self.cfg.layers_per_block
 
-        for i in range(self.cfg.num_layers):
-            x, history_deltas = RematBlock(
-                cfg=self.cfg, layer_idx=i, name=f"layer_{i}"
-            )(x, history_deltas, causal_mask, cos, sin, deterministic, rngs)
+            x, history_blocks = RematBlock(
+                cfg=self.cfg,
+                block_idx=block_idx,
+                layer_idx_start=layer_idx_start,
+                name=f"block_{block_idx}"
+            )(x, history_blocks, causal_mask, cos, sin, deterministic, rngs)
 
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x).astype(x.dtype)
 
