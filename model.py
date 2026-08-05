@@ -358,6 +358,28 @@ class ExpertPack(nn.Module):
 
 
 class MoEJ(nn.Module):
+    """num_experts total FFN-sized slots: 1 always-on SHARED expert (every token,
+    zero routing/dispatch -- just a plain FFN over flat_x) + (num_experts - 1)
+    ROUTED experts selected top-(top_k - 1) via the usual sort/scatter/gather
+    dispatch. This is the standard DeepSeekMoE/Qwen-MoE "shared expert isolation"
+    recipe.
+
+    Why: user's own microbenchmark (see chat) confirmed the sort/scatter/gather
+    dispatch machinery runs 2.6-6x SLOWER than an equivalent-sized plain matmul
+    on this hardware, and doesn't benefit from bf16 at all (it's index/sort work,
+    not matmul FLOPs). Dispatch cost scales with n_assign = num_tokens * K. The
+    shared expert removes one whole unit of K from the ROUTED dispatch (K_routed
+    = top_k - 1) while adding its own compute as one plain, dispatch-free matmul
+    -- net effect: same total active-expert compute per token as before, but the
+    expensive part (dispatch) processes HALF as many assignments (K_routed=1 vs
+    K=2, given top_k=2), and the shared expert's own contribution costs zero
+    dispatch at all.
+
+    Since the shared slot is fixed from initialization (not "the most useful"
+    expert picked after the fact -- the router starts near-uniform, so there's
+    nothing to pick from yet), it specializes on common/shared patterns during
+    training simply because it's the only slot that sees every token."""
+
     cfg: ModelConfig
 
     @nn.compact
@@ -366,9 +388,21 @@ class MoEJ(nn.Module):
         flat_x = x.reshape(-1, d)
         num_tokens = flat_x.shape[0]
         E, K = self.cfg.num_experts, self.cfg.top_k
-        n_assign = num_tokens * K
+        if K < 2:
+            raise ValueError(
+                f"top_k={K} must be >= 2 with a shared expert: 1 slot is always-on "
+                "(the shared expert), the remaining top_k-1 are routed. Set top_k=2 "
+                "for the original 'shared + 1 routed' behavior."
+            )
+        E_routed = E - 1
+        K_routed = K - 1
+        n_assign = num_tokens * K_routed
 
-        router_logits = nn.Dense(E, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
+        # --- Shared expert: every token, no sort/scatter/gather at all ---
+        shared_out = ExpertPack(cfg=self.cfg, name="shared_expert")(flat_x, deterministic)
+
+        # --- Routed experts: top_k_routed among E_routed candidates ---
+        router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout")
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
@@ -376,27 +410,31 @@ class MoEJ(nn.Module):
             )
 
         router_probs = jax.nn.softmax(router_logits, axis=-1)
-        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K)
+        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K_routed)
 
         gate = top_k_vals / (jnp.sum(top_k_vals, axis=-1, keepdims=True) + 1e-9)
 
         flat_expert_idx = top_k_idx.reshape(-1)
         flat_gate = gate.reshape(-1)
-        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K)
+        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K_routed)
 
         mean_probs = jnp.mean(router_probs, axis=0)
-        expert_gate_frac = jnp.zeros(E, dtype=flat_gate.dtype).at[flat_expert_idx].add(flat_gate) / num_tokens
-        self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * expert_gate_frac))
+        expert_gate_frac = jnp.zeros(E_routed, dtype=flat_gate.dtype).at[flat_expert_idx].add(flat_gate) / num_tokens
+        self.sow("losses", "aux_loss", E_routed * jnp.sum(mean_probs * expert_gate_frac))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(jax.scipy.special.logsumexp(router_logits, axis=-1))))
-        expert_assign_frac = jnp.zeros(E, dtype=flat_gate.dtype).at[flat_expert_idx].add(1.0) / n_assign
-        self.sow("losses", "expert_utilization", expert_assign_frac)
+        expert_assign_frac = jnp.zeros(E_routed, dtype=flat_gate.dtype).at[flat_expert_idx].add(1.0) / n_assign
+        # Pad back to E slots so the sown shape stays (num_layers, num_experts) --
+        # shared expert's slot reported as always-1.0-utilized (it sees every
+        # token by construction), prepended so index 0 is the shared expert.
+        shared_util = jnp.ones((1,), dtype=flat_gate.dtype)
+        self.sow("losses", "expert_utilization", jnp.concatenate([shared_util, expert_assign_frac], axis=0))
 
-        capacity = max(1, int(self.cfg.moe_capacity_factor * num_tokens * K / E))
+        capacity = max(1, int(self.cfg.moe_capacity_factor * num_tokens * K_routed / E_routed))
 
         sort_order = jnp.argsort(flat_expert_idx)
         sorted_expert = flat_expert_idx[sort_order]
 
-        expert_counts = jnp.zeros(E, dtype=jnp.int32).at[flat_expert_idx].add(1)
+        expert_counts = jnp.zeros(E_routed, dtype=jnp.int32).at[flat_expert_idx].add(1)
         expert_start = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(expert_counts)[:-1]])
 
         pos_in_bucket_sorted = jnp.arange(n_assign) - expert_start[sorted_expert]
@@ -405,10 +443,10 @@ class MoEJ(nn.Module):
         dest_row = sorted_expert * capacity + jnp.minimum(pos_in_bucket_sorted, capacity - 1)
 
         gathered_x = flat_x[flat_token_idx][sort_order]
-        buffer = jnp.zeros((E * capacity, d), dtype=flat_x.dtype)
+        buffer = jnp.zeros((E_routed * capacity, d), dtype=flat_x.dtype)
         zero = jnp.array(0.0, dtype=flat_x.dtype)
         buffer = buffer.at[dest_row].add(jnp.where(valid_sorted[:, None], gathered_x, zero))
-        expert_inputs = buffer.reshape(E, capacity, d)
+        expert_inputs = buffer.reshape(E_routed, capacity, d)
 
         run_experts = nn.vmap(
             ExpertPack,
@@ -419,7 +457,7 @@ class MoEJ(nn.Module):
         )(cfg=self.cfg, name="experts_block")
         expert_outputs = run_experts(expert_inputs, deterministic)
 
-        flat_expert_outputs = expert_outputs.reshape(E * capacity, d)
+        flat_expert_outputs = expert_outputs.reshape(E_routed * capacity, d)
         gathered_out_sorted = flat_expert_outputs[dest_row]
         gathered_out_sorted = jnp.where(valid_sorted[:, None], gathered_out_sorted, zero)
 
@@ -427,7 +465,9 @@ class MoEJ(nn.Module):
         gathered_out = gathered_out_sorted[unsort_order]
         weighted_out = gathered_out * flat_gate[:, None]
 
-        flat_outputs = jnp.zeros_like(flat_x).at[flat_token_idx].add(weighted_out)
+        routed_out = jnp.zeros_like(flat_x).at[flat_token_idx].add(weighted_out)
+
+        flat_outputs = shared_out + routed_out
         return flat_outputs.reshape(b, l, d)
 
 
@@ -443,9 +483,9 @@ class DeltaAttentionResidualBlockJ(nn.Module):
         norm_1 = nn.RMSNorm(epsilon=1e-6, name="norm_1")(current_x).astype(current_x.dtype)
         gdn_out = GatedDeltaNet2J(cfg=self.cfg, name="gdn")(norm_1)
         mamba_out = Mamba2J(cfg=self.cfg, name="mamba")(norm_1)
-        mla_out = nn.remat(MLAJ, static_argnums=(4,))(
-            cfg=self.cfg, name="mla"
-        )(norm_1, causal_mask, cos, sin, deterministic, rngs)
+        mla_out = MLAJ(cfg=self.cfg, name="mla")(
+            norm_1, causal_mask, cos, sin, deterministic=deterministic, rngs=rngs
+        )
         alpha = jax.nn.softmax(self.param("alpha", nn.initializers.zeros, (3,))).astype(current_x.dtype)
         current_delta = jnp.einsum("i,ibld->bld", alpha, jnp.stack([gdn_out, mamba_out, mla_out], axis=0))
 
@@ -511,8 +551,6 @@ class FullHybridMoEModel(nn.Module):
             (self.cfg.num_layers, b, l, self.cfg.d_model), dtype=x.dtype
         )
 
-        # Один remat-скоуп на КАЖДЫЙ слой (вместо пары). Backward пересчитывает
-        # только текущий слой, а не два сразу. static_argnums=(6,) = deterministic.
         RematBlock = nn.remat(DeltaAttentionResidualBlockJ, static_argnums=(6,))
 
         for i in range(self.cfg.num_layers):
