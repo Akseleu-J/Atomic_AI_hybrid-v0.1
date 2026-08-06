@@ -671,10 +671,7 @@ class FullHybridMoEModel(nn.Module):
         num_blocks = self.cfg.num_layers // self.cfg.layers_per_block
 
 
-        RematBlock = nn.remat(
-            BlockDAR,
-            static_argnums=(7,),  # deterministic — 8-й аргумент (индекс 7 после self)
-        )
+        RematBlock = BlockDAR
         
         for block_idx in range(num_blocks):
             layer_idx_start = block_idx * self.cfg.layers_per_block
