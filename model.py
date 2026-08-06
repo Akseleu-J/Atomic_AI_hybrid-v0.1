@@ -574,7 +574,7 @@ class BlockDARLayer(nn.Module):
         b, l, d = current_x.shape
         
         # --- Hybrid DAR: retrieve from [x_input, Δ..., δ...] ---
-        dar_sources = []
+        dar_sources = [x_input]
         if history_blocks.shape[0] > 0:
             dar_sources.extend([history_blocks[j] for j in range(history_blocks.shape[0])])
         dar_sources.extend(local_deltas)
