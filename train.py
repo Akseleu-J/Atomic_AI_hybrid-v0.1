@@ -30,9 +30,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     n_devices = mesh.shape["tpu_nodes"]
 
     if batch_size % n_devices != 0:
-        raise ValueError(
-            f"batch_size={batch_size} must be divisible by n_devices={n_devices}."
-        )
+        raise ValueError(f"batch_size={batch_size} must be divisible by n_devices={n_devices}.")
 
     batch_axis = "tpu_nodes"
     set_model_mesh(mesh, batch_axis=batch_axis)
@@ -76,6 +74,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             **kwargs
         )
 
+    # --- Single step: forward + backward + update ---
     def distributed_train_step(p, s, b, r):
         loss_fn = lambda param: compute_loss(
             param, model_apply_wrapped, b, config,
@@ -85,7 +84,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         )
         (loss, aux_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
         updates, new_s = tx.update(grads, s, p)
-        return optax.apply_updates(p, updates), new_s, loss, aux_info
+        new_p = optax.apply_updates(p, updates)
+        return new_p, new_s, loss, aux_info
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -100,6 +100,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "z_loss": NamedSharding(mesh, P()),
         "expert_utilization": NamedSharding(mesh, P(None, None)),
     }
+
     compiled_train = jax.jit(
         distributed_train_step,
         donate_argnums=(0, 1),
@@ -116,11 +117,13 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             aux_info_sharding,
         ),
     )
+
     compiled_val = jax.jit(
         distributed_val_step,
         in_shardings=(param_sharding, {"input_ids": data_sharding, "labels": data_sharding}),
         out_shardings=NamedSharding(mesh, P()),
     )
+
     return compiled_train, compiled_val, mesh, tx, model, param_sharding, opt_state_sharding, data_sharding
 
 
@@ -225,53 +228,54 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
 
 def main_execution():
     config = ModelConfig(
-        d_model=512,
+        d_model=768,
         d_state=128,
         d_conv=4,
         expand=2,
         n_heads=8,
-        d_latent=256,
-        d_ff=3072,
+        d_latent=512,
+        d_ff=6144,
         num_experts=8,
         top_k=2,
-        num_layers=22,
+        num_layers=21,
+        layers_per_block=3,
         vocab_size=151936,
         dropout_rate=0.1,
         router_aux_loss_coef=0.01,
         router_z_loss_coef=0.0001,
-        moe_capacity_factor=1.25,
+        moe_capacity_factor=1.0,
         tie_embeddings=True,
-        label_smoothing=0.05,
+        label_smoothing=0.0,
         router_noise_std=0.3,
         use_flash_attention=True,
-        deltanet_chunk_size=256
+        deltanet_chunk_size=512,
     )
 
     file_pairs = [
-    (
-        "/kaggle/input/datasets/akseleu1j/atentic-data/agentic_input_ids.npy",
-        "/kaggle/input/datasets/akseleu1j/atentic-data/agentic_labels.npy",
-    ),
-    (
-        "/kaggle/input/datasets/akseleu1j/coding-labels/coding_A_input_ids.npy",
-        "/kaggle/input/datasets/akseleu1j/coding-labels/coding_A_labels.npy",
-    ),
-    (
-        "/kaggle/input/datasets/akseleu1j/coding-ids/coding_B_input_ids.npy",
-        "/kaggle/input/datasets/akseleu1j/coding-ids/coding_B_labels.npy",
-    ),
-    (
-        "/kaggle/input/datasets/akseleu1j/simple-data/common_input_ids.npy",
-        "/kaggle/input/datasets/akseleu1j/simple-data/common_labels.npy",
-    ),
-    (
-        "/kaggle/input/datasets/akseleu1j/math-ids/math_input_ids.npy",
-        "/kaggle/input/datasets/akseleu1j/math-ids/math_labels.npy",
-    ),
-    (
-        "/kaggle/input/datasets/akseleu1j/reasoning-ids/reasoning_input_ids.npy",
-        "/kaggle/input/datasets/akseleu1j/reasoning-ids/reasoning_labels.npy",
-    ),
+        (
+            "/kaggle/input/datasets/akseleu1j/atentic-data/agentic_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/atentic-data/agentic_labels.npy",
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/coding-labels/coding_A_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/coding-labels/coding_A_labels.npy",
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/coding-ids/coding_B_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/coding-ids/coding_B_labels.npy",
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/simple-data/common_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/simple-data/common_labels.npy",
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/math-ids/math_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/math-ids/math_labels.npy",
+        ),
+        (
+            "/kaggle/input/datasets/akseleu1j/reasoning-ids/reasoning_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/reasoning-ids/reasoning_labels.npy",
+        ),
     ]
 
     for ids_path, lbls_path in file_pairs:
@@ -296,17 +300,19 @@ def main_execution():
     val_split = 0.05
     val_size = int(total_blocks * val_split)
     train_size = total_blocks - val_size
+
     train_steps_per_epoch = train_size // batch_size
     total_train_steps = train_steps_per_epoch * epochs
 
-    print(f"[TPU] Компиляция XLA графа под {total_train_steps} общих шагов обучения "
+    print(f"[TPU] Компиляция XLA графа под {total_train_steps} шагов "
           f"({epochs} эпох(и) x {train_steps_per_epoch} шагов)...")
+
     compiled_train, compiled_val, mesh, tx, model, param_sharding, opt_state_sharding, data_sharding = (
         make_shard_and_compile(config, total_train_steps, batch_size, seq_len)
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
 
-    train_stream, val_factory, train_steps, val_steps = dataloader_multi_source(
+    train_stream, val_factory, _, val_steps = dataloader_multi_source(
         file_pairs, batch_size, data_sharding, seq_len=seq_len
     )
 
@@ -358,7 +364,7 @@ def main_execution():
     epoch_start_time = time.perf_counter()
 
     for epoch in range(epochs):
-        for step in range(train_steps):
+        for step in range(train_steps_per_epoch):
             global_rng, step_rng = jax.random.split(global_rng)
 
             _t0 = time.perf_counter()
@@ -367,28 +373,13 @@ def main_execution():
 
             total_tokens_processed += batch_size * seq_len
 
-            # ПРОФИЛИРОВКА (шаги 5-9, после разогрева/компиляции): jax.profiler
-            # пишет реальный op-level trace -- какие именно HLO-операции (MoE
-            # argsort/scatter/gather, Muon-матмулы, GDN/Mamba associative_scan,
-            # обычные Dense-матмулы) сколько времени реально едят на устройстве.
-            # Открывается в TensorBoard (`pip install tensorboard-plugin-profile`,
-            # затем `%load_ext tensorboard` + `%tensorboard --logdir /kaggle/working/jax-trace`
-            # в отдельной ячейке) либо через https://ui.perfetto.dev (загрузить файл
-            # из /kaggle/working/jax-trace напрямую, plugin не обязателен).
-            _do_trace = 5 <= step < 10
-            if _do_trace and step == 5:
-                jax.profiler.start_trace("/kaggle/working/jax-trace")
-
             _t1 = time.perf_counter()
-            params, opt_state, train_loss, aux_info = compiled_train(params, opt_state, batch, step_rng)
+            params, opt_state, train_loss, aux_info = compiled_train(
+                params, opt_state, batch, step_rng
+            )
             if step < 30:
                 jax.block_until_ready(train_loss)
             _t_compute = time.perf_counter() - _t1
-
-            if _do_trace and step == 9:
-                jax.block_until_ready(train_loss)
-                jax.profiler.stop_trace()
-                print("[PROFILER] Трейс шагов 5-9 сохранён в /kaggle/working/jax-trace")
 
             if step < 30:
                 print(f"[TIMING] step {step}: данные={_t_data*1000:.0f}мс  "
@@ -399,7 +390,7 @@ def main_execution():
 
             if step % 10 == 0:
                 print(
-                    f"Epoch: {epoch} | Step: {step}/{train_steps} | "
+                    f"Epoch: {epoch} | Step: {step}/{train_steps_per_epoch} | "
                     f"Global Step: {global_step} | Train Loss: {jax.device_get(train_loss):.4f} "
                     f"(ce={jax.device_get(aux_info['ce_loss']):.4f} "
                     f"aux={jax.device_get(aux_info['aux_loss']):.4f} "
@@ -413,9 +404,11 @@ def main_execution():
                         f"           expert utilization std (max over layers, layer {worst_layer}): "
                         f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts}"
                     )
-            if (step+1) % 10 == 0:
+
+            if (step + 1) % 10 == 0:
                 print(f"[Успех] Тестовой запуск успешно проверен!")
                 os.kill(os.getpid(), signal.SIGKILL)
+
             if global_step % eval_every_steps == 0:
                 val_stream = val_factory()
                 eval_loss = 0.0
