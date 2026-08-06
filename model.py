@@ -674,7 +674,7 @@ class FullHybridMoEModel(nn.Module):
         RematBlock = nn.remat(BlockDAR, static_argnums=(7,), policy='dots_saveable')
 
 
-        RematBlock = BlockDAR  # без remat
+        
         for block_idx in range(num_blocks):
             layer_idx_start = block_idx * self.cfg.layers_per_block
             x, history_blocks = RematBlock(
