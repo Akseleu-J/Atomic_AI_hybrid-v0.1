@@ -494,7 +494,38 @@ class IntraBlockAttention(nn.Module):
         mixed = jnp.einsum("nbl,nbld->bld", weights, src_stack)
         return mixed.astype(block_input.dtype)
 
+class HybridDARAttention(nn.Module):
+    """DAR over variable source count. Shared k-projection via flattening
+    so Flax params don't depend on n_sources."""
+    cfg: ModelConfig
 
+    @nn.compact
+    def __call__(self, current_x, all_sources):
+        n = len(all_sources)
+        if n == 0:
+            return jnp.zeros_like(current_x)
+        
+        b, l, d = current_x.shape
+        stack = jnp.stack(all_sources, axis=0)  # (n, B, L, D)
+        
+        # Shared projection: params (D, d_latet), shape-agnostic to n
+        flat = stack.reshape(n * b * l, d)
+        k_flat = nn.Dense(
+            self.cfg.d_latent, use_bias=False, name="k_proj", dtype=jnp.bfloat16
+        )(flat)
+        k = k_flat.reshape(n, b, l, self.cfg.d_latent)
+        
+        q = nn.Dense(
+            self.cfg.d_latent, use_bias=False, name="q_proj", dtype=jnp.bfloat16
+        )(current_x)
+        
+        scores = jnp.einsum(
+            "bld,nbld->nbl", q, k
+        ) / jnp.sqrt(jnp.array(self.cfg.d_latent, dtype=q.dtype))
+        
+        weights = jax.nn.softmax(scores, axis=0)
+        retrieved = jnp.einsum("nbl,nbld->bld", weights, stack)
+        return retrieved.astype(current_x.dtype)
 # ==========================================
 # Specialized Sublayer (dispatches to GDN-2 / Mamba2 / MLA)
 # ==========================================
@@ -520,101 +551,82 @@ class SpecializedSublayer(nn.Module):
 # Block-level DAR Layer
 # ==========================================
 class BlockDARLayer(nn.Module):
-    """One layer inside a block.
-    - Computes delta via specialized sublayer (GDN-2 / Mamba2 / MLA)
-    - Mixes [block_input] + local_deltas via intra-block attention
-    """
     cfg: ModelConfig
     layer_type: str
+    layer_idx: int
 
     @nn.compact
-    def __call__(self, block_input, local_deltas, causal_mask, cos, sin, deterministic=True, rngs=None):
-        # sources = [block_input] + all previous local_deltas within this block
-        sources = [block_input] + list(local_deltas)
-
-        # Mix sources via intra-block attention
-        mixed = IntraBlockAttention(cfg=self.cfg, name="intra_attn")(sources, block_input)
-
-        # Apply specialized sublayer to mixed input
+    def __call__(self, current_x, x_input, block_input, local_deltas, history_blocks,
+                 causal_mask, cos, sin, deterministic=True, rngs=None):
+        b, l, d = current_x.shape
+        
+        # --- Hybrid DAR: retrieve from [x_input, Δ..., δ...] ---
+        dar_sources = [x_input]
+        if history_blocks.shape[0] > 0:
+            dar_sources.extend([history_blocks[j] for j in range(history_blocks.shape[0])])
+        dar_sources.extend(local_deltas)
+        
+        retrieved = HybridDARAttention(cfg=self.cfg, name="dar")(
+            current_x, dar_sources
+        )
+        current_x = current_x + retrieved
+        
+        # --- Intra-block mixing (ваш оригинальный механизм) ---
+        intra_sources = [block_input] + list(local_deltas)
+        mixed = IntraBlockAttention(cfg=self.cfg, name="intra")(
+            intra_sources, block_input
+        )
+        
+        # --- Sublayer ---
         delta = SpecializedSublayer(
             cfg=self.cfg, layer_type=self.layer_type, name="sublayer"
-        )(mixed, causal_mask=causal_mask, cos=cos, sin=sin, deterministic=deterministic, rngs=rngs)
-
+        )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
+          deterministic=deterministic, rngs=rngs)
+        
         return delta
-
 
 # ==========================================
 # Block-level DAR Block (3 consecutive layers)
 # ==========================================
 class BlockDAR(nn.Module):
-    """A block of N consecutive layers with:
-    - Intra-block attention mixing within the block
-    - Block delta aggregation (sum of layer deltas)
-    - Inter-block DAR attention after the block
-    - MoE after DAR
-    """
     cfg: ModelConfig
     block_idx: int
     layer_idx_start: int
 
     @nn.compact
-    def __call__(self, block_input, history_blocks, causal_mask, cos, sin, deterministic=True, rngs=None):
-        b, l, d = block_input.shape
-
-        # --- Intra-block layers ---
+    def __call__(self, current_x, x_input, history_blocks, causal_mask, cos, sin,
+                 deterministic=True, rngs=None):
+        b, l, d = current_x.shape
+        block_input = current_x  # snapshot входа блока
+        
         local_deltas = []
+        
         for i in range(self.cfg.layers_per_block):
             layer_idx = self.layer_idx_start + i
             layer_type = self.cfg.layer_types[layer_idx]
-
+            
             delta = BlockDARLayer(
                 cfg=self.cfg,
                 layer_type=layer_type,
+                layer_idx=layer_idx,
                 name=f"layer_{layer_idx}"
-            )(block_input, local_deltas, causal_mask, cos, sin, deterministic, rngs)
-
+            )(current_x, x_input, block_input, local_deltas, history_blocks,
+              causal_mask, cos, sin, deterministic, rngs)
+            
             local_deltas.append(delta)
-
-        # --- Aggregate block delta ---
-        block_delta = sum(local_deltas)  # (B, L, D)
-
-        # --- Update history ---
-        # history_blocks: (num_blocks_so_far, B, L, D)
-        # Append this block's delta
-        new_history = jnp.concatenate([history_blocks, block_delta[None, ...]], axis=0)
-
-        # --- Inter-block DAR attention ---
-        # Query from current block input
-        q_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_route", dtype=jnp.bfloat16)(block_input)
-
-        # Keys from all previous block deltas (including current)
-        k_route = nn.Dense(self.cfg.d_latent, use_bias=False, name="k_route", dtype=jnp.bfloat16)(new_history)
-
-        # Scores: (num_blocks, B, L)
-        routing_scores = jnp.einsum("bld,nbld->nbl", q_route, k_route) / jnp.sqrt(
-            jnp.array(self.cfg.d_latent, dtype=q_route.dtype)
+            current_x = current_x + delta  # residual
+        
+        # Агрегируем и сбрасываем локальные δ
+        block_delta = sum(local_deltas)
+        new_history = jnp.concatenate(
+            [history_blocks, block_delta[None, ...]], axis=0
         )
-
-        # Causal mask: only past blocks
-        num_blocks = new_history.shape[0]
-        depth_mask = jnp.arange(num_blocks) < self.block_idx  # strict < (past only)
-        # Current block (self.block_idx) is NOT included in retrieval
-        neg_inf = jnp.array(-1e9, dtype=routing_scores.dtype)
-        routing_scores = jnp.where(depth_mask[:, None, None], routing_scores, neg_inf)
-
-        routing_weights = jax.nn.softmax(routing_scores, axis=0)  # (num_blocks, B, L)
-
-        # Retrieve from history
-        retrieved = jnp.einsum("nbl,nbld->bld", routing_weights, new_history)
-
-        # Combine: block_input + retrieved + block_delta
-        moe_in = block_input + retrieved + block_delta
-
-        # --- MoE ---
-        norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(moe_in).astype(moe_in.dtype)
+        
+        # MoE после блока (DAR уже был на последнем слое)
+        norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
         moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
-
-        output = moe_in + moe_out
+        output = current_x + moe_out
+        
         return output, new_history
 
 
@@ -633,7 +645,8 @@ class FullHybridMoEModel(nn.Module):
             name="embed",
             dtype=jnp.bfloat16,
         )
-        x = embed_layer(input_ids)
+        x_input = embed_layer(input_ids)
+        x = x_input
         causal_mask = jnp.tril(jnp.ones((l, l))).astype(jnp.bool_)[None, None, :, :]
 
         d_head = self.cfg.d_model // self.cfg.n_heads
@@ -646,19 +659,15 @@ class FullHybridMoEModel(nn.Module):
 
         RematBlock = nn.remat(
             BlockDAR,
-            static_argnums=(6,),
-            policy='dots_saveable',
+            static_argnums=(7,),  # deterministic is 7th arg: (self, x, x_input, hist, mask, cos, sin, det, rngs)
         )
 
         for block_idx in range(num_blocks):
             layer_idx_start = block_idx * self.cfg.layers_per_block
-
             x, history_blocks = RematBlock(
-                cfg=self.cfg,
-                block_idx=block_idx,
-                layer_idx_start=layer_idx_start,
+                cfg=self.cfg, block_idx=block_idx, layer_idx_start=layer_idx_start,
                 name=f"block_{block_idx}"
-            )(x, history_blocks, causal_mask, cos, sin, deterministic, rngs)
+            )(x, x_input, history_blocks, causal_mask, cos, sin, deterministic, rngs)
 
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x).astype(x.dtype)
 
