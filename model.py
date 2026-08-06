@@ -149,7 +149,18 @@ class MLAJ(nn.Module):
                     causal=True, sm_scale=sm_scale, block_sizes=block_sizes,
                 )
 
-            out = _flash_call(Q_rope, K_rope, V).astype(x.dtype)
+            if mesh is not None:
+                spec = P(batch_axis, None, None, None)
+                sharded_flash = jax.shard_map(
+                    _flash_call,
+                    mesh=mesh,
+                    in_specs=spec,
+                    out_specs=spec,
+                    check_vma=False,
+                )
+                out = sharded_flash(Q_rope, K_rope, V).astype(x.dtype)
+            else:
+                out = _flash_call(Q_rope, K_rope, V).astype(x.dtype)
         else:
             scores = jnp.einsum("bhqd,bhkd->bhqk", Q_rope, K_rope) * sm_scale
             scores = jnp.where(causal_mask == 0, -1e9, scores)
