@@ -18,8 +18,7 @@ except Exception as _e:
     FlashBlockSizes = None
     _PALLAS_FLASH_ATTENTION_IMPORT_ERROR = _e
 
-import jax.checkpoint_policies as policies
-
+# jax.checkpoint_policies нет в этой версии JAX — используем строковые policy в nn.remat
 _model_mesh = None
 _batch_axis = None
 
@@ -648,7 +647,7 @@ class FullHybridMoEModel(nn.Module):
         RematBlock = nn.remat(
             BlockDAR,
             static_argnums=(5,),
-            policy=policies.dots_saveable,
+            policy='dots_saveable',
         )
 
         for block_idx in range(num_blocks):
