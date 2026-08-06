@@ -148,6 +148,8 @@ class MLAJ(nn.Module):
                     q_local, k_local, v_local,
                     causal=True, sm_scale=sm_scale, block_sizes=block_sizes,
                 )
+            mesh = get_model_mesh()
+            batch_axis = get_batch_axis()
 
             if mesh is not None:
                 spec = P(batch_axis, None, None, None)
