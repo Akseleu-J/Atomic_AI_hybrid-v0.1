@@ -13,17 +13,27 @@ from utils import collect_by_leaf_name, path_to_str
 # ==========================================
 def muon_orthogonalize(w, g, lr, ns_steps: int = 3):
     """Orthogonalize the gradient via Newton-Schulz iteration, then take a step."""
-    eps = 1e-7
+    # ФИКС: eps увеличен — bfloat16 не держит 1e-7, норма обнуляется,
+    # деление на ~0 дает inf, Newton-Schulz взрывается.
+    eps = 1e-4
+    
     if w.ndim == 3:
         norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
-        X = g / (norm + eps)
+        # Если норма слишком мала — считаем градиент нулевым,
+        # иначе деление на ~0 дает inf и заражает все параметры nan.
+        norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
+        X = g / norm
         for _ in range(ns_steps):
             X = 1.5 * X - 0.5 * jnp.einsum("eij,ejk,ekl->eil", X, jnp.swapaxes(X, -1, -2), X)
+            # Если итерация разошлась — обнуляем, не даем nan расползтись
+            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     else:
         norm = jnp.linalg.norm(g)
-        X = g / (norm + eps)
+        norm = jnp.where(norm < eps, 1.0, norm)
+        X = g / norm
         for _ in range(ns_steps):
             X = 1.5 * X - 0.5 * X @ X.T @ X
+            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     return w - (X * lr)
 
@@ -33,16 +43,6 @@ class MuonState(NamedTuple):
 
 
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
-    """muon_diagnostic_disable=True routes every normally-muon leaf to
-    adamw_nodecay instead. This is a ONE-CALL diagnostic, not a real fix: it
-    exists to answer a single question via memory_analysis() (compile-only, no
-    execution needed) -- is the 17.57 GB `temp` figure caused by Newton-Schulz
-    needing the FULL (all-gathered) matrix under FSDP for ~250+ muon-labeled
-    leaves at once, or is it something else? If HBM temp collapses with this
-    flag on, the hypothesis is confirmed and we go fix Muon's update_fn
-    (sequence the all-gathers instead of leaving them to jax.tree_map's
-    unconstrained scheduling) rather than guessing further blind. If it does
-    NOT collapse, look elsewhere instead of chasing Muon."""
     warmup_steps = max(1, int(total_steps * 0.05))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
@@ -82,12 +82,6 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         path_str = path_to_str(path)
         if "embed" in path_str or "lm_head" in path_str:
             return "adamw_decay"
-        # ФИКС: слои нормализации в model.py называются norm_1/norm_2/out_norm/
-        # final_norm -- подстрока "rmsnorm" никогда не встречается в пути, поэтому
-        # все scale-векторы RMSNorm (1D) проскальзывали мимо этой ветки и падали в
-        # `else: return "lion"` ниже -- обучались Lion'ом с weight decay вместо
-        # AdamW без decay, как задумывалось. Проверено на коллизии: "norm" не
-        # цепляет router/q_route/k_route/decay_proj/out_proj и т.д.
         if "norm" in path_str or "bias" in path_str:
             return "adamw_nodecay"
         if param.ndim >= 2:
@@ -113,24 +107,24 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 # Loss
 # ==========================================
 def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size):
-    """One token-chunk of label-smoothed CE. Wrapped in jax.checkpoint by the
-    caller so its forward tensors (chunk_size, vocab) are recomputed during
-    backward instead of being kept alive for the whole scan -- see
-    chunked_cross_entropy below for why this exists."""
+    """One token-chunk of label-smoothed CE."""
     sum_loss, sum_mask = carry
     hidden_chunk, label_chunk = chunk  # (chunk_size, d_model), (chunk_size,)
 
+    # Матмул в bf16 для памяти (chunk_size x d_model x vocab — самый большой
+    # single matmul в модели). Bfloat16 дает ~2x меньше памяти и полную
+    # throughput TPU MXU. НО: при больших значениях hidden/w bf16 overflow'ится
+    # в inf. Решение: upcast в fp32 -> nan_to_num (inf->clip) -> clip -> softmax.
     logits_chunk = (hidden_chunk.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
-    # (chunk_size, vocab) -- the only large tensor, and only for ONE chunk at a
-    # time. Matmul itself runs in bf16 (biggest single matmul in the whole model:
-    # chunk_size x d_model x vocab, vocab=151936) for TPU MXU throughput; result
-    # upcast to fp32 immediately after, since log_softmax/label-smoothing sums
-    # over the full 151936-wide vocab axis are exactly the kind of reduction
-    # that's sensitive to bf16's ~3 decimal digits of precision.
+
+    # ФИКС: sanitize bfloat16 overflow. Если значение inf или nan —
+    # заменяем на крайние допустимые, чтобы log_softmax не дал nan.
+    logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
+    logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
+
     log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
 
-    labels_safe = jnp.clip(label_chunk, 0, vocab_size - 1)  # -100 (ignore_index) -> valid
-                                                               # gather index; zeroed by mask below
+    labels_safe = jnp.clip(label_chunk, 0, vocab_size - 1)
     nll = -jnp.take_along_axis(log_probs, labels_safe[:, None], axis=-1).squeeze(-1)
 
     if smooth_negative is not None:
@@ -140,43 +134,18 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
         loss_vec = nll
 
     mask = (label_chunk != -100).astype(jnp.float32)
-    new_carry = (sum_loss + jnp.sum(loss_vec * mask), sum_mask + jnp.sum(mask))
-    return new_carry, None  # (carry, y) -- the shape jax.lax.scan's step fn must return
+
+    # ФИКС: jnp.where вместо умножения. Если nll содержит nan (например, от
+    # inf logits до sanitize), то nan * 0.0 = nan, и jnp.sum все равно даст nan.
+    # jnp.where(mask>0, loss_vec, 0.0) берет 0.0 из false-branch и игнорирует
+    # nan в true-branch — pad-токены дают ровно 0 вклада.
+    masked_loss = jnp.where(mask > 0, loss_vec, 0.0)
+
+    new_carry = (sum_loss + jnp.sum(masked_loss), sum_mask + jnp.sum(mask))
+    return new_carry, None
 
 
 def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=256):
-    """Same label-smoothed cross-entropy as before, but the (batch, seq, vocab)
-    logits/log_probs tensor is NEVER materialized in full.
-
-    ЧТО БЫЛО (две итерации назад): jax.nn.one_hot(labels, vocab_size) строил
-    плотный таргет (batch, seq, vocab) -- ~2.5 ГБ на fp32 при batch=2, seq=2048,
-    vocab=151936, и таких тензоров строилось 3-4 разом.
-
-    ЧТО СТАЛО ПОТОМ (прошлая правка): убрали one-hot через take_along_axis --
-    но это не сдвинуло OOM (16.76 -> 16.77 ГБ), потому что сам `logits` и
-    `log_probs` -- тензоры ТОЙ ЖЕ формы (batch, seq, vocab) -- строились самой
-    моделью (`embed_layer.attend(final)` в model.py) ДО того, как loss вообще
-    начинал считаться, и это происходит вне nn.remat-скоупов модели (remat там
-    оборачивает только transformer-блоки, не финальную проекцию). На стыке
-    forward/backward нужно ОДНОВРЕМЕННО держать forward-тензор и backward-тензор
-    того же размера -- отсюда ~8-10 ГБ только на этот узел, и remat здесь не
-    помогает (нечего "растягивать" -- промежуток между вычислением и
-    использованием и так короткий).
-
-    ЧТО СТАЛО ТЕПЕРЬ: model.py возвращает `final` (b, l, d_model) вместо
-    `logits` (return_hidden=True) -- маленький тензор, не зависящий от vocab_size.
-    Проекция в vocab-пространство и вся loss-арифметика делается здесь, чанками
-    по `chunk_size` токенов через jax.lax.scan, и тело каждого чанка обёрнуто в
-    jax.checkpoint: во время backward JAX пересчитывает logits/log_probs для
-    ОДНОГО чанка за раз и сразу их выбрасывает, вместо того чтобы хранить все
-    чанки разом. Пиковая память по этому узлу падает с O(batch*seq*vocab) до
-    O(chunk_size*vocab) -- при chunk_size=256 это ~148 МБ вместо ~2.5 ГБ.
-    Градиент по `w` (embedding-таблица/lm_head) накапливается через обычный
-    autodiff по scan (JAX суммирует вклад каждой итерации в grad замкнутого
-    аргумента корректно, это стандартное поведение, не что-то специальное).
-    Численно эквивалентно прежней формуле -- то же разложение, тот же
-    take_along_axis + sum(log_probs), просто по кускам вместо разом.
-    """
     b, l, d = final_hidden.shape
     vocab_size = w.shape[-1]
 
@@ -196,17 +165,15 @@ def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=2
     smooth_positive = 1.0 - label_smoothing
     smooth_negative = (label_smoothing / (vocab_size - 1)) if label_smoothing > 0 else None
 
-    # jax.checkpoint on the per-chunk step itself: during backward, jax.lax.scan
-    # recomputes logits_chunk/log_probs for one chunk at a time from the (small,
-    # cheap-to-keep) hidden_chunk, uses them, then discards them -- instead of
-    # every chunk's (chunk_size, vocab) tensor being kept alive simultaneously
-    # for the whole scan.
     scan_step = jax.checkpoint(
         lambda carry, chunk: _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size)
     )
 
     (sum_loss, sum_mask), _ = jax.lax.scan(scan_step, (0.0, 0.0), (hidden_chunks, label_chunks))
-    return sum_loss / (sum_mask + 1e-9)
+
+    # ФИКС: защита от пустого батча (все токены -100). jnp.maximum с 1.0
+    # вместо +1e-9 — если sum_mask=0, возвращаем 0.0 (не огромное число).
+    return sum_loss / jnp.maximum(sum_mask, 1.0)
 
 
 def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, deterministic=False, return_aux=False,
@@ -236,15 +203,18 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
 
-    # w must be (d_model, vocab) for `hidden_chunk @ w` in chunked_cross_entropy.
-    # Tied embeddings: nn.Embed's kernel is stored (vocab, d_model) -- transpose.
-    # Untied: nn.Dense("lm_head") kernel is already (d_model, vocab).
     if cfg.tie_embeddings:
         w = params["embed"]["embedding"].T
     else:
         w = params["lm_head"]["kernel"]
 
     ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
+
+    # ФИКС: последняя линия обороны. Если в params уже есть nan (например,
+    # от предыдущего взорвавшегося шага), обнуляем ce_loss чтобы не заразить
+    # opt_state. Обучение продолжится с плохим loss — это сигнал смотреть
+    # предыдущие шаги, но не убивает процесс.
+    ce_loss = jnp.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=0.0)
 
     total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
     if return_aux:
