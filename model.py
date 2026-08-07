@@ -380,13 +380,17 @@ class ExpertPack(nn.Module):
 
 
 class MoEJ(nn.Module):
+    """DENSE MoE (тестовый режим): все E экспертов считают все токены,
+    без routing/capacity/sort/gather-scatter. Используется для диагностики
+    того, был ли TPU compute bottleneck именно в routing-механике старого
+    top-k + capacity-buffer варианта (см. историю: 3.3с/микрошаг при MFU ~2%)."""
     cfg: ModelConfig
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
-        E = self.cfg.num_experts  # например 4
+        E = self.cfg.num_experts
 
         router_logits = nn.Dense(E, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         if not deterministic and self.cfg.router_noise_std > 0:
@@ -396,27 +400,28 @@ class MoEJ(nn.Module):
             )
         gate = jax.nn.softmax(router_logits, axis=-1)  # (tokens, E)
 
-        # диагностика балансировки роутера — оставляем aux/z-loss как есть
         mean_probs = jnp.mean(gate, axis=0)
         self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * mean_probs))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(
             jax.scipy.special.logsumexp(router_logits, axis=-1))))
         self.sow("losses", "expert_utilization", mean_probs)
 
+        # ФИКС: in_axes=(None, None) значит НИ ОДИН аргумент не несёт ось
+        # экспертов -- в отличие от старого in_axes=(0, None), где
+        # expert_inputs уже имел ось E_routed и axis_size выводился сам.
+        # Здесь axis_size нужно указать явно, иначе падает при компиляции.
         run_experts = nn.vmap(
             ExpertPack,
             variable_axes={"params": 0},
             split_rngs={"params": True, "dropout": True},
             in_axes=(None, None),
             out_axes=0,
+            axis_size=E,
         )(cfg=self.cfg, name="experts_block")
-        # (E, tokens, d) — каждый эксперт видит все токены
-        all_outputs = run_experts(flat_x, deterministic)
+        all_outputs = run_experts(flat_x, deterministic)  # (E, tokens, d)
 
         weighted = jnp.einsum("te,etd->td", gate, all_outputs)
         return weighted.reshape(b, l, d)
-
-
 # ==========================================
 # Intra-block attention (lightweight mixing)
 # ==========================================
