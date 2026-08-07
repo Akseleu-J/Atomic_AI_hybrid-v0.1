@@ -209,47 +209,50 @@ def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=2
     return sum_loss / (sum_mask + 1e-9)
 
 
-def compute_loss(params, model_apply, batch, config, rngs=None, deterministic=True, return_aux=False, ce_chunk_size=2048):
+def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, deterministic=False, return_aux=False,
+                  ce_chunk_size=256):
     input_ids = batch["input_ids"]
     labels = batch["labels"]
-    
-    # Маска: -100 = pad, всё остальное — валидные токены
-    loss_mask = (labels >= 0).astype(jnp.float32)
-    # Заменяем -100 на 0 чтобы не вылететь за vocab при индексации
-    safe_labels = jnp.where(labels >= 0, labels, 0)
-    
-    logits = model_apply({"params": params}, input_ids, rngs=rngs, deterministic=deterministic)
-    # logits: [batch, seq, vocab]
-    
-    # Cross-entropy по чанкам (ваш ce_chunk_size)
-    vocab_size = logits.shape[-1]
-    
-    # Разворачиваем для подсчёта
-    logits_flat = logits.reshape(-1, vocab_size)
-    labels_flat = safe_labels.reshape(-1)
-    mask_flat = loss_mask.reshape(-1)
-    
-    # log-softmax в float32 для стабильности
-    log_probs = jax.nn.log_softmax(logits_flat.astype(jnp.float32), axis=-1)
-    nll = -jnp.take_along_axis(log_probs, labels_flat[:, None], axis=-1).squeeze(-1)
-    
-    # Применяем маску: pad токены дают 0 loss
-    masked_nll = nll * mask_flat
-    
-    # Среднее ТОЛЬКО по валидным токенам (не по всем!)
-    n_valid = jnp.maximum(jnp.sum(mask_flat), 1.0)  # защита от деления на 0
-    ce_loss = jnp.sum(masked_nll) / n_valid
-    
-    # ... остальной ваш код (aux_loss, z_loss) ...
-    
-    total_loss = ce_loss  # + aux_loss * coef + z_loss * coef
-    
+
+    kwargs = {"deterministic": deterministic, "return_hidden": True}
+    if rngs is not None:
+        kwargs["rngs"] = rngs
+
+    outputs = model_fn(
+        {"params": params}, input_ids, **kwargs, mutable=["losses"] if not deterministic else False
+    )
+
+    expert_util_stacked = None
+    if not deterministic:
+        final_hidden, sowed_vars = outputs
+        aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
+        z_losses = collect_by_leaf_name(sowed_vars["losses"], "z_loss")
+        expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
+        aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
+        z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
+        if expert_utils:
+            expert_util_stacked = jnp.stack(expert_utils)
+    else:
+        final_hidden = outputs
+        aux_loss, z_loss = 0.0, 0.0
+
+    # w must be (d_model, vocab) for `hidden_chunk @ w` in chunked_cross_entropy.
+    # Tied embeddings: nn.Embed's kernel is stored (vocab, d_model) -- transpose.
+    # Untied: nn.Dense("lm_head") kernel is already (d_model, vocab).
+    if cfg.tie_embeddings:
+        w = params["embed"]["embedding"].T
+    else:
+        w = params["lm_head"]["kernel"]
+
+    ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
+
+    total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
     if return_aux:
         aux_info = {
             "ce_loss": ce_loss,
-            "aux_loss": aux_loss if 'aux_loss' in dir() else jnp.array(0.0),
-            "z_loss": z_loss if 'z_loss' in dir() else jnp.array(0.0),
-            "expert_utilization": expert_util if 'expert_util' in dir() else None,
+            "aux_loss": aux_loss,
+            "z_loss": z_loss,
+            "expert_utilization": expert_util_stacked,
         }
         return total_loss, aux_info
     return total_loss
