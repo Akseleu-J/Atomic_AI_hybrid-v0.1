@@ -379,7 +379,7 @@ class ExpertPack(nn.Module):
         return nn.Dense(self.cfg.d_model, name="w2", dtype=jnp.bfloat16)(h)
 
 
-class DenseMoEJ(nn.Module):
+class MoEJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
