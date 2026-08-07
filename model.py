@@ -379,87 +379,42 @@ class ExpertPack(nn.Module):
         return nn.Dense(self.cfg.d_model, name="w2", dtype=jnp.bfloat16)(h)
 
 
-class MoEJ(nn.Module):
+class DenseMoEJ(nn.Module):
     cfg: ModelConfig
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
-        num_tokens = flat_x.shape[0]
-        E, K = self.cfg.num_experts, self.cfg.top_k
-        if K < 2:
-            raise ValueError(f"top_k={K} must be >= 2 with a shared expert.")
-        E_routed = E - 1
-        K_routed = K - 1
-        n_assign = num_tokens * K_routed
+        E = self.cfg.num_experts  # например 4
 
-        shared_out = ExpertPack(cfg=self.cfg, name="shared_expert")(flat_x, deterministic)
-
-        router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
+        router_logits = nn.Dense(E, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout")
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
                 noise_rng, router_logits.shape, dtype=router_logits.dtype
             )
+        gate = jax.nn.softmax(router_logits, axis=-1)  # (tokens, E)
 
-        router_probs = jax.nn.softmax(router_logits, axis=-1)
-        top_k_vals, top_k_idx = jax.lax.top_k(router_probs, K_routed)
-
-        gate = top_k_vals / (jnp.sum(top_k_vals, axis=-1, keepdims=True) + 1e-9)
-
-        flat_expert_idx = top_k_idx.reshape(-1)
-        flat_gate = gate.reshape(-1)
-        flat_token_idx = jnp.repeat(jnp.arange(num_tokens), K_routed)
-
-        mean_probs = jnp.mean(router_probs, axis=0)
-        expert_gate_frac = jnp.zeros(E_routed, dtype=flat_gate.dtype).at[flat_expert_idx].add(flat_gate) / num_tokens
-        self.sow("losses", "aux_loss", E_routed * jnp.sum(mean_probs * expert_gate_frac))
-        self.sow("losses", "z_loss", jnp.mean(jnp.square(jax.scipy.special.logsumexp(router_logits, axis=-1))))
-        expert_assign_frac = jnp.zeros(E_routed, dtype=flat_gate.dtype).at[flat_expert_idx].add(1.0) / n_assign
-        shared_util = jnp.ones((1,), dtype=flat_gate.dtype)
-        self.sow("losses", "expert_utilization", jnp.concatenate([shared_util, expert_assign_frac], axis=0))
-
-        capacity = max(1, int(self.cfg.moe_capacity_factor * num_tokens * K_routed / E_routed))
-
-        sort_order = jnp.argsort(flat_expert_idx)
-        sorted_expert = flat_expert_idx[sort_order]
-
-        expert_counts = jnp.zeros(E_routed, dtype=jnp.int32).at[flat_expert_idx].add(1)
-        expert_start = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(expert_counts)[:-1]])
-
-        pos_in_bucket_sorted = jnp.arange(n_assign) - expert_start[sorted_expert]
-        valid_sorted = pos_in_bucket_sorted < capacity
-
-        dest_row = sorted_expert * capacity + jnp.minimum(pos_in_bucket_sorted, capacity - 1)
-
-        gathered_x = flat_x[flat_token_idx][sort_order]
-        buffer = jnp.zeros((E_routed * capacity, d), dtype=flat_x.dtype)
-        zero = jnp.array(0.0, dtype=flat_x.dtype)
-        buffer = buffer.at[dest_row].add(jnp.where(valid_sorted[:, None], gathered_x, zero))
-        expert_inputs = buffer.reshape(E_routed, capacity, d)
+        # диагностика балансировки роутера — оставляем aux/z-loss как есть
+        mean_probs = jnp.mean(gate, axis=0)
+        self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * mean_probs))
+        self.sow("losses", "z_loss", jnp.mean(jnp.square(
+            jax.scipy.special.logsumexp(router_logits, axis=-1))))
+        self.sow("losses", "expert_utilization", mean_probs)
 
         run_experts = nn.vmap(
             ExpertPack,
             variable_axes={"params": 0},
             split_rngs={"params": True, "dropout": True},
-            in_axes=(0, None),
+            in_axes=(None, None),
             out_axes=0,
         )(cfg=self.cfg, name="experts_block")
-        expert_outputs = run_experts(expert_inputs, deterministic)
+        # (E, tokens, d) — каждый эксперт видит все токены
+        all_outputs = run_experts(flat_x, deterministic)
 
-        flat_expert_outputs = expert_outputs.reshape(E_routed * capacity, d)
-        gathered_out_sorted = flat_expert_outputs[dest_row]
-        gathered_out_sorted = jnp.where(valid_sorted[:, None], gathered_out_sorted, zero)
-
-        unsort_order = jnp.argsort(sort_order)
-        gathered_out = gathered_out_sorted[unsort_order]
-        weighted_out = gathered_out * flat_gate[:, None]
-
-        routed_out = jnp.zeros_like(flat_x).at[flat_token_idx].add(weighted_out)
-
-        flat_outputs = shared_out + routed_out
-        return flat_outputs.reshape(b, l, d)
+        weighted = jnp.einsum("te,etd->td", gate, all_outputs)
+        return weighted.reshape(b, l, d)
 
 
 # ==========================================
