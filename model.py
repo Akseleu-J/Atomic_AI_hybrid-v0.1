@@ -1,4 +1,5 @@
 import math
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -299,6 +300,96 @@ class Mamba2J(nn.Module):
 # ==========================================
 # Gated DeltaNet-2 (GDN-2)
 # ==========================================
+def _gdn2_recurrence_impl(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype):
+    """Чистая (без flax-параметров) реализация рекуррентной части GDN-2.
+    Вынесена наружу, чтобы обернуть в custom_vjp ниже."""
+
+    def _combine(state1, state2):
+        m1, c1 = state1
+        m2, c2 = state2
+        m_new = m2 @ m1
+        fro_norm = jnp.sqrt(jnp.sum(jnp.square(m_new), axis=(-2, -1), keepdims=True))
+        scale = jnp.minimum(1.0, 1.0 / (fro_norm + 1e-6))
+        m_new = m_new * scale
+        c_new = m2 @ c1 + c2
+        c_new = jnp.nan_to_num(c_new, nan=0.0, posinf=1e4, neginf=-1e4)
+        return m_new, c_new
+
+    def _to_chunks(t):
+        t = t.reshape(b, num_chunks, chunk_size, n_heads, d_head)
+        return jnp.moveaxis(t, 1, 0)
+
+    k_ch, ea_ch, z_ch, alpha_ch, q_ch = map(_to_chunks, (k, ea, z, alpha, q))
+
+    eye_bh = jnp.broadcast_to(jnp.eye(d_head, dtype=dtype), (b, n_heads, d_head, d_head))
+    zero_bh = jnp.zeros((b, n_heads, d_head, d_head), dtype=dtype)
+
+    def _chunk_step(carry, chunk_inputs):
+        carry_M, carry_S = carry
+        k_c, ea_c, z_c, alpha_c, q_c = chunk_inputs
+
+        eye = jnp.eye(d_head, dtype=dtype)[None, None, None, :, :]
+        M_c = eye * alpha_c[:, :, :, None, :] - k_c[:, :, :, :, None] @ ea_c[:, :, :, None, :]
+        C_c = k_c[:, :, :, :, None] @ z_c[:, :, :, None, :]
+
+        P_local, S_local = jax.lax.associative_scan(_combine, (M_c, C_c), axis=1)
+
+        global_M = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_M)
+        global_S = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_S) + S_local
+        global_S = jnp.nan_to_num(global_S, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        out_c = jnp.einsum("bchij,bchi->bchj", global_S, q_c)
+        new_carry = (global_M[:, -1], global_S[:, -1])
+        return new_carry, out_c
+
+    _chunk_step = jax.checkpoint(_chunk_step)
+
+    _, out_chunks = jax.lax.scan(
+        _chunk_step, (eye_bh, zero_bh), (k_ch, ea_ch, z_ch, alpha_ch, q_ch)
+    )
+    return jnp.moveaxis(out_chunks, 0, 1).reshape(b, num_chunks * chunk_size, n_heads * d_head)
+
+
+# ФИКС: forward-clipping внутри _combine (Frobenius-норма <=1) ограничивает
+# ЗНАЧЕНИЯ на прямом проходе, но НЕ ограничивает величину градиента при
+# автоматическом дифференцировании jax.lax.associative_scan через 256-шаговую
+# цепочку матричных произведений -- это классический exploding gradient
+# в BPTT-подобной рекуррентной схеме, отдельный от проблемы forward-overflow.
+# Эмпирически подтверждено (BWD-DIAG): grad уже non-finite к моменту, когда
+# backward доходит до block19 (gdn2) -- т.е. взрыв происходит ВНУТРИ
+# автоматического backward associative_scan, а не после него. Поэтому
+# оборачиваем всю рекуррентную функцию в custom_vjp: forward -- как есть,
+# backward считаем через jax.vjp (тот же автоматический граф), но затем
+# ЯВНО санитизируем полученный градиент (nan_to_num + клип по модулю) перед
+# тем как отдать его дальше по графу. Это не убирает потенциальную
+# численную неустойчивость самой рекуррентности, но гарантирует, что она
+# не отравляет остальные 20 слоёв через shared residual/DAR граф.
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10))
+def gdn2_recurrence_safe(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype):
+    return _gdn2_recurrence_impl(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype)
+
+
+def _gdn2_recurrence_safe_fwd(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype):
+    primal_fn = lambda k, ea, z, alpha, q: _gdn2_recurrence_impl(
+        k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype
+    )
+    out, vjp_fn = jax.vjp(primal_fn, k, ea, z, alpha, q)
+    return out, vjp_fn
+
+
+def _gdn2_recurrence_safe_bwd(chunk_size, num_chunks, b, n_heads, d_head, dtype, vjp_fn, g):
+    grads = vjp_fn(g)
+    _GRAD_CLIP = 1e3
+    safe_grads = tuple(
+        jnp.nan_to_num(jnp.clip(gr, -_GRAD_CLIP, _GRAD_CLIP), nan=0.0, posinf=_GRAD_CLIP, neginf=-_GRAD_CLIP)
+        for gr in grads
+    )
+    return safe_grads
+
+
+gdn2_recurrence_safe.defvjp(_gdn2_recurrence_safe_fwd, _gdn2_recurrence_safe_bwd)
+
+
 class GatedDeltaNet2J(nn.Module):
     cfg: ModelConfig
 
@@ -353,69 +444,7 @@ class GatedDeltaNet2J(nn.Module):
             raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
         num_chunks = l // chunk_size
 
-        # ФИКС: M_c = eye*alpha - k⊗ea в общем случае НЕ гарантированно имеет
-        # спектральную норму <=1 (b_gate/w_gate -- независимые сигмоиды, а не
-        # согласованный erase/write gate классического delta rule), поэтому
-        # даже небольшое превышение normы 1 на одном токене после
-        # associative_scan-произведения ПОДРЯД chunk_size=256 таких матриц
-        # даёт экспоненциальный рост (1.05^256 ~ 1.6e5) вплоть до inf --
-        # именно это наблюдалось эмпирически (block=5, layer=16, gdn2, после
-        # 190 стабильных шагов, когда веса гейтов сместились в опасную зону).
-        # bf16 и fp32 имеют ОДИНАКОВЫЙ диапазон экспоненты (8 бит), так что
-        # апкаст сам по себе точку overflow не сдвигает -- нужно ограничивать
-        # саму норму матрицы на каждом шаге combine, а не только точность.
-        def _combine(state1, state2):
-            m1, c1 = state1
-            m2, c2 = state2
-            m_new = m2 @ m1
-            # Ограничиваем Frobenius-норму произведения сверху -- дешёвая
-            # аппроксимация spectral clipping, которая не даёт норме расти
-            # неограниченно внутри scan, но не трогает "здоровые" M (норма
-            # которых и так <=1 почти везде).
-            fro_norm = jnp.sqrt(jnp.sum(jnp.square(m_new), axis=(-2, -1), keepdims=True))
-            scale = jnp.minimum(1.0, 1.0 / (fro_norm + 1e-6))
-            m_new = m_new * scale
-            c_new = m2 @ c1 + c2
-            c_new = jnp.nan_to_num(c_new, nan=0.0, posinf=1e4, neginf=-1e4)
-            return m_new, c_new
-
-        def _to_chunks(t):
-            t = t.reshape(b, num_chunks, chunk_size, n_heads, d_head)
-            return jnp.moveaxis(t, 1, 0)
-
-        k_ch, ea_ch, z_ch, alpha_ch, q_ch = map(_to_chunks, (k, ea, z, alpha, q))
-
-        eye_bh = jnp.broadcast_to(jnp.eye(d_head, dtype=x.dtype), (b, n_heads, d_head, d_head))
-        zero_bh = jnp.zeros((b, n_heads, d_head, d_head), dtype=x.dtype)
-
-        def _chunk_step(carry, chunk_inputs):
-            carry_M, carry_S = carry
-            k_c, ea_c, z_c, alpha_c, q_c = chunk_inputs
-
-            eye = jnp.eye(d_head, dtype=x.dtype)[None, None, None, :, :]
-            M_c = eye * alpha_c[:, :, :, None, :] - k_c[:, :, :, :, None] @ ea_c[:, :, :, None, :]
-            C_c = k_c[:, :, :, :, None] @ z_c[:, :, :, None, :]
-
-            P_local, S_local = jax.lax.associative_scan(_combine, (M_c, C_c), axis=1)
-
-            global_M = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_M)
-            global_S = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_S) + S_local
-            # ФИКС: последняя линия обороны -- если несмотря на clipping в
-            # _combine что-то всё же дало inf/nan (например, carry_M/carry_S,
-            # пришедшие с предыдущего чанка), не даём этому уйти дальше по
-            # scan через новый carry.
-            global_S = jnp.nan_to_num(global_S, nan=0.0, posinf=1e4, neginf=-1e4)
-
-            out_c = jnp.einsum("bchij,bchi->bchj", global_S, q_c)
-            new_carry = (global_M[:, -1], global_S[:, -1])
-            return new_carry, out_c
-
-        _chunk_step = jax.checkpoint(_chunk_step)
-
-        _, out_chunks = jax.lax.scan(
-            _chunk_step, (eye_bh, zero_bh), (k_ch, ea_ch, z_ch, alpha_ch, q_ch)
-        )
-        out = jnp.moveaxis(out_chunks, 0, 1).reshape(b, l, d)
+        out = gdn2_recurrence_safe(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, x.dtype)
 
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
