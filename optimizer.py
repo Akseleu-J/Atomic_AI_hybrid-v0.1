@@ -43,7 +43,7 @@ class MuonState(NamedTuple):
 
 
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
-    warmup_steps = max(1, int(total_steps * 0.05))
+    warmup_steps = max(1, int(total_steps * 0.10))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
     )
@@ -76,7 +76,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 
         return optax.GradientTransformation(init_fn, update_fn)
 
-    tx_muon = _muon_step(base_lr=0.02)
+    tx_muon = _muon_step(base_lr=0.01)
 
     def _label_leaf(path, param):
         path_str = path_to_str(path)
@@ -95,7 +95,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     def label_fn(params):
         return jax.tree_util.tree_map_with_path(_label_leaf, params)
 
-    clip_tx = optax.clip_by_global_norm(1.0)
+    clip_tx = optax.clip_by_global_norm(0.5)
     multi_tx = optax.multi_transform(
         {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay, "adamw_nodecay": tx_adamw_nodecay},
         label_fn,
