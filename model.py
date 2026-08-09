@@ -64,6 +64,34 @@ def make_grad_probe(tag: str):
     return _probe
 
 
+def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
+    """Как make_grad_probe, но не только печатает, а АКТИВНО чинит non-finite
+    градиент (nan_to_num + клип) прежде чем отдать его дальше по backward
+    графу. Используется в узлах со своим сложным custom VJP (pallas
+    flash-attention) или длинной scan-рекуррентностью (Mamba2), где
+    санитизация только forward-входов (как для GDN-2/Mamba2 сделано выше)
+    не гарантирует конечность именно ГРАДИЕНТА, вычисляемого внутри."""
+    @jax.custom_vjp
+    def _sanitizer(x):
+        return x
+
+    def _fwd(x):
+        return x, None
+
+    def _bwd(_, g):
+        finite = jnp.all(jnp.isfinite(g))
+        jax.lax.cond(
+            jnp.logical_not(finite),
+            lambda: jax.debug.print("[BWD-FIX] 🩹 non-finite градиент в узле {t} -- санитизирован", t=tag),
+            lambda: None,
+        )
+        g_safe = jnp.nan_to_num(jnp.clip(g, -clip_val, clip_val), nan=0.0, posinf=clip_val, neginf=-clip_val)
+        return (g_safe,)
+
+    _sanitizer.defvjp(_fwd, _bwd)
+    return _sanitizer
+
+
 @struct.dataclass
 class ModelConfig:
     d_model: int = 512
@@ -205,7 +233,7 @@ class MLAJ(nn.Module):
             out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
-        out = make_grad_probe(f"mla_flash_attn_out")(out)
+        out = make_grad_sanitizer("mla_flash_attn_out")(out)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o", dtype=jnp.bfloat16)(out)
 
 
