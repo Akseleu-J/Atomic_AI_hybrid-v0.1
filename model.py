@@ -238,12 +238,19 @@ class Mamba2J(nn.Module):
         )
         x_conv = jax.nn.silu(res_conv + conv_b[None, None, :].astype(x_bc.dtype))
 
-        A = -jnp.exp(self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,))).astype(x.dtype)
+        # ФИКС: тот же inf*0=nan риск, что и в GDN-2 decay -- если A_log
+        # уйдёт в большое положительное значение, exp(A_log) переполняется в
+        # inf, A=-inf; если dt в какой-то позиции округлится до 0 в bf16,
+        # dt*A = 0*(-inf) = nan. Клипаем A_log перед exp и санитизируем
+        # итоговый показатель степени перед exp.
+        A_log_safe = jnp.clip(self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,)), -20.0, 20.0)
+        A = -jnp.exp(A_log_safe).astype(x.dtype)
         B = nn.Dense(d_state, use_bias=False, name="B_proj", dtype=jnp.bfloat16)(x_bc)
         C = nn.Dense(d_state, use_bias=False, name="C_proj", dtype=jnp.bfloat16)(x_bc)
         dt = jax.nn.softplus(nn.Dense(d_inner, use_bias=True, name="dt_proj", dtype=jnp.bfloat16)(x_bc))
 
-        dA = jnp.exp(jnp.einsum("bld,d->bld", dt, A))
+        dA_exponent = jnp.nan_to_num(jnp.einsum("bld,d->bld", dt, A), nan=0.0, posinf=0.0, neginf=-20.0)
+        dA = jnp.exp(dA_exponent)
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
@@ -430,7 +437,24 @@ class GatedDeltaNet2J(nn.Module):
 
         a_param = self.param("decay_a", nn.initializers.zeros, (n_heads,)).astype(x.dtype)
         f_proj = nn.Dense(d, use_bias=True, name="decay_proj", dtype=jnp.bfloat16)(x).reshape(b, l, n_heads, d_head)
-        g = -jnp.exp(a_param)[None, None, :, None] * jax.nn.softplus(f_proj)
+        # ФИКС: a_param -- необучаемо-ограниченный параметр; если он
+        # (например, через Lion) уйдёт в достаточно большое положительное
+        # значение, jnp.exp(a_param) переполняется в inf ЕЩЁ ДО входа в
+        # рекуррентность. Если в этот же момент softplus(f_proj) в какой-то
+        # позиции округляется до 0 (в bf16 это вполне достижимо), получаем
+        # классический inf*0=nan -- источник, полностью независимый от
+        # associative_scan и не перехватываемый никакими фиксами внутри
+        # рекуррентности (эмпирически подтверждено: nan возникает в forward
+        # ДО gdn2_recurrence_safe). Клипаем a_param перед exp -- decay_a=20
+        # уже даёт exp(20)~5e8, что более чем достаточно как верхняя граница
+        # скорости распада, дальнейший рост только приближает к inf без
+        # практической пользы.
+        a_param_safe = jnp.clip(a_param, -20.0, 20.0)
+        g = -jnp.exp(a_param_safe)[None, None, :, None] * jax.nn.softplus(f_proj)
+        # ФИКС: safety-net на случай inf*0=nan из других комбинаций (или
+        # bf16-округления softplus до ровно 0 при экстремальном f_proj) --
+        # nan -> g=0 -> alpha=exp(0)=1 (нейтральный decay, не взрыв).
+        g = jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=-20.0)
         alpha = jnp.exp(g)
 
         out_gate = nn.Dense(d, use_bias=False, name="out_gate", dtype=jnp.bfloat16)(x)
