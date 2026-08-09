@@ -233,6 +233,67 @@ from optimizer import compute_loss, make_hybrid_optimizer
 from utils import path_to_str
 
 
+# ==========================================================================
+# ДИАГНОСТИКА non-finite градиентов: относим каждый лист параметров к одной
+# из "подозреваемых" групп (те же кандидаты, что обсуждали: GDN-2, Mamba2,
+# MLA, MoE, Muon-таргеты типа >=2D веса, остальное), затем на каждом шаге,
+# где итоговый global_norm не конечен, печатаем через jax.debug.print,
+# у КАКИХ ИМЕННО групп есть non-finite градиент. Работает под jax.jit.
+# Временная мера -- после локализации источника этот блок можно убрать.
+# ==========================================================================
+_DIAG_GROUPS = ("gdn2", "mamba2", "mla", "moe", "muon_decay", "embed", "other")
+
+
+def _classify_leaf_group(path_str: str) -> str:
+    if "gdn2" in path_str:
+        return "gdn2"
+    if "mamba2" in path_str:
+        return "mamba2"
+    if "mla" in path_str:
+        return "mla"
+    if "experts_block" in path_str or "moe" in path_str or "router" in path_str:
+        return "moe"
+    if "embed" in path_str or "lm_head" in path_str:
+        return "embed"
+    return "other"
+
+
+def make_grad_group_map(params):
+    """Строит pytree той же формы, что params/grads, где каждый лист -- это
+    ИМЯ группы (питоновская строка, статична, не трейсится). Вычисляется
+    один раз вне jit по abstract params."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, _: _classify_leaf_group(path_to_str(path)), params
+    )
+
+
+def build_group_nonfinite_check(grad_group_map):
+    """Возвращает функцию (avg_grads) -> None, которая ВНУТРИ jit печатает
+    через jax.debug.print, в каких группах есть non-finite градиент.
+    grad_group_map должен быть уже посчитан (статические python-строки),
+    его листья используются только для группировки на python-уровне --
+    сам traversal и суммирование masks делается в jax."""
+    leaves_g, treedef = jax.tree_util.tree_flatten(grad_group_map)
+
+    def _check(avg_grads):
+        leaves_grad = jax.tree_util.tree_leaves(avg_grads)
+        for group in _DIAG_GROUPS:
+            idxs = [i for i, g in enumerate(leaves_g) if g == group]
+            if not idxs:
+                continue
+            any_nonfinite = False
+            flags = [jnp.logical_not(jnp.all(jnp.isfinite(leaves_grad[i]))) for i in idxs]
+            group_flag = jnp.any(jnp.stack(flags)) if len(flags) > 1 else flags[0]
+            jax.lax.cond(
+                group_flag,
+                lambda g=group: jax.debug.print(
+                    "[DIAG] ⚠️ non-finite градиент обнаружен в группе: {g}", g=g
+                ),
+                lambda: None,
+            )
+    return _check
+
+
 def make_tpu_mesh():
     devices = jax.devices()
     n = len(devices)
@@ -282,6 +343,12 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
     param_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, abstract_params)
 
+    # ДИАГНОСТИКА: строим карту групп один раз (вне jit, на python-уровне) и
+    # компилируем функцию-проверку non-finite по группам для использования
+    # внутри distributed_apply_step.
+    grad_group_map = make_grad_group_map(abstract_params)
+    _group_nonfinite_check = build_group_nonfinite_check(grad_group_map)
+
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
     opt_state_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, opt_state_abstract)
 
@@ -306,6 +373,10 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
     def distributed_apply_step(p, s, accum_grads, n_accum):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
+
+        # ДИАГНОСТИКА: печатаем, в каких группах параметров градиент
+        # non-finite -- до клиппинга/nan_to_num, чтобы видеть "сырой" источник.
+        _group_nonfinite_check(avg_grads)
 
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
 
