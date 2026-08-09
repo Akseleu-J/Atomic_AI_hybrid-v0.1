@@ -585,7 +585,22 @@ class BlockDAR(nn.Module):
                 name=f"layer_{layer_idx}"
             )(current_x, x_input, block_input, local_deltas, history_blocks,
               causal_mask, cos, sin, deterministic, rngs)
-            
+
+            # ДИАГНОСТИКА: ловим ПЕРВЫЙ non-finite delta по forward-активациям,
+            # до того как residual/DAR размажет его по всему графу (что и
+            # даёт симметричную картину "все группы параметров non-finite"
+            # в backward-диагностике). layer_type печатается статически
+            # (python f-string), non-finite флаг -- динамически.
+            delta_finite = jnp.all(jnp.isfinite(delta))
+            jax.lax.cond(
+                jnp.logical_not(delta_finite),
+                lambda: jax.debug.print(
+                    "[FWD-DIAG] ⚠️ non-finite delta: block={b} layer={l} type=" + layer_type,
+                    b=self.block_idx, l=layer_idx,
+                ),
+                lambda: None,
+            )
+
             local_deltas.append(delta)
             current_x = current_x + delta  # residual
         
@@ -598,6 +613,15 @@ class BlockDAR(nn.Module):
         # MoE после блока (DAR уже был на последнем слое)
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
         moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
+
+        # ДИАГНОСТИКА: то же самое для MoE-выхода блока.
+        moe_finite = jnp.all(jnp.isfinite(moe_out))
+        jax.lax.cond(
+            jnp.logical_not(moe_finite),
+            lambda: jax.debug.print("[FWD-DIAG] ⚠️ non-finite moe_out: block={b}", b=self.block_idx),
+            lambda: None,
+        )
+
         output = current_x + moe_out
         
         return output, new_history
