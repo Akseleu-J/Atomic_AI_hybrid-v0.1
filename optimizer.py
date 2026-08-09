@@ -85,7 +85,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
     tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
 
-    def _muon_step(base_lr: float):
+    def _muon_step(base_lr: float, weight_decay: float = 0.01):
         def init_fn(params):
             return MuonState(count=jnp.zeros([], jnp.int32))
 
@@ -93,14 +93,29 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
             if params is None:
                 return updates, state
             step_lr = base_lr * lr_schedule(state.count)
+            # ФИКС: у Muon-ветки (в отличие от AdamW/Lion) не было НИКАКОГО
+            # weight decay -- ортогонализованное обновление ничего не тянет
+            # к нулю, поэтому норма параметров могла годами (в масштабе шагов
+            # обучения) медленно дрейфовать вверх без противовеса. Это
+            # правдоподобный вклад в наблюдавшийся "взрыв параметров"
+            # (см. диагностику [PARAM-DIAG] в train.py). Добавляем простой
+            # decoupled weight decay: w <- w - step_lr*weight_decay*w,
+            # применяется ПОСЛЕ основного muon-шага, тем же способом, что
+            # AdamW/Lion делают decoupled decay.
             new_updates = jax.tree_util.tree_map(
-                lambda p, g: (muon_orthogonalize(p, g, step_lr) - p), params, updates
+                lambda p, g: (muon_orthogonalize(p, g, step_lr) - p) - step_lr * weight_decay * p,
+                params, updates,
             )
             return new_updates, MuonState(count=state.count + 1)
 
         return optax.GradientTransformation(init_fn, update_fn)
 
-    tx_muon = _muon_step(base_lr=0.01)
+    # ФИКС: base_lr слегка снижен (0.01 -> 0.008) как дополнительная
+    # предосторожность параллельно с добавленным weight decay -- снижает
+    # скорость, с которой ортогонализованные обновления могут толкать норму
+    # параметров вверх на старте обучения, пока decay ещё не успел накопить
+    # эффект (decay пропорционален w, на малых w в начале почти не действует).
+    tx_muon = _muon_step(base_lr=0.008, weight_decay=0.01)
 
     def _label_leaf(path, param):
         path_str = path_to_str(path)
