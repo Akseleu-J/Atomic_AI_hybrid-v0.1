@@ -34,6 +34,35 @@ def get_batch_axis():
     return _batch_axis
 
 
+# ==========================================================================
+# ДИАГНОСТИКА (2-й уровень): forward-активации уже проверены (FWD-DIAG) и
+# оказались finite, а градиент всё равно non-finite -- значит проблема
+# именно в backward конкретного узла (например, custom VJP flash-attention
+# ядра, или матмул с бOльшим диапазоном значений, чем видно по forward
+# значению после clip/nan_to_num). identity-функция с custom_vjp пропускает
+# forward без изменений, а в backward проверяет входящий котангент.
+# ==========================================================================
+def make_grad_probe(tag: str):
+    @jax.custom_vjp
+    def _probe(x):
+        return x
+
+    def _fwd(x):
+        return x, None
+
+    def _bwd(_, g):
+        finite = jnp.all(jnp.isfinite(g))
+        jax.lax.cond(
+            jnp.logical_not(finite),
+            lambda: jax.debug.print("[BWD-DIAG] ⚠️ non-finite ВХОДЯЩИЙ градиент в узле: " + tag),
+            lambda: None,
+        )
+        return (g,)
+
+    _probe.defvjp(_fwd, _bwd)
+    return _probe
+
+
 @struct.dataclass
 class ModelConfig:
     d_model: int = 512
@@ -175,6 +204,7 @@ class MLAJ(nn.Module):
             out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
+        out = make_grad_probe(f"mla_flash_attn_out")(out)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o", dtype=jnp.bfloat16)(out)
 
 
@@ -568,6 +598,7 @@ class BlockDARLayer(nn.Module):
         retrieved = HybridDARAttention(cfg=self.cfg, name="dar")(
             current_x, dar_sources
         )
+        retrieved = make_grad_probe(f"block{self.layer_idx}_dar_out")(retrieved)
         current_x = current_x + retrieved
         
         # --- Intra-block mixing (ваш оригинальный механизм) ---
@@ -575,6 +606,7 @@ class BlockDARLayer(nn.Module):
         mixed = IntraBlockAttention(cfg=self.cfg, name="intra")(
             intra_sources, block_input
         )
+        mixed = make_grad_probe(f"block{self.layer_idx}_intra_out")(mixed)
         
         # --- Sublayer ---
         delta = SpecializedSublayer(
