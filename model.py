@@ -268,6 +268,15 @@ class Mamba2J(nn.Module):
             t = t.reshape(b, num_chunks, chunk_size, *trailing)
             return jnp.moveaxis(t, 1, 0)
 
+        # ФИКС: та же санитизация-рубеж, что и в GDN-2 -- независимо от
+        # источника nan/inf выше по графу (A_log/exp, dt/softplus, B/C
+        # проекции), гарантируем, что в рекуррентный scan всегда приходят
+        # конечные значения.
+        def _sanitize(t):
+            return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
+
+        dA, dt, B, C, x_conv = map(_sanitize, (dA, dt, B, C, x_conv))
+
         dA_ch = _to_chunks(dA)
         dt_ch = _to_chunks(dt)
         B_ch = _to_chunks(B)
@@ -428,6 +437,12 @@ class GatedDeltaNet2J(nn.Module):
         q = jax.nn.silu(short_causal_conv("q", q_lin)).reshape(b, l, n_heads, d_head)
         k = jax.nn.silu(short_causal_conv("k", k_lin)).reshape(b, l, n_heads, d_head)
         v = jax.nn.silu(short_causal_conv("v", v_lin)).reshape(b, l, n_heads, d_head)
+        # ФИКС: в отличие от q/k (которые нормируются ниже), v НЕ нормируется
+        # и silu не ограничена сверху -- если веса v_proj/conv вырастут,
+        # v может расти неограниченно, заражая z=w_gate*v и C_c=k⊗z большими
+        # величинами, которые могут переполниться в inf внутри scan. Клипаем
+        # как дешёвую защиту, не завязанную на конкретный механизм переполнения.
+        v = jnp.clip(v, -50.0, 50.0)
 
         q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + eps)
         k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + eps)
@@ -462,6 +477,20 @@ class GatedDeltaNet2J(nn.Module):
         e = b_gate * k
         z = w_gate * v
         ea = e * alpha
+
+        # ФИКС: последний общий рубеж защиты ПЕРЕД входом в рекуррентность.
+        # Вместо того чтобы гоняться за каждым отдельным источником nan/inf
+        # выше по графу (гейты, conv, произведения -- источник эмпирически
+        # каждый раз оказывается в разном месте: сперва overflow в scan,
+        # потом inf*0 в decay, теперь смещается на более ранние блоки),
+        # санитизируем все входы рекуррентности единым узлом. Это не
+        # заменяет точечные фиксы выше (они полезны сами по себе), но даёт
+        # гарантию, что ЧТО БЫ ТАМ ни случилось, в gdn2_recurrence_safe
+        # всегда приходят конечные значения.
+        def _sanitize(t):
+            return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
+
+        k, ea, z, alpha, q = map(_sanitize, (k, ea, z, alpha, q))
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
