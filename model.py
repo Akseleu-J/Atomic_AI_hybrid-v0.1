@@ -323,10 +323,31 @@ class GatedDeltaNet2J(nn.Module):
             raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
         num_chunks = l // chunk_size
 
+        # ФИКС: M_c = eye*alpha - k⊗ea в общем случае НЕ гарантированно имеет
+        # спектральную норму <=1 (b_gate/w_gate -- независимые сигмоиды, а не
+        # согласованный erase/write gate классического delta rule), поэтому
+        # даже небольшое превышение normы 1 на одном токене после
+        # associative_scan-произведения ПОДРЯД chunk_size=256 таких матриц
+        # даёт экспоненциальный рост (1.05^256 ~ 1.6e5) вплоть до inf --
+        # именно это наблюдалось эмпирически (block=5, layer=16, gdn2, после
+        # 190 стабильных шагов, когда веса гейтов сместились в опасную зону).
+        # bf16 и fp32 имеют ОДИНАКОВЫЙ диапазон экспоненты (8 бит), так что
+        # апкаст сам по себе точку overflow не сдвигает -- нужно ограничивать
+        # саму норму матрицы на каждом шаге combine, а не только точность.
         def _combine(state1, state2):
             m1, c1 = state1
             m2, c2 = state2
-            return m2 @ m1, m2 @ c1 + c2
+            m_new = m2 @ m1
+            # Ограничиваем Frobenius-норму произведения сверху -- дешёвая
+            # аппроксимация spectral clipping, которая не даёт норме расти
+            # неограниченно внутри scan, но не трогает "здоровые" M (норма
+            # которых и так <=1 почти везде).
+            fro_norm = jnp.sqrt(jnp.sum(jnp.square(m_new), axis=(-2, -1), keepdims=True))
+            scale = jnp.minimum(1.0, 1.0 / (fro_norm + 1e-6))
+            m_new = m_new * scale
+            c_new = m2 @ c1 + c2
+            c_new = jnp.nan_to_num(c_new, nan=0.0, posinf=1e4, neginf=-1e4)
+            return m_new, c_new
 
         def _to_chunks(t):
             t = t.reshape(b, num_chunks, chunk_size, n_heads, d_head)
@@ -349,6 +370,11 @@ class GatedDeltaNet2J(nn.Module):
 
             global_M = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_M)
             global_S = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_S) + S_local
+            # ФИКС: последняя линия обороны -- если несмотря на clipping в
+            # _combine что-то всё же дало inf/nan (например, carry_M/carry_S,
+            # пришедшие с предыдущего чанка), не даём этому уйти дальше по
+            # scan через новый carry.
+            global_S = jnp.nan_to_num(global_S, nan=0.0, posinf=1e4, neginf=-1e4)
 
             out_c = jnp.einsum("bchij,bchi->bchj", global_S, q_c)
             new_carry = (global_M[:, -1], global_S[:, -1])
