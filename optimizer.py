@@ -8,6 +8,30 @@ from model import ModelConfig
 from utils import collect_by_leaf_name, path_to_str
 
 
+# ДИАГНОСТИКА (2-й уровень, backward-only): см. аналогичную в model.py.
+# Здесь отдельная копия, чтобы не тянуть зависимость optimizer.py -> model.py
+# для одной internal-функции.
+def make_grad_probe(tag: str):
+    @jax.custom_vjp
+    def _probe(x):
+        return x
+
+    def _fwd(x):
+        return x, None
+
+    def _bwd(_, g):
+        finite = jnp.all(jnp.isfinite(g))
+        jax.lax.cond(
+            jnp.logical_not(finite),
+            lambda: jax.debug.print("[BWD-DIAG] ⚠️ non-finite ВХОДЯЩИЙ градиент в узле: " + tag),
+            lambda: None,
+        )
+        return (g,)
+
+    _probe.defvjp(_fwd, _bwd)
+    return _probe
+
+
 # ==========================================
 # Muon (Newton-Schulz orthogonalization)
 # ==========================================
@@ -121,6 +145,7 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
     # заменяем на крайние допустимые, чтобы log_softmax не дал nan.
     logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
     logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
+    logits_chunk = make_grad_probe("ce_logits_chunk")(logits_chunk)
 
     log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
 
