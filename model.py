@@ -480,8 +480,6 @@ class GatedDeltaNet2J(nn.Module):
                              # .reshape(b, l, d) на out_chunks, новая per-token функция
                              # возвращает форму с раздельными head/d_head, merge пропущен.
 
-out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
-return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
 
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
