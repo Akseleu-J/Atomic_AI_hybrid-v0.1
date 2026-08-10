@@ -344,94 +344,60 @@ class Mamba2J(nn.Module):
 # ==========================================
 # Gated DeltaNet-2 (GDN-2)
 # ==========================================
-def _gdn2_recurrence_impl(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype):
-    """Чистая (без flax-параметров) реализация рекуррентной части GDN-2.
-    Вынесена наружу, чтобы обернуть в custom_vjp ниже."""
+# ФИКС (архитектурный, не патч): предыдущая реализация считала рекуррентность
+# через явное произведение chunk_size=256 плотных d×d матриц (associative_scan
+# по M_c = I*alpha - k⊗ea), что структурно допускает экспоненциальный рост
+# нормы произведения и было источником всех non-finite инцидентов в этом
+# файле, несмотря на клипы/санитайзеры сверху.
+#
+# Официальная формула Gated Delta Rule-2 (NVlabs/GatedDeltaNet-2, Hatamizadeh
+# et al. 2026, arXiv:2605.22791, Eq. 9/29) ВООБЩЕ НЕ формирует d×d матрицу:
+#   S̄_t = Diag(alpha_t) · S_{t-1}              (decay -- построчное масштабирование)
+#   r_t  = S̄_t^T · e_t,  e_t = b_t⊙k_t          (matrix-vector, O(d^2))
+#   S_t  = S̄_t + k_t ⊗ (z_t - r_t), z_t = w_t⊙v_t  (rank-1 update, O(d^2))
+#   o_t  = S_t^T · q_t
+# Их собственный "recurrent decoding kernel" (Appendix C.5) считает ИМЕННО
+# это, ТОКЕН ЗА ТОКЕНОМ, с состоянием S в fp32 -- chunked WY-форма в статье
+# существует только ради параллелизма при обучении на GPU, не ради
+# корректности. Мы реализуем этот же простой и структурно устойчивый путь:
+# без explicit d×d матриц и их перемножения, состояние -- в fp32.
+def _gdn2_recurrence_impl(k, e, z, alpha, q, dtype):
+    """k, e, z, alpha, q: (b, l, n_heads, d_head), уже в исходном dtype (bf16).
+    Внутри рекуррентности состояние S ведётся в fp32 (см. обоснование выше).
+    Возвращает выход (b, l, n_heads, d_head) в исходном dtype."""
+    b, l, n_heads, d_head = k.shape
 
-    def _combine(state1, state2):
-        m1, c1 = state1
-        m2, c2 = state2
-        m_new = m2 @ m1
-        fro_norm = jnp.sqrt(jnp.sum(jnp.square(m_new), axis=(-2, -1), keepdims=True))
-        scale = jnp.minimum(1.0, 1.0 / (fro_norm + 1e-6))
-        m_new = m_new * scale
-        c_new = m2 @ c1 + c2
-        c_new = jnp.nan_to_num(c_new, nan=0.0, posinf=1e4, neginf=-1e4)
-        return m_new, c_new
-
-    def _to_chunks(t):
-        t = t.reshape(b, num_chunks, chunk_size, n_heads, d_head)
+    # Раскладка на (l, b, n_heads, d_head) для лидирующей оси scan.
+    def _to_time_major(t):
         return jnp.moveaxis(t, 1, 0)
 
-    k_ch, ea_ch, z_ch, alpha_ch, q_ch = map(_to_chunks, (k, ea, z, alpha, q))
+    k_t, e_t, z_t, alpha_t, q_t = map(_to_time_major, (k, e, z, alpha, q))
 
-    eye_bh = jnp.broadcast_to(jnp.eye(d_head, dtype=dtype), (b, n_heads, d_head, d_head))
-    zero_bh = jnp.zeros((b, n_heads, d_head, d_head), dtype=dtype)
+    S0 = jnp.zeros((b, n_heads, d_head, d_head), dtype=jnp.float32)
 
-    def _chunk_step(carry, chunk_inputs):
-        carry_M, carry_S = carry
-        k_c, ea_c, z_c, alpha_c, q_c = chunk_inputs
+    def _step(S, inputs):
+        k_i, e_i, z_i, alpha_i, q_i = inputs
+        # Апкаст входов токена в fp32 перед взаимодействием с fp32-состоянием
+        # -- сама рекуррентность (накопление S по всей длине последовательности)
+        # выполняется в fp32, как у NVIDIA (Appendix D.3).
+        k_f = k_i.astype(jnp.float32)
+        e_f = e_i.astype(jnp.float32)
+        z_f = z_i.astype(jnp.float32)
+        alpha_f = alpha_i.astype(jnp.float32)
+        q_f = q_i.astype(jnp.float32)
 
-        eye = jnp.eye(d_head, dtype=dtype)[None, None, None, :, :]
-        M_c = eye * alpha_c[:, :, :, None, :] - k_c[:, :, :, :, None] @ ea_c[:, :, :, None, :]
-        C_c = k_c[:, :, :, :, None] @ z_c[:, :, :, None, :]
+        S_bar = alpha_f[..., :, None] * S               # (b, h, d_k, d_v), построчный decay
+        r = jnp.einsum('bhkv,bhk->bhv', S_bar, e_f)       # (b, h, d_v)
+        S_new = S_bar + jnp.einsum('bhk,bhv->bhkv', k_f, z_f - r)  # rank-1 update
+        o = jnp.einsum('bhkv,bhk->bhv', S_new, q_f)        # (b, h, d_v)
+        return S_new, o.astype(dtype)
 
-        P_local, S_local = jax.lax.associative_scan(_combine, (M_c, C_c), axis=1)
+    # ФИКС: jax.checkpoint на шаге scan -- как и раньше, ограничивает память
+    # (не храним промежуточные S для всех l шагов при backward).
+    _step = jax.checkpoint(_step)
+    _, out_t = jax.lax.scan(_step, S0, (k_t, e_t, z_t, alpha_t, q_t))
 
-        global_M = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_M)
-        global_S = jnp.einsum("bchmn,bhnp->bchmp", P_local, carry_S) + S_local
-        global_S = jnp.nan_to_num(global_S, nan=0.0, posinf=1e4, neginf=-1e4)
-
-        out_c = jnp.einsum("bchij,bchi->bchj", global_S, q_c)
-        new_carry = (global_M[:, -1], global_S[:, -1])
-        return new_carry, out_c
-
-    _chunk_step = jax.checkpoint(_chunk_step)
-
-    _, out_chunks = jax.lax.scan(
-        _chunk_step, (eye_bh, zero_bh), (k_ch, ea_ch, z_ch, alpha_ch, q_ch)
-    )
-    return jnp.moveaxis(out_chunks, 0, 1).reshape(b, num_chunks * chunk_size, n_heads * d_head)
-
-
-# ФИКС: forward-clipping внутри _combine (Frobenius-норма <=1) ограничивает
-# ЗНАЧЕНИЯ на прямом проходе, но НЕ ограничивает величину градиента при
-# автоматическом дифференцировании jax.lax.associative_scan через 256-шаговую
-# цепочку матричных произведений -- это классический exploding gradient
-# в BPTT-подобной рекуррентной схеме, отдельный от проблемы forward-overflow.
-# Эмпирически подтверждено (BWD-DIAG): grad уже non-finite к моменту, когда
-# backward доходит до block19 (gdn2) -- т.е. взрыв происходит ВНУТРИ
-# автоматического backward associative_scan, а не после него. Поэтому
-# оборачиваем всю рекуррентную функцию в custom_vjp: forward -- как есть,
-# backward считаем через jax.vjp (тот же автоматический граф), но затем
-# ЯВНО санитизируем полученный градиент (nan_to_num + клип по модулю) перед
-# тем как отдать его дальше по графу. Это не убирает потенциальную
-# численную неустойчивость самой рекуррентности, но гарантирует, что она
-# не отравляет остальные 20 слоёв через shared residual/DAR граф.
-@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10))
-def gdn2_recurrence_safe(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype):
-    return _gdn2_recurrence_impl(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype)
-
-
-def _gdn2_recurrence_safe_fwd(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype):
-    primal_fn = lambda k, ea, z, alpha, q: _gdn2_recurrence_impl(
-        k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, dtype
-    )
-    out, vjp_fn = jax.vjp(primal_fn, k, ea, z, alpha, q)
-    return out, vjp_fn
-
-
-def _gdn2_recurrence_safe_bwd(chunk_size, num_chunks, b, n_heads, d_head, dtype, vjp_fn, g):
-    grads = vjp_fn(g)
-    _GRAD_CLIP = 1e3
-    safe_grads = tuple(
-        jnp.nan_to_num(jnp.clip(gr, -_GRAD_CLIP, _GRAD_CLIP), nan=0.0, posinf=_GRAD_CLIP, neginf=-_GRAD_CLIP)
-        for gr in grads
-    )
-    return safe_grads
-
-
-gdn2_recurrence_safe.defvjp(_gdn2_recurrence_safe_fwd, _gdn2_recurrence_safe_bwd)
+    return jnp.moveaxis(out_t, 0, 1)  # обратно в (b, l, n_heads, d_head)
 
 
 class GatedDeltaNet2J(nn.Module):
@@ -465,67 +431,49 @@ class GatedDeltaNet2J(nn.Module):
         q = jax.nn.silu(short_causal_conv("q", q_lin)).reshape(b, l, n_heads, d_head)
         k = jax.nn.silu(short_causal_conv("k", k_lin)).reshape(b, l, n_heads, d_head)
         v = jax.nn.silu(short_causal_conv("v", v_lin)).reshape(b, l, n_heads, d_head)
-        # ФИКС: в отличие от q/k (которые нормируются ниже), v НЕ нормируется
-        # и silu не ограничена сверху -- если веса v_proj/conv вырастут,
-        # v может расти неограниченно, заражая z=w_gate*v и C_c=k⊗z большими
-        # величинами, которые могут переполниться в inf внутри scan. Клипаем
-        # как дешёвую защиту, не завязанную на конкретный механизм переполнения.
+        # ФИКС (сохранён): v не нормируется (в отличие от q/k) и silu не
+        # ограничена сверху -- клип как дешёвая доп. страховка.
         v = jnp.clip(v, -50.0, 50.0)
 
+        # D.2: L2-нормализация q/k перед рекуррентностью (как в статье).
         q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + eps)
         k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + eps)
 
+        # Eq. 11: b_t, w_t -- НЕЗАВИСИМЫЕ channel-wise erase/write гейты.
+        # Это и есть суть GDN-2 (сохраняем как есть, НЕ сводим к одному гейту).
         b_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="erase_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
         w_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="write_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
 
-        a_param = self.param("decay_a", nn.initializers.zeros, (n_heads,)).astype(x.dtype)
+        # Eq. 12 + Appendix D.1: log-decay считается в fp32 -- "This is
+        # important because the local cumulative sum... A low precision
+        # mantissa can perturb long products of decays even when each
+        # tokenwise gate is small." У нас нет explicit cumsum (per-token
+        # scan вместо chunked WY), но decay всё равно считаем в fp32 ради
+        # той же точности при использовании в fp32-состоянии рекуррентности.
+        a_param = self.param("decay_a", nn.initializers.zeros, (n_heads,)).astype(jnp.float32)
         f_proj = nn.Dense(d, use_bias=True, name="decay_proj", dtype=jnp.bfloat16)(x).reshape(b, l, n_heads, d_head)
-        # ФИКС: a_param -- необучаемо-ограниченный параметр; если он
-        # (например, через Lion) уйдёт в достаточно большое положительное
-        # значение, jnp.exp(a_param) переполняется в inf ЕЩЁ ДО входа в
-        # рекуррентность. Если в этот же момент softplus(f_proj) в какой-то
-        # позиции округляется до 0 (в bf16 это вполне достижимо), получаем
-        # классический inf*0=nan -- источник, полностью независимый от
-        # associative_scan и не перехватываемый никакими фиксами внутри
-        # рекуррентности (эмпирически подтверждено: nan возникает в forward
-        # ДО gdn2_recurrence_safe). Клипаем a_param перед exp -- decay_a=20
-        # уже даёт exp(20)~5e8, что более чем достаточно как верхняя граница
-        # скорости распада, дальнейший рост только приближает к inf без
-        # практической пользы.
+        # ФИКС (сохранён): клип перед exp -- защита от inf*0=nan, теперь уже
+        # скорее избыточная страховка, чем необходимость (сама рекуррентность
+        # больше не умножает decay сама на себя по цепочке матриц), но
+        # оставляем как дешёвый ремень безопасности.
         a_param_safe = jnp.clip(a_param, -20.0, 20.0)
-        g = -jnp.exp(a_param_safe)[None, None, :, None] * jax.nn.softplus(f_proj)
-        # ФИКС: safety-net на случай inf*0=nan из других комбинаций (или
-        # bf16-округления softplus до ровно 0 при экстремальном f_proj) --
-        # nan -> g=0 -> alpha=exp(0)=1 (нейтральный decay, не взрыв).
+        g = -jnp.exp(a_param_safe)[None, None, :, None] * jax.nn.softplus(f_proj.astype(jnp.float32))
         g = jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=-20.0)
-        alpha = jnp.exp(g)
+        alpha = jnp.exp(g)  # fp32, (b, l, n_heads, d_head) -- decay по КЛЮЧЕВЫМ каналам
 
         out_gate = nn.Dense(d, use_bias=False, name="out_gate", dtype=jnp.bfloat16)(x)
 
+        # Eq. 8: e_t = b_t⊙k_t (erase, key-side), z_t = w_t⊙v_t (write,
+        # value-side). ВАЖНО -- в отличие от предыдущей реализации, decay
+        # (alpha) здесь НЕ вмешивается в erase-член; он применяется отдельно
+        # к состоянию S_{t-1} внутри _gdn2_recurrence_impl (Diag(alpha)·S),
+        # ровно как в Eq. 9/29 статьи. Раньше ea = b_gate*k*alpha смешивала
+        # decay и erase в одно произведение -- это была не просто численная
+        # хрупкость, а отклонение от самой формулы GDN-2.
         e = b_gate * k
         z = w_gate * v
-        ea = e * alpha
 
-        # ФИКС: последний общий рубеж защиты ПЕРЕД входом в рекуррентность.
-        # Вместо того чтобы гоняться за каждым отдельным источником nan/inf
-        # выше по графу (гейты, conv, произведения -- источник эмпирически
-        # каждый раз оказывается в разном месте: сперва overflow в scan,
-        # потом inf*0 в decay, теперь смещается на более ранние блоки),
-        # санитизируем все входы рекуррентности единым узлом. Это не
-        # заменяет точечные фиксы выше (они полезны сами по себе), но даёт
-        # гарантию, что ЧТО БЫ ТАМ ни случилось, в gdn2_recurrence_safe
-        # всегда приходят конечные значения.
-        def _sanitize(t):
-            return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
-
-        k, ea, z, alpha, q = map(_sanitize, (k, ea, z, alpha, q))
-
-        chunk_size = min(self.cfg.deltanet_chunk_size, l)
-        if l % chunk_size != 0:
-            raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
-        num_chunks = l // chunk_size
-
-        out = gdn2_recurrence_safe(k, ea, z, alpha, q, chunk_size, num_chunks, b, n_heads, d_head, x.dtype)
+        out = _gdn2_recurrence_impl(k, e, z, alpha, q, x.dtype)
 
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
