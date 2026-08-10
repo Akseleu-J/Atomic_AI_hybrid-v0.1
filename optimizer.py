@@ -67,7 +67,11 @@ class MuonState(NamedTuple):
 
 
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
-    warmup_steps = max(1, int(total_steps * 0.10))
+    # ФИКС: минимальный пол на длину warmup. Если total_steps окажется
+    # небольшим (например, при короткой сессии/маленьком датасете), 10%
+    # может дать слишком короткий warmup для стабилизации только что
+    # инициализированных GDN-2/Mamba2 блоков.
+    warmup_steps = max(500, int(total_steps * 0.10))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
     )
@@ -84,6 +88,17 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     tx_lion = optax.lion(learning_rate=lion_lr, weight_decay=0.1)
     tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
     tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
+
+    # ФИКС: отдельная, ЗАМЕДЛЕННАЯ LR-группа специально для экспоненцируемых
+    # decay-параметров (decay_a в GDN-2, A_log в Mamba2). Диагностика
+    # многократно и стабильно указывала именно на эту точку как источник
+    # non-finite (см. историю: block=5/layer=16 gdn2 повторяется даже с
+    # чистого старта, несмотря на закрытые численные дыры) -- exp(param)
+    # структурно чувствителен к скорости роста param, поэтому даже с клипом
+    # (защита от inf) быстрый LR тут продолжает толкать параметр к границе
+    # снова и снова. Даём этой узкой группе LR в 5 раз меньше обычного Lion.
+    decay_param_lr = lambda step: 3e-4 * 0.2 * lr_schedule(step)
+    tx_lion_decay_slow = optax.lion(learning_rate=decay_param_lr, weight_decay=0.1)
 
     def _muon_step(base_lr: float, weight_decay: float = 0.01):
         def init_fn(params):
@@ -123,6 +138,11 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
             return "adamw_decay"
         if "norm" in path_str or "bias" in path_str:
             return "adamw_nodecay"
+        # ФИКС: decay_a (GDN-2) / A_log (Mamba2) -- экспоненцируемые decay-
+        # параметры, повторяющаяся "горячая точка" non-finite. Отдельная
+        # замедленная группа (см. tx_lion_decay_slow выше).
+        if "decay_a" in path_str or "a_log" in path_str:
+            return "lion_decay_slow"
         if param.ndim >= 2:
             if "mamba" in path_str:
                 return "lion"
@@ -134,9 +154,19 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     def label_fn(params):
         return jax.tree_util.tree_map_with_path(_label_leaf, params)
 
-    clip_tx = optax.clip_by_global_norm(0.5)
+    # ФИКС: общий global-norm clip слегка ужесточён (0.5 -> 0.35) как
+    # дополнительный запас прочности -- дешёвая мера, не требующая
+    # архитектурных изменений, снижает амплитуду отдельных "плохих" шагов
+    # по всем группам параметров одновременно.
+    clip_tx = optax.clip_by_global_norm(0.35)
     multi_tx = optax.multi_transform(
-        {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay, "adamw_nodecay": tx_adamw_nodecay},
+        {
+            "muon": tx_muon,
+            "lion": tx_lion,
+            "lion_decay_slow": tx_lion_decay_slow,
+            "adamw_decay": tx_adamw_decay,
+            "adamw_nodecay": tx_adamw_nodecay,
+        },
         label_fn,
     )
     return optax.chain(clip_tx, multi_tx)
