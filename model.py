@@ -7,7 +7,8 @@ from flax import linen as nn
 from flax import struct
 from typing import List, Tuple
 from jax.sharding import PartitionSpec as P
-
+from atomic_ops.kernel_trainable import gdn2_pallas_forward_trainable
+from atomic_ops.kernel_a_scores import BT as GDN2_PALLAS_BT
 try:
     from jax.experimental.pallas.ops.tpu.flash_attention import (
         flash_attention as pallas_flash_attention,
@@ -470,16 +471,37 @@ class GatedDeltaNet2J(nn.Module):
         # ровно как в Eq. 9/29 статьи. Раньше ea = b_gate*k*alpha смешивала
         # decay и erase в одно произведение -- это была не просто численная
         # хрупкость, а отклонение от самой формулы GDN-2.
-        e = b_gate * k
-        z = w_gate * v
+# ФИКС (Pallas-порт): раньше b_gate*k/w_gate*v/*alpha комбинировались
+        # заранее и уходили в gdn2_recurrence_safe (associative_scan). Новый
+        # Pallas-пайплайн делает эту комбинацию ВНУТРИ себя -- принимает
+        # "сырые" q/k/v/w_gate/b_gate/g напрямую (та же санитизация, что и раньше).
+        def _sanitize(t):
+            return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
-        out = _gdn2_recurrence_impl(k, e, z, alpha, q, x.dtype)
-        
-        out = out.reshape(b, l, d)  # ФИКС: (b, l, n_heads, d_head) -> (b, l, d) -- слияние голов,
-                             # старая chunk-based реализация делала это неявно через
-                             # .reshape(b, l, d) на out_chunks, новая per-token функция
-                             # возвращает форму с раздельными head/d_head, merge пропущен.
+        q, k, v, w_gate, b_gate, g = map(_sanitize, (q, k, v, w_gate, b_gate, g))
 
+        # ФИКС: чанк-размер Pallas-кернелов сейчас захардкожен (BT=256 в
+        # kernel_a_scores.py), НЕ читается из cfg.deltanet_chunk_size --
+        # совпадает с текущим дефолтом, но если когда-нибудь поменяешь
+        # cfg.deltanet_chunk_size, GDN-2-Pallas путь это не подхватит
+        # автоматически (в отличие от Mamba2J, который эту cfg-переменную
+        # честно использует). Проверяем явно против константы кернелов.
+        if l % GDN2_PALLAS_BT != 0:
+            raise ValueError(
+                f"seq_len={l} must be divisible by the Pallas GDN-2 chunk size "
+                f"({GDN2_PALLAS_BT}); this is currently a separate constant from "
+                f"cfg.deltanet_chunk_size, see kernel_a_scores.py."
+            )
+
+        # ФИКС: scale=1.0 -- сознательно НЕ используем официальный 1/sqrt(d_head)
+        # из оригинального GDN-2 (авторский Triton-код его применяет), чтобы не
+        # менять динамику обучения при переходе на Pallas -- текущий
+        # associative_scan путь тоже не масштабировал q. Переход на
+        # scale=d_head**-0.5 -- отдельное, осознанное решение на будущее.
+        out, _h_final = gdn2_pallas_forward_trainable(
+            q, k, v, w_gate, b_gate, g, scale=1.0, h0=None
+        )
+        out = out.reshape(b, l, d)
 
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
