@@ -51,7 +51,7 @@ def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
     u = jnp.dot(A, w * v, precision=_HIGHEST)                     # (BT, D)
 
     gc_last_row = gc[BT - 1]  # (D,) -- static index (compile-time constant), not dynamic_slice
-    kg = k * jnp.exp(gc_last_row[None, :] - gc)  # (BT, D)
+    kg = k * jnp.exp(jnp.clip(gc_last_row[None, :] - gc, -20.0, 20.0))
     qg = q * jnp.exp(gc)                            # (BT, D)
 
     w_pseudo_ref[0, 0, 0] = w_pseudo
