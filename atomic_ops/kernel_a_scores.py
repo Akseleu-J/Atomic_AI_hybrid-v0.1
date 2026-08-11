@@ -88,7 +88,7 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale):
             gc_j = gc[j0:j1]
 
             decay_diff = gc_i[:, None, :] - gc_j[None, :, :]  # (BC, BC, D)
-            edecay = jnp.exp(decay_diff)
+            edecay = jnp.exp(jnp.clip(decay_diff, -20.0, 20.0))
 
             aqk_blk = scale * _weighted_pair_sum(q_i, edecay, k_j)
             bk_i = b_i * k_i
