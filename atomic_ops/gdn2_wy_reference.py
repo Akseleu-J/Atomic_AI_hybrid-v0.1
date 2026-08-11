@@ -121,7 +121,7 @@ def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale):
 
     gc_bhcd = jnp.moveaxis(gc, 2, 1)  # (B,H,C,D)
     decay_diff = gc_bhcd[:, :, :, None, :] - gc_bhcd[:, :, None, :, :]  # (B,H,C,C,D)
-    edecay = jnp.exp(decay_diff)
+    edecay = jnp.exp(jnp.clip(decay_diff, -20.0, 20.0))
 
     causal = jnp.tril(jnp.ones((C, C), dtype=f32))          # j<=i
     strict = jnp.tril(jnp.ones((C, C), dtype=f32), k=-1)    # j<i
