@@ -37,7 +37,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from kernel_a_scores import BT, BC, N_SUB
+from atomic_ops.kernel_a_scores import BT, BC, N_SUB
 
 _HIGHEST = jax.lax.Precision.HIGHEST
 
