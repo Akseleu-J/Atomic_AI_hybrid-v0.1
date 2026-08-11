@@ -362,6 +362,12 @@ class Mamba2J(nn.Module):
 # существует только ради параллелизма при обучении на GPU, не ради
 # корректности. Мы реализуем этот же простой и структурно устойчивый путь:
 # без explicit d×d матриц и их перемножения, состояние -- в fp32.
+#
+# NOTE: this token-serial reference implementation (_gdn2_recurrence_impl)
+# is no longer called anywhere -- GatedDeltaNet2J.__call__ now dispatches to
+# the Pallas chunked-WY pipeline (gdn2_pallas_forward_trainable) instead.
+# Left in place as a readable reference / fallback, not part of the active
+# forward path.
 def _gdn2_recurrence_impl(k, e, z, alpha, q, dtype):
     """k, e, z, alpha, q: (b, l, n_heads, d_head), уже в исходном dtype (bf16).
     Внутри рекуррентности состояние S ведётся в fp32 (см. обоснование выше).
@@ -471,7 +477,7 @@ class GatedDeltaNet2J(nn.Module):
         # ровно как в Eq. 9/29 статьи. Раньше ea = b_gate*k*alpha смешивала
         # decay и erase в одно произведение -- это была не просто численная
         # хрупкость, а отклонение от самой формулы GDN-2.
-# ФИКС (Pallas-порт): раньше b_gate*k/w_gate*v/*alpha комбинировались
+        # ФИКС (Pallas-порт): раньше b_gate*k/w_gate*v/*alpha комбинировались
         # заранее и уходили в gdn2_recurrence_safe (associative_scan). Новый
         # Pallas-пайплайн делает эту комбинацию ВНУТРИ себя -- принимает
         # "сырые" q/k/v/w_gate/b_gate/g напрямую (та же санитизация, что и раньше).
@@ -493,14 +499,46 @@ class GatedDeltaNet2J(nn.Module):
                 f"cfg.deltanet_chunk_size, see kernel_a_scores.py."
             )
 
-        # ФИКС: scale=1.0 -- сознательно НЕ используем официальный 1/sqrt(d_head)
-        # из оригинального GDN-2 (авторский Triton-код его применяет), чтобы не
-        # менять динамику обучения при переходе на Pallas -- текущий
-        # associative_scan путь тоже не масштабировал q. Переход на
-        # scale=d_head**-0.5 -- отдельное, осознанное решение на будущее.
-        out, _h_final = gdn2_pallas_forward_trainable(
-            q, k, v, w_gate, b_gate, g, scale=1.0, h0=None
-        )
+        # ФИКС (shard_map): pallas_call внутри gdn2_pallas_forward_trainable
+        # -> gdn2_pallas_forward -> build_chunk_scores_pallas/wy_solve_pallas/
+        # recompute_wy_pallas cannot be auto-partitioned by GSPMD ("Mosaic
+        # kernels cannot be automatically partitioned. Please wrap the call
+        # in a shard_map.", hit on real multi-device TPU mesh at
+        # model.init() time). Same root cause and same fix as MLAJ's
+        # pallas_flash_attention above: explicitly shard_map the call so
+        # each device runs the Pallas kernels on its own local (unsharded)
+        # batch shard, with the batch axis as the only sharded axis (q/k/v/
+        # w/b/g are (B,L,H,D), sharded along B to match data_sharding /
+        # param_sharding elsewhere in train.py).
+        #
+        # scale and h0 are NOT arrays we want shard_map to try to shard
+        # (scale is a python float / static; h0 defaults to None here) --
+        # functools.partial binds them into the traced function BEFORE
+        # shard_map ever sees it, so shard_map only has to reason about the
+        # 6 real (B,L,H,D) array arguments (q,k,v,w_gate,b_gate,g) and the 2
+        # array outputs (o, h_final).
+        mesh = get_model_mesh()
+        batch_axis = get_batch_axis()
+
+        _gdn2_fixed = partial(gdn2_pallas_forward_trainable, scale=1.0, h0=None)
+
+        if mesh is not None:
+            in_spec = P(batch_axis, None, None, None)   # (B, L, H, D) for q,k,v,w,b,g
+            out_spec = (
+                P(batch_axis, None, None, None),         # o: (B, L, H, D)
+                P(batch_axis, None, None, None),         # h_final: (B, H, D, D)
+            )
+            sharded_gdn2 = jax.shard_map(
+                _gdn2_fixed,
+                mesh=mesh,
+                in_specs=(in_spec, in_spec, in_spec, in_spec, in_spec, in_spec),
+                out_specs=out_spec,
+                check_vma=False,
+            )
+            out, _h_final = sharded_gdn2(q, k, v, w_gate, b_gate, g)
+        else:
+            out, _h_final = _gdn2_fixed(q, k, v, w_gate, b_gate, g)
+
         out = out.reshape(b, l, d)
 
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
