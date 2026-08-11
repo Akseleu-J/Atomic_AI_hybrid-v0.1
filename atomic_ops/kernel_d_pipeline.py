@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
 
 from .kernel_a_scores import build_chunk_scores_pallas, BT
 from .kernel_b_solve import wy_solve_pallas
@@ -69,46 +68,26 @@ def gdn2_pallas_forward(q, k, v, w, b, g, scale, h0=None):
     -> D (plain JAX scan). q,k,v,w,b,g: (B,L,H,D). Returns o: (B,L,H,D),
     h_final: (B,H,D,D).
 
-    ФИКС (shard_map): pallas_call внутри Kernels A/B/C cannot be
-    automatically partitioned by GSPMD ("Mosaic kernels cannot be
-    automatically partitioned. Please wrap the call in a shard_map.", same
-    root cause and same fix as MLAJ's pallas_flash_attention in model.py).
-    Deferred import of get_model_mesh/get_batch_axis from model.py avoids a
-    circular import (model.py imports this module) -- it only resolves at
-    call time, by which point model.py is fully loaded. Kernel D (plain JAX
-    scan) doesn't strictly need shard_map -- ordinary JAX ops partition fine
-    under GSPMD -- but wrapping the whole thing together is simpler and
-    matches MLAJ's granularity (one shard_map per sub-layer).
+    NOTE: no shard_map here. An earlier version of this function added one,
+    but that's WRONG if the caller (GatedDeltaNet2J in model.py) already
+    wraps the whole gdn2_pallas_forward_trainable call in its own shard_map
+    (matching MLAJ's pallas_flash_attention pattern) -- nesting two shard_map
+    calls on the same mesh axis fails ("context mesh ... should match the
+    mesh passed to shard_map", confirmed on real v5e-8: outer shard_map puts
+    the axis into Manual mode, inner shard_map then tries to open it again
+    with a plain Auto mesh). Sharding is the CALLER's responsibility -- do it
+    once, at the GatedDeltaNet2J call site, not inside this function.
     """
     bsz, L, H, D = q.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
 
-    def _impl(q, k, v, w, b, g, h0):
-        Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale)
-        A = wy_solve_pallas(Akk)
-        w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A)
-        o_chunks, h_final = gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=h0)
-        n_chunks = L // BT
-        o = jnp.moveaxis(o_chunks, 1, 3)          # (B,n_chunks,BT,H,D)
-        o = o.reshape(bsz, n_chunks * BT, H, D)     # (B,L,H,D)
-        return o, h_final
+    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale)
+    A = wy_solve_pallas(Akk)
+    w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A)
+    o_chunks, h_final = gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=h0)
 
-    try:
-        from model import get_model_mesh, get_batch_axis
-        mesh = get_model_mesh()
-        batch_axis = get_batch_axis()
-    except ImportError:
-        mesh, batch_axis = None, None
-
-    if mesh is not None:
-        spec = P(batch_axis, None, None, None)
-        sharded_impl = jax.shard_map(
-            _impl, mesh=mesh,
-            in_specs=(spec, spec, spec, spec, spec, spec, spec),
-            out_specs=(spec, spec),
-            check_vma=False,
-        )
-        return sharded_impl(q, k, v, w, b, g, h0)
-    else:
-        return _impl(q, k, v, w, b, g, h0)
+    n_chunks = L // BT
+    o = jnp.moveaxis(o_chunks, 1, 3)          # (B,n_chunks,BT,H,D)
+    o = o.reshape(bsz, n_chunks * BT, H, D)     # (B,L,H,D)
+    return o, h_final
