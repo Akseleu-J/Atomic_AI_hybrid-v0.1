@@ -188,7 +188,16 @@ def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None):
         v_new_bhcv = jnp.moveaxis(v_new, 2, 1)  # (B,H,C,Dv)
         intra = jnp.einsum("bhij,bhjv->bhiv", Aqk, v_new_bhcv, precision=_HIGHEST)
         intra = jnp.moveaxis(intra, 1, 2)  # (B,C,H,Dv)
-        o_c = (scale * qh + intra).astype(dtype)
+        # ФИКС: НЕ кастуем к dtype=q.dtype здесь. gdn2_pallas_forward (Pallas
+        # Kernel D) никогда не кастует свой выход -- всегда float32. Если q
+        # приходит bfloat16 (реальная модель), а этот референс (используется
+        # ТОЛЬКО внутри _gdn2_core_bwd для jax.vjp) кастует в bf16, то
+        # forward-путь и backward-референс-путь получают РАЗНЫЙ dtype для
+        # логически одного и того же тензора -- custom_vjp с этим падает
+        # ("unexpected JAX type... expected bfloat16... got float32", found
+        # on real training run). Даункаст в bf16 делает вызывающий код
+        # (GatedDeltaNet2J, после RMSNorm), не этот референс.
+        o_c = scale * qh + intra
 
         # inter-chunk state update: h_pre <- h_pre * exp(gc_last) + kg^T @ v_new
         decay_h = jnp.exp(gc_last)[..., None]  # (B,H,D,1)
