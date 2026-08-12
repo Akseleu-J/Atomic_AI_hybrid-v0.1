@@ -49,9 +49,13 @@ def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
     kb_decayed = b * k * jnp.exp(gc)                          # (BT, D)
     w_pseudo = jnp.dot(A, kb_decayed, precision=_HIGHEST)       # (BT, D)
     u = jnp.dot(A, w * v, precision=_HIGHEST)                     # (BT, D)
+    # ФИКС: см. тот же комментарий в kernel_b_solve.py -- рубеж защиты после
+    # инцидента на реальном обучении.
+    w_pseudo = jnp.nan_to_num(w_pseudo, nan=0.0, posinf=1e4, neginf=-1e4)
+    u = jnp.nan_to_num(u, nan=0.0, posinf=1e4, neginf=-1e4)
 
     gc_last_row = gc[BT - 1]  # (D,) -- static index (compile-time constant), not dynamic_slice
-    kg = k * jnp.exp(jnp.clip(gc_last_row[None, :] - gc, -20.0, 20.0))
+    kg = k * jnp.exp(gc_last_row[None, :] - gc)  # (BT, D)
     qg = q * jnp.exp(gc)                            # (BT, D)
 
     w_pseudo_ref[0, 0, 0] = w_pseudo
