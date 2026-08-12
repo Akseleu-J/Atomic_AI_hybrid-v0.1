@@ -121,6 +121,12 @@ def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale):
 
     gc_bhcd = jnp.moveaxis(gc, 2, 1)  # (B,H,C,D)
     decay_diff = gc_bhcd[:, :, :, None, :] - gc_bhcd[:, :, None, :, :]  # (B,H,C,C,D)
+    # ФИКС (пользователь, до инцидента 710+): decay_diff теоретически всегда
+    # <=0 для причинных пар (t>=j, decay<=1), но численно (bf16-округления
+    # выше по графу, экстремальные decay_a) может просачиваться и в плюс --
+    # exp без клипа на это даёт inf. Без этого клипа обучение падало сразу
+    # же (не через 700 шагов, а немедленно) -- это первый, самый важный
+    # рубеж защиты, nan_to_num на Aqk/Akk/A ниже -- уже вторая линия.
     edecay = jnp.exp(jnp.clip(decay_diff, -20.0, 20.0))
 
     causal = jnp.tril(jnp.ones((C, C), dtype=f32))          # j<=i
@@ -134,11 +140,27 @@ def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale):
     bk_bhcd = b_bhcd * k_bhcd
     Akk = jnp.einsum("bhid,bhijd,bhjd->bhij", bk_bhcd, edecay, k_bhcd, precision=_HIGHEST) * strict  # (B,H,C,C)
 
+    # ФИКС: этот путь (не Pallas Kernel A/B/C!) -- единственный, который
+    # реально исполняется в backward (через jax.vjp в kernel_trainable.py),
+    # т.к. custom_vjp считает градиент через ЭТОТ чистый JAX референс, а не
+    # через forward Pallas-кернелы. Санитизация в kernel_a_scores.py (forward)
+    # НЕ защищает backward -- это два независимых пути вычисления одной
+    # математики. Инцидент на реальном обучении (шаг 710+, non-finite delta
+    # в gdn2 block4/layer14, затем non-finite и в backward) показал, что без
+    # клипа здесь Akk/A могут уйти в нестабильный режим по мере дрейфа весов,
+    # так же как это уже случалось со старым associative_scan-путём
+    # (см. Frobenius-clip в его _combine).
+    Aqk = jnp.nan_to_num(Aqk, nan=0.0, posinf=1e4, neginf=-1e4)
+    Akk = jnp.nan_to_num(Akk, nan=0.0, posinf=1e4, neginf=-1e4)
+
     A = _wy_inverse(Akk)  # (B,H,C,C) -- explicit forward substitution, not jnp.linalg.inv
+    A = jnp.nan_to_num(A, nan=0.0, posinf=1e4, neginf=-1e4)
 
     kb_decayed = (b_c.astype(f32) * k_c.astype(f32)) * jnp.exp(gc)  # (B,C,H,D)
     w_pseudo = jnp.einsum("bhij,bjhd->bihd", A, kb_decayed, precision=_HIGHEST)          # (B,C,H,D)
     u = jnp.einsum("bhij,bjhv->bihv", A, (w_c * v_c).astype(f32), precision=_HIGHEST)    # (B,C,H,Dv)
+    w_pseudo = jnp.nan_to_num(w_pseudo, nan=0.0, posinf=1e4, neginf=-1e4)
+    u = jnp.nan_to_num(u, nan=0.0, posinf=1e4, neginf=-1e4)
 
     gc_last = gc[:, -1]  # (B,H,D)
     kg = k_c.astype(f32) * jnp.exp(gc_last[:, None] - gc)  # (B,C,H,D)
@@ -203,6 +225,12 @@ def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None):
         decay_h = jnp.exp(gc_last)[..., None]  # (B,H,D,1)
         write = jnp.einsum("bihd,bihv->bhdv", kg, v_new, precision=_HIGHEST)  # (B,H,D,Dv)
         h_new = h_pre * decay_h + write
+        # ФИКС: тот же рубеж защиты, что уже стоит в Pallas Kernel D
+        # (kernel_d_pipeline.py) -- этот путь исполняется в backward, у него
+        # своя копия состояния, отдельная от Pallas-forward, поэтому нужен
+        # свой собственный клип, а не общий с forward.
+        h_new = jnp.nan_to_num(jnp.clip(h_new, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
+        o_c = jnp.nan_to_num(o_c, nan=0.0, posinf=1e4, neginf=-1e4)
 
         return h_new, o_c
 
