@@ -88,6 +88,9 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale):
             gc_j = gc[j0:j1]
 
             decay_diff = gc_i[:, None, :] - gc_j[None, :, :]  # (BC, BC, D)
+            # ФИКС (пользователь, до инцидента 710+): тот же клип, что в
+            # gdn2_wy_reference.py -- без него падало немедленно, не через
+            # 700 шагов. nan_to_num на aqk_blk/akk_blk ниже -- вторая линия.
             edecay = jnp.exp(jnp.clip(decay_diff, -20.0, 20.0))
 
             aqk_blk = scale * _weighted_pair_sum(q_i, edecay, k_j)
@@ -103,8 +106,8 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale):
             # off-diagonal (si>sj): every pair already satisfies j<i globally,
             # no masking needed.
 
-            aqk_ref[0, 0, 0, i0:i1, j0:j1] = aqk_blk
-            akk_ref[0, 0, 0, i0:i1, j0:j1] = akk_blk
+            aqk_ref[0, 0, 0, i0:i1, j0:j1] = jnp.nan_to_num(aqk_blk, nan=0.0, posinf=1e4, neginf=-1e4)
+            akk_ref[0, 0, 0, i0:i1, j0:j1] = jnp.nan_to_num(akk_blk, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
 def build_chunk_scores_pallas(q, k, b, g, scale):
