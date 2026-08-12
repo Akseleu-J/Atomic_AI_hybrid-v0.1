@@ -86,6 +86,14 @@ def _kernel_b_body(akk_ref, a_ref):
     tmp = jnp.dot(T10, A00, precision=_HIGHEST)     # (BC, BC) -- plain 2D dot, no batch dims
     A10 = -jnp.dot(A11, tmp, precision=_HIGHEST)      # (BC, BC)
 
+    # ФИКС: тот же рубеж защиты, что добавлен в gdn2_wy_reference.py после
+    # инцидента на реальном обучении (шаг 710+, non-finite delta в gdn2) --
+    # Akk/A могут дрейфовать в нестабильный режим по мере обучения, forward
+    # Pallas-путь нуждается в той же санитизации, что и backward-референс.
+    A00 = jnp.nan_to_num(A00, nan=0.0, posinf=1e4, neginf=-1e4)
+    A10 = jnp.nan_to_num(A10, nan=0.0, posinf=1e4, neginf=-1e4)
+    A11 = jnp.nan_to_num(A11, nan=0.0, posinf=1e4, neginf=-1e4)
+
     a_ref[0, 0, 0] = jnp.zeros((BT, BT), dtype=jnp.float32)
     a_ref[0, 0, 0, 0:BC, 0:BC] = A00
     a_ref[0, 0, 0, BC:2 * BC, 0:BC] = A10
