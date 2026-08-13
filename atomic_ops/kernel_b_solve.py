@@ -1,6 +1,24 @@
 """
 Milestone 3 -- Kernel B (Pallas/TPU): WY solve A = (I + Akk)^{-1}.
-Unchanged from validated project version.
+
+FIX (non-finite hardening, found while diagnosing a forward non-finite that
+appeared at step ~780 of a real training run, block=4/layer=14/type=gdn2):
+this was the ONE place in the whole project using only `nan_to_num` on its
+output, without a `clip` first -- every other kernel (B3, B4, B5,
+kernel_d_pipeline's scan step) uses the `clip(...) + nan_to_num(...)`
+combination specifically because `nan_to_num` alone only replaces VALUES
+THAT ARE ALREADY nan/inf; it does nothing to a value that is merely huge but
+still finite (e.g. ~1e25). Forward substitution against a near-singular
+`Akk` (which can happen for a specific (batch, head, chunk) once decay/erase
+gate parameters have drifted far enough into training) can produce exactly
+that: a large-but-finite `A`. That unbounded magnitude then flows on,
+unclipped, into Kernel C's `w_pseudo`/`u`/`kg`/`qg` and finally overflows to
+an actual `inf` only once it hits a later matmul in Kernel D's inter-chunk
+scan -- by which point the ORIGINAL cause (this near-singular WY-solve) is
+several kernels removed from where the `inf` finally appears, which is
+exactly why the existing [FWD-DIAG] block/layer-level check couldn't
+pinpoint it. Clipping A here, at the actual source, closes the gap instead
+of only reacting to its downstream symptom.
 """
 from __future__ import annotations
 
@@ -12,8 +30,13 @@ from jax.experimental.pallas import tpu as pltpu
 from .kernel_a_scores import BT, BC, N_SUB
 
 _HIGHEST = jax.lax.Precision.HIGHEST
+_CLIP = 1e4
 
 assert N_SUB == 2, "Kernel B currently implements only the 2-subblock (BT=2*BC) case."
+
+
+def _sanitize(x):
+    return jnp.nan_to_num(jnp.clip(x, -_CLIP, _CLIP), nan=0.0, posinf=_CLIP, neginf=-_CLIP)
 
 
 def _bc_forward_substitution(T):
@@ -46,9 +69,12 @@ def _kernel_b_body(akk_ref, a_ref):
     tmp = jnp.dot(T10, A00, precision=_HIGHEST)
     A10 = -jnp.dot(A11, tmp, precision=_HIGHEST)
 
-    A00 = jnp.nan_to_num(A00, nan=0.0, posinf=1e4, neginf=-1e4)
-    A10 = jnp.nan_to_num(A10, nan=0.0, posinf=1e4, neginf=-1e4)
-    A11 = jnp.nan_to_num(A11, nan=0.0, posinf=1e4, neginf=-1e4)
+    # FIX: clip, not just nan_to_num -- see module docstring. A near-singular
+    # Akk can make forward substitution produce a large-but-finite A that
+    # nan_to_num alone would let straight through.
+    A00 = _sanitize(A00)
+    A10 = _sanitize(A10)
+    A11 = _sanitize(A11)
 
     a_ref[0, 0, 0] = jnp.zeros((BT, BT), dtype=jnp.float32)
     a_ref[0, 0, 0, 0:BC, 0:BC] = A00
