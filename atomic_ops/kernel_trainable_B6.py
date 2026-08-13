@@ -15,6 +15,29 @@ non-finite cascade several steps later. Adding one final clip/nan_to_num
 pass right before the values leave this function is the same "belt and
 braces" pattern used everywhere else in this project, applied at the one
 place it was still missing: the actual custom_vjp return boundary.
+
+FIX #2 (dtype mismatch, found when this backward was actually wired into
+real training in model.py): custom_vjp requires the bwd function to return
+cotangents with the SAME dtype as the corresponding forward input. In real
+usage (GatedDeltaNet2J in model.py), q/k/v/w_gate/b_gate arrive as
+bfloat16, while g (log-decay) arrives as float32 (computed explicitly in
+fp32 for precision -- see model.py's GatedDeltaNet2J.__call__). Every
+intermediate value in this backward chain (B1-B5) is float32, and the
+final-sanitize pass did NOT change that -- so dq/dk/dv/dw/db were returned
+as float32 for bfloat16 primal inputs. JAX accepts that silently at the
+custom_vjp boundary itself, but training then crashes one level up the
+graph the moment that float32 cotangent has to combine with a
+bfloat16-typed gradient elsewhere (e.g. through a bf16 nn.Dense/conv
+weight upstream) -- `TypeError: lax.mul requires arguments to have the
+same dtypes, got float32, bfloat16`.
+
+The jax.vjp-on-reference path in kernel_trainable.py never hit this because
+gdn2_chunked_wy_reference does an explicit `.astype(f32)` as the very first
+thing it does to EACH input inside `_build_chunk_wy` -- autodiff then casts
+the cotangent back down to that input's original dtype automatically, for
+free, on the way out of that `.astype` call. Here, since the backward is
+computed by hand (not by differentiating through an `.astype`), the cast
+back to the original dtype has to be explicit -- added below.
 """
 from __future__ import annotations
 
@@ -128,13 +151,32 @@ def _gdn2_core_bwd(scale, residuals, cotangents):
     # optimizer step consumes exactly these values next, so this is the
     # last place a non-finite or absurdly-large gradient can be caught
     # before it reaches the model's weights.
-    dq = _final_sanitize(dq)
-    dk = _final_sanitize(dk)
-    db = _final_sanitize(db)
-    dw = _final_sanitize(dw)
-    dv = _final_sanitize(dv)
-    dg = _final_sanitize(dg)
-    dh0 = _final_sanitize(dh0)
+    #
+    # FIX #2 (dtype): custom_vjp requires the bwd function to return
+    # cotangents with the SAME dtype as the corresponding forward input.
+    # q/k/v/w/b arrive from model.py as bfloat16, while g (log-decay)
+    # arrives as float32 (computed explicitly in fp32 for precision --
+    # see GatedDeltaNet2J in model.py). Every intermediate value in this
+    # backward chain (B1-B5) is float32, and the sanitize step above does
+    # NOT change that -- so without this cast, dq/dk/dv/dw/db would be
+    # returned as float32 for bfloat16 primal inputs. JAX accepts that
+    # silently at the custom_vjp boundary itself, but it then fails one
+    # level up the graph with a dtype-mismatch error (float32 vs bfloat16)
+    # the moment that cotangent has to combine with a bfloat16-typed
+    # gradient elsewhere (e.g. through a bf16 nn.Dense/conv weight) --
+    # exactly the "lax.mul requires ... float32, bfloat16" failure. The
+    # jax.vjp-on-reference path in kernel_trainable.py never hit this
+    # because gdn2_chunked_wy_reference does an explicit `.astype(f32)` as
+    # the very first thing it does to EACH input -- autodiff then casts the
+    # cotangent back down to that input's original dtype automatically for
+    # free, on the way out of `.astype`. Here the cast has to be explicit.
+    dq = _final_sanitize(dq).astype(q.dtype)
+    dk = _final_sanitize(dk).astype(k.dtype)
+    db = _final_sanitize(db).astype(b.dtype)
+    dw = _final_sanitize(dw).astype(w.dtype)
+    dv = _final_sanitize(dv).astype(v.dtype)
+    dg = _final_sanitize(dg).astype(g.dtype)
+    dh0 = _final_sanitize(dh0).astype(h0.dtype)
 
     return dq, dk, dv, dw, db, dg, dh0
 
