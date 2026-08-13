@@ -1,6 +1,32 @@
 """
 Milestone 3 -- Kernel C (Pallas/TPU): w_pseudo, u, kg, qg, gc_last.
-Unchanged from validated project version.
+
+FIX (non-finite hardening, found by Акселеу while auditing this file against
+the same failure mode already documented in kernel_b_solve.py's docstring):
+this kernel had TWO separate gaps, both allowing a large-but-finite `A`
+(produced by Kernel B when Akk is near-singular -- see kernel_b_solve.py's
+own docstring for the full story) to flow downstream unbounded, only to
+overflow to an actual `inf` later inside Kernel D's inter-chunk scan (where
+the existing clip/nan_to_num finally catches it -- too late to localize the
+real source):
+
+  1. `w_pseudo`/`u` were only `nan_to_num`'d, never `clip`'d. Exactly the
+     gap kernel_b_solve.py's docstring warns about: `nan_to_num` alone only
+     replaces values that are ALREADY nan/inf -- it does nothing to a value
+     that is merely huge but still finite (e.g. ~1e20, which a near-singular
+     A can easily produce through `A @ kb_decayed` / `A @ (w*v)`).
+
+  2. `kg`, `qg`, and `gc_last_row` had NO sanitization at all -- not even
+     `nan_to_num`. `kg = k * exp(gc_last - gc)` and `qg = q * exp(gc)` both
+     exponentiate a cumulative decay term; if that ever leaks slightly
+     positive (same `decay_diff` numerical-leak risk documented in
+     gdn2_wy_reference.py and kernel_a_scores.py) or `A` upstream is huge,
+     these can overflow directly here, unclipped, straight into Kernel D's
+     `wh = einsum(w_pseudo, h_pre)` / `write = einsum(kg, v_new)` matmuls.
+
+Fix: same `clip(+-1e4) + nan_to_num` combination used everywhere else in
+this project (kernel_b_solve.py, kernel_d_pipeline.py's scan step, B3, B4,
+B5) applied to all five outputs of this kernel, not just two of them.
 """
 from __future__ import annotations
 
@@ -12,6 +38,11 @@ from jax.experimental.pallas import tpu as pltpu
 from .kernel_a_scores import BT
 
 _HIGHEST = jax.lax.Precision.HIGHEST
+_CLIP = 1e4
+
+
+def _sanitize(x):
+    return jnp.nan_to_num(jnp.clip(x, -_CLIP, _CLIP), nan=0.0, posinf=_CLIP, neginf=-_CLIP)
 
 
 def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
@@ -31,12 +62,24 @@ def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
     kb_decayed = b * k * jnp.exp(gc)
     w_pseudo = jnp.dot(A, kb_decayed, precision=_HIGHEST)
     u = jnp.dot(A, w * v, precision=_HIGHEST)
-    w_pseudo = jnp.nan_to_num(w_pseudo, nan=0.0, posinf=1e4, neginf=-1e4)
-    u = jnp.nan_to_num(u, nan=0.0, posinf=1e4, neginf=-1e4)
+    # FIX: clip, not just nan_to_num -- see module docstring. A near-singular
+    # Akk upstream (Kernel B) can make A large-but-finite, which propagates
+    # here through these matmuls; nan_to_num alone lets that straight through.
+    w_pseudo = _sanitize(w_pseudo)
+    u = _sanitize(u)
 
     gc_last_row = gc[BT - 1]
     kg = k * jnp.exp(gc_last_row[None, :] - gc)
     qg = q * jnp.exp(gc)
+
+    # FIX: kg/qg/gc_last_row previously had NO sanitization at all. These
+    # feed directly into Kernel D's inter-chunk einsums (wh, write) --
+    # unclipped, an overflow here only surfaces as an `inf` several kernels
+    # downstream, exactly the diagnosability gap kernel_b_solve.py's
+    # docstring describes for A itself.
+    kg = _sanitize(kg)
+    qg = _sanitize(qg)
+    gc_last_row = _sanitize(gc_last_row)
 
     w_pseudo_ref[0, 0, 0] = w_pseudo
     u_ref[0, 0, 0] = u
