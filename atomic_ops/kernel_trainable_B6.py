@@ -23,16 +23,16 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from kernel_a_scores import BT, build_chunk_scores_pallas
-from kernel_b_solve import wy_solve_pallas
-from kernel_c_recompute import recompute_wy_pallas
-from kernel_d_pipeline import gdn2_pallas_forward, gdn2_inter_chunk_combine_with_state
+from .kernel_a_scores import BT, build_chunk_scores_pallas
+from .kernel_b_solve import wy_solve_pallas
+from .kernel_c_recompute import recompute_wy_pallas
+from .kernel_d_pipeline import gdn2_pallas_forward, gdn2_inter_chunk_combine_with_state
 
-from kernel_bwd_b1_dhu import gdn2_dhu_backward
-from kernel_bwd_b2_dav import dav_backward_pallas
-from kernel_bwd_b3_wy_dqkg import wy_dqkg_backward_pallas
-from kernel_bwd_b4_intra import intra_backward_pallas
-from kernel_bwd_b5_reverse_cumsum import reverse_cumsum_bwd
+from .kernel_bwd_b1_dhu import gdn2_dhu_backward
+from .kernel_bwd_b2_dav import dav_backward_pallas
+from .kernel_bwd_b3_wy_dqkg import wy_dqkg_backward_pallas
+from .kernel_bwd_b4_intra import intra_backward_pallas
+from .kernel_bwd_b5_reverse_cumsum import reverse_cumsum_bwd
 
 _HIGHEST = jax.lax.Precision.HIGHEST
 _FINAL_CLIP = 1e4
