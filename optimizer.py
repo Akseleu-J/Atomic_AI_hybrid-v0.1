@@ -37,7 +37,7 @@ def make_grad_probe(tag: str):
 # ==========================================
 def muon_orthogonalize(w, g, lr, ns_steps: int = 3):
     """Orthogonalize the gradient via Newton-Schulz iteration, then take a step."""
-    # ФИКС: eps увеличен — bfloat16 не держит 1e-7, норма обнуляется,
+    # ФИКС: eps увеличен — bfloat16 не держит 1e-7, норма обнуляется, 
     # деление на ~0 дает inf, Newton-Schulz взрывается.
     eps = 1e-4
     
