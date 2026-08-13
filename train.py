@@ -39,7 +39,7 @@ except ImportError:
 # следите за первыми 2-3 циклами и увеличьте интервал, если запись занимает
 # больше половины интервала (иначе TPU будет простаивать в ожидании I/O больше,
 # чем считать).
-CHECKPOINT_EVERY_SECONDS = 10 * 60
+CHECKPOINT_EVERY_SECONDS = 100 * 60
  
 # ФИКС: автостоп при частых non-finite градиентах. Раньше скрипт тихо
 # пропускал битые шаги и полз дальше сколько угодно -- на долгом фоновом
@@ -720,16 +720,16 @@ def main_execution():
     best_train_loss = float("inf")
  
     config = ModelConfig(
-        d_model=768,
+        d_model=512,
         d_state=128,
         d_conv=4,
         expand=2,
-        n_heads=6,
+        n_heads=4,
         d_latent=512,
-        d_ff=4096,
+        d_ff=3072,
         num_experts=8,
         top_k=2,
-        num_layers=21,
+        num_layers=18,
         layers_per_block=3,
         vocab_size=128256,
         dropout_rate=0.1,
@@ -741,6 +741,15 @@ def main_execution():
         router_noise_std=0.1,
         use_flash_attention=True,
         deltanet_chunk_size=256,
+        layer_types = (
+        "gdn2", "gdn2", "mla",      # block 0
+        "gdn2", "mamba2", "gdn2",   # block 1
+        "gdn2", "gdn2", "gdn2",     # block 2
+        "gdn2", "gdn2", "mla",      # block 3
+        "gdn2", "mamba2", "gdn2",   # block 4
+        "gdn2", "gdn2", "mla",     # block 5
+        
+    )
     )
     file_pairs = [
         (
@@ -1207,4 +1216,3 @@ def main_execution():
 if __name__ == "__main__":
     main_execution()
  
-
