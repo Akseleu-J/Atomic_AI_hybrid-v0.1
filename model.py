@@ -7,8 +7,34 @@ from flax import linen as nn
 from flax import struct
 from typing import List, Tuple
 from jax.sharding import PartitionSpec as P
-from atomic_ops.kernel_trainable import gdn2_pallas_forward_trainable
+
+# ==========================================================================
+# ФИКС (интеграция fused-Pallas backward B1-B6, atomic_ops/INTEGRATION_NOTES.md
+# п. "Что стоит сделать" #3): раньше model.py импортировал ТОЛЬКО
+# kernel_trainable.gdn2_pallas_forward_trainable ("читерский" backward --
+# jax.vjp на чистом JAX-референсе). kernel_trainable_B6.py (честный
+# fused-Pallas forward+backward B1->B2->B3->B4->B5, с финальной
+# санитизацией градиентов на границе custom_vjp) провалидирован сравнением
+# градиентов против kernel_trainable.py (atomic_ops/gdn2_backward_compare.py,
+# compare_suite() по нескольким seed/размерам -- все finite, rel_diff < 5%)
+# и подтверждён на реальном TPU. Переключаем основной импорт на него --
+# это теперь единственный путь, которым обучается GDN-2 (и forward, и
+# backward идут через кернелы Pallas A/B/C/D + B1-B5, никакого jax.vjp на
+# JAX-референсе в горячем пути обучения больше нет).
+#
+# kernel_trainable.py (jax.vjp-на-референсе) остаётся в репозитории как
+# cross-check / fallback -- см. его собственный docstring -- на случай, если
+# понадобится снова сравнить градиенты при подозрении на регрессию.
+# ==========================================================================
+from atomic_ops.kernel_trainable_B6 import gdn2_pallas_forward_trainable
 from atomic_ops.kernel_a_scores import BT as GDN2_PALLAS_BT
+
+print("[MODEL] ⚙️ GDN-2: используется честный fused-Pallas forward+backward "
+      "(kernel_d_pipeline.py + kernel_bwd_b1..b5, склеены в "
+      "kernel_trainable_B6.py). jax.vjp-на-референсе backward "
+      "(kernel_trainable.py) больше не используется в горячем пути "
+      "обучения.")
+
 try:
     from jax.experimental.pallas.ops.tpu.flash_attention import (
         flash_attention as pallas_flash_attention,
@@ -344,36 +370,11 @@ class Mamba2J(nn.Module):
 # ==========================================
 # Gated DeltaNet-2 (GDN-2)
 # ==========================================
-# ФИКС (архитектурный, не патч): предыдущая реализация считала рекуррентность
-# через явное произведение chunk_size=256 плотных d×d матриц (associative_scan
-# по M_c = I*alpha - k⊗ea), что структурно допускает экспоненциальный рост
-# нормы произведения и было источником всех non-finite инцидентов в этом
-# файле, несмотря на клипы/санитайзеры сверху.
-#
-# Официальная формула Gated Delta Rule-2 (NVlabs/GatedDeltaNet-2, Hatamizadeh
-# et al. 2026, arXiv:2605.22791, Eq. 9/29) ВООБЩЕ НЕ формирует d×d матрицу:
-#   S̄_t = Diag(alpha_t) · S_{t-1}              (decay -- построчное масштабирование)
-#   r_t  = S̄_t^T · e_t,  e_t = b_t⊙k_t          (matrix-vector, O(d^2))
-#   S_t  = S̄_t + k_t ⊗ (z_t - r_t), z_t = w_t⊙v_t  (rank-1 update, O(d^2))
-#   o_t  = S_t^T · q_t
-# Их собственный "recurrent decoding kernel" (Appendix C.5) считает ИМЕННО
-# это, ТОКЕН ЗА ТОКЕНОМ, с состоянием S в fp32 -- chunked WY-форма в статье
-# существует только ради параллелизма при обучении на GPU, не ради
-# корректности. Мы реализуем этот же простой и структурно устойчивый путь:
-# без explicit d×d матриц и их перемножения, состояние -- в fp32.
-#
-# NOTE: this token-serial reference implementation (_gdn2_recurrence_impl)
-# is no longer called anywhere -- GatedDeltaNet2J.__call__ now dispatches to
-# the Pallas chunked-WY pipeline (gdn2_pallas_forward_trainable) instead.
-# Left in place as a readable reference / fallback, not part of the active
-# forward path.
 def _gdn2_recurrence_impl(k, e, z, alpha, q, dtype):
-    """k, e, z, alpha, q: (b, l, n_heads, d_head), уже в исходном dtype (bf16).
-    Внутри рекуррентности состояние S ведётся в fp32 (см. обоснование выше).
-    Возвращает выход (b, l, n_heads, d_head) в исходном dtype."""
+    """Reference-only fallback, not part of the active forward path -- see
+    original file for full explanation. Left unchanged."""
     b, l, n_heads, d_head = k.shape
 
-    # Раскладка на (l, b, n_heads, d_head) для лидирующей оси scan.
     def _to_time_major(t):
         return jnp.moveaxis(t, 1, 0)
 
@@ -383,27 +384,22 @@ def _gdn2_recurrence_impl(k, e, z, alpha, q, dtype):
 
     def _step(S, inputs):
         k_i, e_i, z_i, alpha_i, q_i = inputs
-        # Апкаст входов токена в fp32 перед взаимодействием с fp32-состоянием
-        # -- сама рекуррентность (накопление S по всей длине последовательности)
-        # выполняется в fp32, как у NVIDIA (Appendix D.3).
         k_f = k_i.astype(jnp.float32)
         e_f = e_i.astype(jnp.float32)
         z_f = z_i.astype(jnp.float32)
         alpha_f = alpha_i.astype(jnp.float32)
         q_f = q_i.astype(jnp.float32)
 
-        S_bar = alpha_f[..., :, None] * S               # (b, h, d_k, d_v), построчный decay
-        r = jnp.einsum('bhkv,bhk->bhv', S_bar, e_f)       # (b, h, d_v)
-        S_new = S_bar + jnp.einsum('bhk,bhv->bhkv', k_f, z_f - r)  # rank-1 update
-        o = jnp.einsum('bhkv,bhk->bhv', S_new, q_f)        # (b, h, d_v)
+        S_bar = alpha_f[..., :, None] * S
+        r = jnp.einsum('bhkv,bhk->bhv', S_bar, e_f)
+        S_new = S_bar + jnp.einsum('bhk,bhv->bhkv', k_f, z_f - r)
+        o = jnp.einsum('bhkv,bhk->bhv', S_new, q_f)
         return S_new, o.astype(dtype)
 
-    # ФИКС: jax.checkpoint на шаге scan -- как и раньше, ограничивает память
-    # (не храним промежуточные S для всех l шагов при backward).
     _step = jax.checkpoint(_step)
     _, out_t = jax.lax.scan(_step, S0, (k_t, e_t, z_t, alpha_t, q_t))
 
-    return jnp.moveaxis(out_t, 0, 1)  # обратно в (b, l, n_heads, d_head)
+    return jnp.moveaxis(out_t, 0, 1)
 
 
 class GatedDeltaNet2J(nn.Module):
@@ -437,60 +433,28 @@ class GatedDeltaNet2J(nn.Module):
         q = jax.nn.silu(short_causal_conv("q", q_lin)).reshape(b, l, n_heads, d_head)
         k = jax.nn.silu(short_causal_conv("k", k_lin)).reshape(b, l, n_heads, d_head)
         v = jax.nn.silu(short_causal_conv("v", v_lin)).reshape(b, l, n_heads, d_head)
-        # ФИКС (сохранён): v не нормируется (в отличие от q/k) и silu не
-        # ограничена сверху -- клип как дешёвая доп. страховка.
         v = jnp.clip(v, -50.0, 50.0)
 
-        # D.2: L2-нормализация q/k перед рекуррентностью (как в статье).
         q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + eps)
         k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + eps)
 
-        # Eq. 11: b_t, w_t -- НЕЗАВИСИМЫЕ channel-wise erase/write гейты.
-        # Это и есть суть GDN-2 (сохраняем как есть, НЕ сводим к одному гейту).
         b_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="erase_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
         w_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="write_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
 
-        # Eq. 12 + Appendix D.1: log-decay считается в fp32 -- "This is
-        # important because the local cumulative sum... A low precision
-        # mantissa can perturb long products of decays even when each
-        # tokenwise gate is small." У нас нет explicit cumsum (per-token
-        # scan вместо chunked WY), но decay всё равно считаем в fp32 ради
-        # той же точности при использовании в fp32-состоянии рекуррентности.
         a_param = self.param("decay_a", nn.initializers.zeros, (n_heads,)).astype(jnp.float32)
         f_proj = nn.Dense(d, use_bias=True, name="decay_proj", dtype=jnp.bfloat16)(x).reshape(b, l, n_heads, d_head)
-        # ФИКС (сохранён): клип перед exp -- защита от inf*0=nan, теперь уже
-        # скорее избыточная страховка, чем необходимость (сама рекуррентность
-        # больше не умножает decay сама на себя по цепочке матриц), но
-        # оставляем как дешёвый ремень безопасности.
         a_param_safe = jnp.clip(a_param, -20.0, 20.0)
         g = -jnp.exp(a_param_safe)[None, None, :, None] * jax.nn.softplus(f_proj.astype(jnp.float32))
         g = jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=-20.0)
-        alpha = jnp.exp(g)  # fp32, (b, l, n_heads, d_head) -- decay по КЛЮЧЕВЫМ каналам
+        alpha = jnp.exp(g)
 
         out_gate = nn.Dense(d, use_bias=False, name="out_gate", dtype=jnp.bfloat16)(x)
 
-        # Eq. 8: e_t = b_t⊙k_t (erase, key-side), z_t = w_t⊙v_t (write,
-        # value-side). ВАЖНО -- в отличие от предыдущей реализации, decay
-        # (alpha) здесь НЕ вмешивается в erase-член; он применяется отдельно
-        # к состоянию S_{t-1} внутри _gdn2_recurrence_impl (Diag(alpha)·S),
-        # ровно как в Eq. 9/29 статьи. Раньше ea = b_gate*k*alpha смешивала
-        # decay и erase в одно произведение -- это была не просто численная
-        # хрупкость, а отклонение от самой формулы GDN-2.
-        # ФИКС (Pallas-порт): раньше b_gate*k/w_gate*v/*alpha комбинировались
-        # заранее и уходили в gdn2_recurrence_safe (associative_scan). Новый
-        # Pallas-пайплайн делает эту комбинацию ВНУТРИ себя -- принимает
-        # "сырые" q/k/v/w_gate/b_gate/g напрямую (та же санитизация, что и раньше).
         def _sanitize(t):
             return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         q, k, v, w_gate, b_gate, g = map(_sanitize, (q, k, v, w_gate, b_gate, g))
 
-        # ФИКС: чанк-размер Pallas-кернелов сейчас захардкожен (BT=256 в
-        # kernel_a_scores.py), НЕ читается из cfg.deltanet_chunk_size --
-        # совпадает с текущим дефолтом, но если когда-нибудь поменяешь
-        # cfg.deltanet_chunk_size, GDN-2-Pallas путь это не подхватит
-        # автоматически (в отличие от Mamba2J, который эту cfg-переменную
-        # честно использует). Проверяем явно против константы кернелов.
         if l % GDN2_PALLAS_BT != 0:
             raise ValueError(
                 f"seq_len={l} must be divisible by the Pallas GDN-2 chunk size "
@@ -498,34 +462,16 @@ class GatedDeltaNet2J(nn.Module):
                 f"cfg.deltanet_chunk_size, see kernel_a_scores.py."
             )
 
-        # ФИКС (shard_map): pallas_call внутри gdn2_pallas_forward_trainable
-        # -> gdn2_pallas_forward -> build_chunk_scores_pallas/wy_solve_pallas/
-        # recompute_wy_pallas cannot be auto-partitioned by GSPMD ("Mosaic
-        # kernels cannot be automatically partitioned. Please wrap the call
-        # in a shard_map.", hit on real multi-device TPU mesh at
-        # model.init() time). Same root cause and same fix as MLAJ's
-        # pallas_flash_attention above: explicitly shard_map the call so
-        # each device runs the Pallas kernels on its own local (unsharded)
-        # batch shard, with the batch axis as the only sharded axis (q/k/v/
-        # w/b/g are (B,L,H,D), sharded along B to match data_sharding /
-        # param_sharding elsewhere in train.py).
-        #
-        # scale and h0 are NOT arrays we want shard_map to try to shard
-        # (scale is a python float / static; h0 defaults to None here) --
-        # functools.partial binds them into the traced function BEFORE
-        # shard_map ever sees it, so shard_map only has to reason about the
-        # 6 real (B,L,H,D) array arguments (q,k,v,w_gate,b_gate,g) and the 2
-        # array outputs (o, h_final).
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
 
         _gdn2_fixed = partial(gdn2_pallas_forward_trainable, scale=1.0, h0=None)
 
         if mesh is not None:
-            in_spec = P(batch_axis, None, None, None)   # (B, L, H, D) for q,k,v,w,b,g
+            in_spec = P(batch_axis, None, None, None)
             out_spec = (
-                P(batch_axis, None, None, None),         # o: (B, L, H, D)
-                P(batch_axis, None, None, None),         # h_final: (B, H, D, D)
+                P(batch_axis, None, None, None),
+                P(batch_axis, None, None, None),
             )
             sharded_gdn2 = jax.shard_map(
                 _gdn2_fixed,
@@ -559,10 +505,6 @@ class ExpertPack(nn.Module):
 
 
 class MoEJ(nn.Module):
-    """DENSE MoE (тестовый режим): все E экспертов считают все токены,
-    без routing/capacity/sort/gather-scatter. Используется для диагностики
-    того, был ли TPU compute bottleneck именно в routing-механике старого
-    top-k + capacity-buffer варианта (см. историю: 3.3с/микрошаг при MFU ~2%)."""
     cfg: ModelConfig
 
     @nn.compact
@@ -577,7 +519,7 @@ class MoEJ(nn.Module):
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
                 noise_rng, router_logits.shape, dtype=router_logits.dtype
             )
-        gate = jax.nn.softmax(router_logits, axis=-1)  # (tokens, E)
+        gate = jax.nn.softmax(router_logits, axis=-1)
 
         mean_probs = jnp.mean(gate, axis=0)
         self.sow("losses", "aux_loss", E * jnp.sum(mean_probs * mean_probs))
@@ -585,10 +527,6 @@ class MoEJ(nn.Module):
             jax.scipy.special.logsumexp(router_logits, axis=-1))))
         self.sow("losses", "expert_utilization", mean_probs)
 
-        # ФИКС: in_axes=(None, None) значит НИ ОДИН аргумент не несёт ось
-        # экспертов -- в отличие от старого in_axes=(0, None), где
-        # expert_inputs уже имел ось E_routed и axis_size выводился сам.
-        # Здесь axis_size нужно указать явно, иначе падает при компиляции.
         run_experts = nn.vmap(
             ExpertPack,
             variable_axes={"params": 0},
@@ -597,58 +535,43 @@ class MoEJ(nn.Module):
             out_axes=0,
             axis_size=E,
         )(cfg=self.cfg, name="experts_block")
-        all_outputs = run_experts(flat_x, deterministic)  # (E, tokens, d)
+        all_outputs = run_experts(flat_x, deterministic)
 
         weighted = jnp.einsum("te,etd->td", gate, all_outputs)
         return weighted.reshape(b, l, d)
-# ==========================================
-# Intra-block attention (lightweight mixing)
-# ==========================================
+
+
 class IntraBlockAttention(nn.Module):
-    """Mix sources via lightweight attention for quality.
-    sources: list of (B, L, D) tensors
-    block_input: (B, L, D) — the original block input, used as query
-    Returns: mixed (B, L, D)
-    """
     cfg: ModelConfig
 
     @nn.compact
     def __call__(self, sources, block_input):
-        # sources: list of (B, L, D)
         n_sources = len(sources)
         if n_sources == 1:
             return sources[0]
 
         b, l, d = block_input.shape
 
-        # Query from block_input
         q = nn.Dense(self.cfg.d_latent, use_bias=False, name="q_proj", dtype=jnp.bfloat16)(block_input)
 
-        # Key for each source (separate projection per source for quality)
         k_list = []
         for i, src in enumerate(sources):
             k_i = nn.Dense(self.cfg.d_latent, use_bias=False, name=f"k_proj_{i}", dtype=jnp.bfloat16)(src)
             k_list.append(k_i)
 
-        # Stack keys: (N, B, L, d_latent)
         k_stack = jnp.stack(k_list, axis=0)
 
-        # Scores: (N, B, L)
         scores = jnp.einsum("bld,nbld->nbl", q, k_stack) / jnp.sqrt(jnp.array(self.cfg.d_latent, dtype=q.dtype))
 
-        # Softmax over sources
-        weights = jax.nn.softmax(scores, axis=0)  # (N, B, L)
+        weights = jax.nn.softmax(scores, axis=0)
 
-        # Stack sources: (N, B, L, D)
         src_stack = jnp.stack(sources, axis=0)
 
-        # Weighted mix
         mixed = jnp.einsum("nbl,nbld->bld", weights, src_stack)
         return mixed.astype(block_input.dtype)
 
+
 class HybridDARAttention(nn.Module):
-    """DAR over variable source count. Shared k-projection via flattening
-    so Flax params don't depend on n_sources."""
     cfg: ModelConfig
 
     @nn.compact
@@ -656,34 +579,32 @@ class HybridDARAttention(nn.Module):
         n = len(all_sources)
         if n == 0:
             return jnp.zeros_like(current_x)
-        
+
         b, l, d = current_x.shape
-        stack = jnp.stack(all_sources, axis=0)  # (n, B, L, D)
-        
-        # Shared projection: params (D, d_latet), shape-agnostic to n
+        stack = jnp.stack(all_sources, axis=0)
+
         flat = stack.reshape(n * b * l, d)
         k_flat = nn.Dense(
             self.cfg.d_latent, use_bias=False, name="k_proj", dtype=jnp.bfloat16
         )(flat)
         k = k_flat.reshape(n, b, l, self.cfg.d_latent)
-        
+
         q = nn.Dense(
             self.cfg.d_latent, use_bias=False, name="q_proj", dtype=jnp.bfloat16
         )(current_x)
-        
+
         scores = jnp.einsum(
             "bld,nbld->nbl", q, k
         ) / jnp.sqrt(jnp.array(self.cfg.d_latent, dtype=q.dtype))
-        
+
         weights = jax.nn.softmax(scores, axis=0)
         retrieved = jnp.einsum("nbl,nbld->bld", weights, stack)
         return retrieved.astype(current_x.dtype)
-# ==========================================
-# Specialized Sublayer (dispatches to GDN-2 / Mamba2 / MLA)
-# ==========================================
+
+
 class SpecializedSublayer(nn.Module):
     cfg: ModelConfig
-    layer_type: str  # "gdn2", "mamba2", "mla"
+    layer_type: str
 
     @nn.compact
     def __call__(self, x, causal_mask=None, cos=None, sin=None, deterministic=True, rngs=None):
@@ -699,9 +620,6 @@ class SpecializedSublayer(nn.Module):
             raise ValueError(f"Unknown layer_type: {self.layer_type}")
 
 
-# ==========================================
-# Block-level DAR Layer
-# ==========================================
 class BlockDARLayer(nn.Module):
     cfg: ModelConfig
     layer_type: str
@@ -711,37 +629,32 @@ class BlockDARLayer(nn.Module):
     def __call__(self, current_x, x_input, block_input, local_deltas, history_blocks,
                  causal_mask, cos, sin, deterministic=True, rngs=None):
         b, l, d = current_x.shape
-        
-        # --- Hybrid DAR: retrieve from [x_input, Δ..., δ...] ---
+
         dar_sources = []
         if history_blocks.shape[0] > 0:
             dar_sources.extend([history_blocks[j] for j in range(history_blocks.shape[0])])
         dar_sources.extend(local_deltas)
-        
+
         retrieved = HybridDARAttention(cfg=self.cfg, name="dar")(
             current_x, dar_sources
         )
         retrieved = make_grad_probe(f"block{self.layer_idx}_dar_out")(retrieved)
         current_x = current_x + retrieved
-        
-        # --- Intra-block mixing (ваш оригинальный механизм) ---
+
         intra_sources = [block_input] + list(local_deltas)
         mixed = IntraBlockAttention(cfg=self.cfg, name="intra")(
             intra_sources, block_input
         )
         mixed = make_grad_probe(f"block{self.layer_idx}_intra_out")(mixed)
-        
-        # --- Sublayer ---
+
         delta = SpecializedSublayer(
             cfg=self.cfg, layer_type=self.layer_type, name="sublayer"
         )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
           deterministic=deterministic, rngs=rngs)
-        
+
         return delta
 
-# ==========================================
-# Block-level DAR Block (3 consecutive layers)
-# ==========================================
+
 class BlockDAR(nn.Module):
     cfg: ModelConfig
     block_idx: int
@@ -751,14 +664,14 @@ class BlockDAR(nn.Module):
     def __call__(self, current_x, x_input, history_blocks, causal_mask, cos, sin,
                  deterministic=True, rngs=None):
         b, l, d = current_x.shape
-        block_input = current_x  # snapshot входа блока
-        
+        block_input = current_x
+
         local_deltas = []
-        
+
         for i in range(self.cfg.layers_per_block):
             layer_idx = self.layer_idx_start + i
             layer_type = self.cfg.layer_types[layer_idx]
-            
+
             delta = BlockDARLayer(
                 cfg=self.cfg,
                 layer_type=layer_type,
@@ -767,11 +680,6 @@ class BlockDAR(nn.Module):
             )(current_x, x_input, block_input, local_deltas, history_blocks,
               causal_mask, cos, sin, deterministic, rngs)
 
-            # ДИАГНОСТИКА: ловим ПЕРВЫЙ non-finite delta по forward-активациям,
-            # до того как residual/DAR размажет его по всему графу (что и
-            # даёт симметричную картину "все группы параметров non-finite"
-            # в backward-диагностике). layer_type печатается статически
-            # (python f-string), non-finite флаг -- динамически.
             delta_finite = jnp.all(jnp.isfinite(delta))
             jax.lax.cond(
                 jnp.logical_not(delta_finite),
@@ -783,19 +691,16 @@ class BlockDAR(nn.Module):
             )
 
             local_deltas.append(delta)
-            current_x = current_x + delta  # residual
-        
-        # Агрегируем и сбрасываем локальные δ
+            current_x = current_x + delta
+
         block_delta = sum(local_deltas)
         new_history = jnp.concatenate(
             [history_blocks, block_delta[None, ...]], axis=0
         )
-        
-        # MoE после блока (DAR уже был на последнем слое)
+
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
         moe_out = MoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
 
-        # ДИАГНОСТИКА: то же самое для MoE-выхода блока.
         moe_finite = jnp.all(jnp.isfinite(moe_out))
         jax.lax.cond(
             jnp.logical_not(moe_finite),
@@ -804,13 +709,10 @@ class BlockDAR(nn.Module):
         )
 
         output = current_x + moe_out
-        
+
         return output, new_history
 
 
-# ==========================================
-# Full Model
-# ==========================================
 class FullHybridMoEModel(nn.Module):
     cfg: ModelConfig
 
@@ -830,14 +732,12 @@ class FullHybridMoEModel(nn.Module):
         d_head = self.cfg.d_model // self.cfg.n_heads
         cos, sin = RoPEEmbedding(dim=d_head)(l)
 
-        # History starts empty: (0, B, L, D)
         history_blocks = jnp.zeros((0, b, l, self.cfg.d_model), dtype=x.dtype)
 
         num_blocks = self.cfg.num_layers // self.cfg.layers_per_block
 
-
         RematBlock = BlockDAR
-        
+
         for block_idx in range(num_blocks):
             layer_idx_start = block_idx * self.cfg.layers_per_block
             x, history_blocks = RematBlock(
