@@ -25,7 +25,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from kernel_a_scores import BT
+from .kernel_a_scores import BT
 
 _HIGHEST = jax.lax.Precision.HIGHEST
 
