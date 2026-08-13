@@ -12,9 +12,9 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from kernel_a_scores import BT
-from kernel_d_pipeline import gdn2_pallas_forward
-from gdn2_wy_reference import gdn2_chunked_wy_reference
+from .kernel_a_scores import BT
+from .kernel_d_pipeline import gdn2_pallas_forward
+from .gdn2_wy_reference import gdn2_chunked_wy_reference
 
 _FINAL_CLIP = 1e4
 
