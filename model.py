@@ -20,7 +20,6 @@ except Exception as _e:
     FlashBlockSizes = None
     _PALLAS_FLASH_ATTENTION_IMPORT_ERROR = _e
 
-# jax.checkpoint_policies нет в этой версии JAX — используем строковые policy в nn.remat
 _model_mesh = None
 _batch_axis = None
 
@@ -95,7 +94,7 @@ def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
 
 @struct.dataclass
 class ModelConfig:
-    d_model: int = 512
+    d_model: int = 768
     d_state: int = 128
     d_conv: int = 4
     expand: int = 2
