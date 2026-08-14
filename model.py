@@ -203,6 +203,15 @@ class MLAJ(nn.Module):
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
         V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
+        # ФИКС: единственный модуль без входной санитизации перед
+        # flash-attention (GDN-2 нормирует q/k, Mamba2 клипает B/C/dt) --
+        # подтверждено логом, где mla_flash_attn_out регулярно требовал
+        # спасения градиента. Клип входа тем же способом (±1e3), что и везде.
+        def _sanitize(t):
+            return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
+
+        Q_rope, K_rope, V = map(_sanitize, (Q_rope, K_rope, V))
+
         sm_scale = 1.0 / math.sqrt(d_head)
 
         if self.cfg.use_flash_attention:
@@ -651,6 +660,23 @@ class BlockDARLayer(nn.Module):
             cfg=self.cfg, layer_type=self.layer_type, name="sublayer"
         )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
           deterministic=deterministic, rngs=rngs)
+
+        # ФИКС (подтверждено логом инцидента на шаге 943 -- без этого клипа
+        # delta от layer13/mamba2 достигала ~6.25e8, а от layer14/gdn2 --
+        # ~5.3e6, ОБЕ поверх current_x, который уже был ограничен фиксом #1
+        # (клип после current_x+delta). Фикс #1 сам по себе НЕ защищает,
+        # потому что клипается СУММА current_x+delta уже ПОСЛЕ того, как
+        # delta успевает разойтись в local_deltas/block_delta/history_blocks
+        # -- т.е. клип current_x спасает следующий шаг накопления residual
+        # stream, но не спасает IntraBlockAttention/HybridDARAttention
+        # следующих слоёв и history_blocks будущих блоков, которые читают
+        # local_deltas/history_blocks НАПРЯМУЮ, в обход current_x. Вероятный
+        # источник самой амплитуды -- GatedDeltaNet2J: out_gate ничем не
+        # клипируется до silu(out_gate)*out -> out_proj, то есть даже
+        # ограниченный вход (mixed) может дать неограниченный delta на
+        # выходе. Клип здесь, в источнике, закрывает это независимо от
+        # внутреннего механизма амплификации.
+        delta = jnp.nan_to_num(jnp.clip(delta, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return delta
 
