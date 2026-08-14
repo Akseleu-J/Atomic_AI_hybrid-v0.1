@@ -444,8 +444,29 @@ class GatedDeltaNet2J(nn.Module):
         v = jax.nn.silu(short_causal_conv("v", v_lin)).reshape(b, l, n_heads, d_head)
         v = jnp.clip(v, -50.0, 50.0)
 
-        q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + eps)
-        k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + eps)
+        # ФИКС (найдено через probe sublayer_out_layer{N}/intra_out: forward
+        # ПОЛНОСТЬЮ конечен, но backward регулярно даёт NaN между этими
+        # двумя точками -- т.е. внутри GatedDeltaNet2J, между выходом B1-B6
+        # chain (уже санитизирован на своей границе в kernel_trainable_B6.py)
+        # и входом в conv/q_proj/k_proj). Единственный кандидат на этом
+        # участке -- нормализация q/k. jnp.linalg.norm(x) САМ ПО СЕБЕ имеет
+        # NaN-градиент РОВНО в x=0 (d‖x‖/dx = x/‖x‖, неопределённость 0/0) --
+        # прибавление +eps в форвард-делении (q/(‖q‖+eps)) защищает ТОЛЬКО
+        # forward-деление, backward самого jnp.linalg.norm() эту особенность
+        # не лечит вообще. Если silu(conv(...)) даёт точный или почти точный
+        # нулевой вектор для каких-то токенов/каналов -- невидимо в forward
+        # (там всё гладко благодаря +eps), но backward взрывается в NaN.
+        # Прямая проверка (jax.vjp на x=jnp.zeros(4)): текущая формула даёт
+        # grad=[nan,nan,nan,nan]; rsqrt(sum(x^2)+eps^2) даёт конечный (хоть
+        # и большой, ~1e6 у сингулярности) градиент везде, включая x=0.
+        # Оборачиваем дополнительно в grad_sanitizer (тот же приём, что для
+        # mla_flash_attn_out) -- большой-но-конечный градиент у сингулярности
+        # всё ещё стоит подрезать, чтобы не разгонять его дальше по conv/Dense.
+        def _safe_normalize(t):
+            return t * jax.lax.rsqrt(jnp.sum(t * t, axis=-1, keepdims=True) + eps ** 2)
+
+        q = make_grad_sanitizer("gdn2_q_normalize")(_safe_normalize(q))
+        k = make_grad_sanitizer("gdn2_k_normalize")(_safe_normalize(k))
 
         b_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="erase_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
         w_gate = jax.nn.sigmoid(nn.Dense(d, use_bias=True, name="write_gate", dtype=jnp.bfloat16)(x)).reshape(b, l, n_heads, d_head)
