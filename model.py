@@ -713,6 +713,10 @@ class BlockDARLayer(nn.Module):
         )
         mixed = make_grad_probe(f"block{self.layer_idx}_intra_out")(mixed)
 
+        # ФИКС: нормализация перед рекуррентным/внимательным саблеером
+        # Убирает разогретый residual (1032+) на вход в Mamba2/GDN2/MLA
+        mixed = nn.RMSNorm(epsilon=1e-6, name="pre_sublayer_norm")(mixed)
+
         delta = SpecializedSublayer(
             cfg=self.cfg, layer_type=self.layer_type, name="sublayer"
         )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
@@ -768,8 +772,7 @@ class BlockDARLayer(nn.Module):
         delta = jnp.nan_to_num(jnp.clip(delta, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return delta
-
-
+                       
 class BlockDAR(nn.Module):
     cfg: ModelConfig
     block_idx: int
