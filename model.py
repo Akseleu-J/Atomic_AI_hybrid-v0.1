@@ -717,7 +717,7 @@ class BlockDAR(nn.Module):
             jax.lax.cond(
                 cx_abs_max > 1e2,
                 lambda: jax.debug.print(
-                    "[RESID-DIAG] ⚠️ current_x после layer={l} (block={b}) max|abs|={m:.3e} "
+                    "[RESID-DIAG] ⚠️ current_x после layer={l} (block={b}) max|abs|={m} "
                     "ДО санитизации -- дрейф residual stream", b=self.block_idx, l=layer_idx, m=cx_abs_max,
                 ),
                 lambda: None,
