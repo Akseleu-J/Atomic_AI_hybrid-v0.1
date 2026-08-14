@@ -682,6 +682,24 @@ class BlockDARLayer(nn.Module):
         )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
           deterministic=deterministic, rngs=rngs)
 
+        # ФИКС (найдено по инциденту, где sublayer_out_layer16_gdn2 САМ был
+        # non-finite -- т.е. входящий градиент уже испорчен ДО backward
+        # самого GDN-2/Mamba2/MLA, в отличие от предыдущего инцидента, где
+        # ломалась именно нормализация q/k ВНУТРИ sublayer'а). delta имеет
+        # широкий fan-out: current_x (этот блок), local_deltas ->
+        # IntraBlockAttention для СЛЕДУЮЩИХ слоёв ЭТОГО блока, и, самое
+        # далекобойное, history_blocks -> HybridDARAttention ВСЕХ будущих
+        # блоков. Градиент от всех этих потребителей суммируется в одну
+        # точку (dL/ddelta) -- если хотя бы один из многих путей даёт NaN,
+        # сумма NaN. make_grad_sanitizer здесь чистит именно эту
+        # аккумулированную точку ДО того, как она уходит в backward самого
+        # sublayer'а (аналитический B1-B6 chain для gdn2 -- наиболее хрупкий
+        # участок, т.к. это ручной VJP, не автодифф). Ставится МЕЖДУ
+        # SpecializedSublayer и диагностическим probe ниже -- probe
+        # по-прежнему видит сырую (незачищенную) картину для диагностики,
+        # сама защита работает на уровень глубже.
+        delta = make_grad_sanitizer(f"delta_fanin_layer{self.layer_idx}_{self.layer_type}")(delta)
+
         # ДИАГНОСТИКА (найдено по инцидентам 1067/1142: forward теперь
         # ПОЛНОСТЬЮ конечен -- ни одного [FWD-DIAG] -- а backward всё равно
         # даёт non-finite. Существующий пробник intra_out висит на ВХОДЕ в
