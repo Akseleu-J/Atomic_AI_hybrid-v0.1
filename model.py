@@ -661,6 +661,20 @@ class BlockDARLayer(nn.Module):
         )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
           deterministic=deterministic, rngs=rngs)
 
+        # ДИАГНОСТИКА (найдено по инцидентам 1067/1142: forward теперь
+        # ПОЛНОСТЬЮ конечен -- ни одного [FWD-DIAG] -- а backward всё равно
+        # даёт non-finite. Существующий пробник intra_out висит на ВХОДЕ в
+        # sublayer и загорается каскадом по всем блокам через
+        # HybridDARAttention -- не локализует. Этот пробник -- на ВЫХОДЕ
+        # sublayer'а (до клипа delta), с тегом layer_type+layer_idx -- если
+        # входящий градиент здесь уже non-finite, проблема НИЖЕ по потоку
+        # (IntraBlockAttention/HybridDARAttention/следующие слои); если
+        # здесь finite, а intra_out дальше внутри ЭТОГО ЖЕ layer/backward
+        # (см. отдельный tag) -- non-finite, значит проблема ВНУТРИ
+        # backward самого sublayer'а (B1-B6 аналитический chain для gdn2,
+        # associative_scan для mamba2, или custom VJP flash-attention).
+        delta = make_grad_probe(f"sublayer_out_layer{self.layer_idx}_{self.layer_type}")(delta)
+
         # ФИКС (подтверждено логом инцидента на шаге 943 -- без этого клипа
         # delta от layer13/mamba2 достигала ~6.25e8, а от layer14/gdn2 --
         # ~5.3e6, ОБЕ поверх current_x, который уже был ограничен фиксом #1
