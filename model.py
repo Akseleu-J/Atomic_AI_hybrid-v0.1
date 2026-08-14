@@ -312,14 +312,26 @@ class Mamba2J(nn.Module):
             nn.Dense(d_inner, use_bias=True, name="dt_proj", dtype=jnp.bfloat16)(x_bc)
         )
 
-        # ФИКС: clip с сохранением dtype
-        dt = jnp.clip(dt, jnp.array(1e-2, dtype=dt.dtype), jnp.array(1.0, dtype=dt.dtype))
+        # ФИКС: dt ∈ [0.01, 1.0] — не даём SSM-шагу быть ни слишком маленьким
+        # (иначе dA→1, нет decay), ни гигантским. Сохраняем dtype.
+        dt = jnp.clip(
+            dt,
+            jnp.array(1e-2, dtype=dt.dtype),
+            jnp.array(1.0, dtype=dt.dtype),
+        )
 
         dA_exponent = jnp.nan_to_num(
             jnp.einsum("bld,d->bld", dt, A), nan=0.0, posinf=0.0, neginf=-20.0
         )
         dA = jnp.exp(dA_exponent)
-        dA = jnp.clip(dA, jnp.array(0.0, dtype=dA.dtype), jnp.array(0.99, dtype=dA.dtype))
+
+        # ФИКС: потолок на decay — минимум 1% забывания за шаг.
+        # При chunk_size=256 это даёт (0.99)^256 ≈ 0.08.
+        dA = jnp.clip(
+            dA,
+            jnp.array(0.0, dtype=dA.dtype),
+            jnp.array(0.99, dtype=dA.dtype),
+        )
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
@@ -339,11 +351,12 @@ class Mamba2J(nn.Module):
             t = t.reshape(b, num_chunks, chunk_size, *trailing)
             return jnp.moveaxis(t, 1, 0)
 
-        def _sanitize(t):
-            c = jnp.array(1e3, dtype=t.dtype)
-            return jnp.clip(
-                jnp.nan_to_num(t, nan=0.0, posinf=1e3, neginf=-1e3),
-                -c, c
+        # ФИКС: jnp.clip(t, -1e3, 1e3) с Python float upcast'ит bfloat16 → float32.
+        # Используем bound той же разрядности, что и тензор.
+        def _sanitize(t, bound=1e3):
+            b = jnp.array(bound, dtype=t.dtype)
+            return jnp.nan_to_num(
+                jnp.clip(t, -b, b), nan=0.0, posinf=float(b), neginf=-float(b)
             )
 
         dA, dt, B, C, x_conv = map(_sanitize, (dA, dt, B, C, x_conv))
@@ -357,35 +370,25 @@ class Mamba2J(nn.Module):
         carry_da_init = jnp.ones((b, d_inner), dtype=x.dtype)
         carry_h_init = jnp.zeros((b, d_inner, d_state), dtype=x.dtype)
 
-        def _sanitize_scan_val(x, clip=1e4):
-            c = jnp.array(clip, dtype=x.dtype)
-            return jnp.clip(
-                jnp.nan_to_num(x, nan=0.0, posinf=float(clip), neginf=-float(clip)),
-                -c, c
-            )
-
         def _chunk_step(carry, chunk_inputs):
             carry_da, carry_h = carry
             da_c, dt_c, B_c, C_c, xconv_c = chunk_inputs
 
             dB_c = jnp.einsum("bcd,bcs->bcds", dt_c, B_c)
-            c1k = jnp.array(1e3, dtype=dB_c.dtype)
-            dB_c = jnp.clip(dB_c, -c1k, c1k)
+            # ФИКС: dB_c не должен взрываться до 2000+
+            bound_db = jnp.array(1e3, dtype=dB_c.dtype)
+            dB_c = jnp.clip(dB_c, -bound_db, bound_db)
 
             C_input_c = dB_c * xconv_c[..., None]
-            C_input_c = _sanitize_scan_val(C_input_c)
 
             P_local, S_local = jax.lax.associative_scan(
                 _combine, (da_c, C_input_c), axis=1
             )
-            S_local = _sanitize_scan_val(S_local)
 
             global_da = P_local * carry_da[:, None, :]
             global_h = P_local[..., None] * carry_h[:, None, :, :] + S_local
-            global_h = _sanitize_scan_val(global_h)
 
             y_c = jnp.einsum("bcds,bcs->bcd", global_h, C_c)
-            y_c = _sanitize_scan_val(y_c)
 
             new_carry = (global_da[:, -1], global_h[:, -1])
             return new_carry, y_c
@@ -400,8 +403,9 @@ class Mamba2J(nn.Module):
         y = jnp.moveaxis(y_chunks, 0, 1).reshape(b, l, d_inner)
 
         out = y * jax.nn.silu(res)
-        c10k = jnp.array(1e4, dtype=out.dtype)
-        out = jnp.clip(out, -c10k, c10k)
+        # ФИКС: финальный клип на выход Mamba2J
+        bound_out = jnp.array(1e4, dtype=out.dtype)
+        out = jnp.clip(out, -bound_out, bound_out)
 
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out)
 # ==========================================
