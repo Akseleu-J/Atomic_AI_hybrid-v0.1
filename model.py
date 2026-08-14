@@ -356,15 +356,35 @@ class Mamba2J(nn.Module):
             dB_c = jnp.einsum("bcd,bcs->bcds", dt_c, B_c)
             C_input_c = dB_c * xconv_c[..., None]
 
+            # --- ДИАГНОСТИКА: смотрим, что пришло в scan ---
+            jax.debug.print("[MAMBA2-WATCH] da_c: min={mn} max={mx} (min близко к 1.0 = почти нет decay)",
+                             mn=jnp.min(da_c), mx=jnp.max(da_c))
+            jax.debug.print("[MAMBA2-WATCH] dB_c max|abs|={m}", m=jnp.max(jnp.abs(dB_c)))
+            jax.debug.print("[MAMBA2-WATCH] C_input_c max|abs|={m}", m=jnp.max(jnp.abs(C_input_c)))
+
             P_local, S_local = jax.lax.associative_scan(_combine, (da_c, C_input_c), axis=1)
+
+            jax.debug.print("[MAMBA2-WATCH] P_local max|abs|={m}  (произведение decay по чанку)",
+                             m=jnp.max(jnp.abs(P_local)))
+            jax.debug.print("[MAMBA2-WATCH] S_local max|abs|={m}  (накопленный по чанку C_input)",
+                             m=jnp.max(jnp.abs(S_local)))
 
             global_da = P_local * carry_da[:, None, :]
             global_h = P_local[..., None] * carry_h[:, None, :, :] + S_local
 
+            jax.debug.print("[MAMBA2-WATCH] global_h max|abs|={m}", m=jnp.max(jnp.abs(global_h)))
+
             y_c = jnp.einsum("bcds,bcs->bcd", global_h, C_c)
+            jax.debug.print("[MAMBA2-WATCH] y_c (итоговый выход scan) max|abs|={m}", m=jnp.max(jnp.abs(y_c)))
+
             new_carry = (global_da[:, -1], global_h[:, -1])
             return new_carry, y_c
 
+        _chunk_step = jax.checkpoint(_chunk_step)
+
+        _, y_chunks = jax.lax.scan(
+            _chunk_step, (carry_da_init, carry_h_init), (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch)
+        )
         _chunk_step = jax.checkpoint(_chunk_step)
 
         _, y_chunks = jax.lax.scan(
