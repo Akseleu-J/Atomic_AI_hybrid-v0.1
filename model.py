@@ -301,43 +301,37 @@ class Mamba2J(nn.Module):
         )
         x_conv = jax.nn.silu(res_conv + conv_b[None, None, :].astype(x_bc.dtype))
 
-        A_log_safe = jnp.clip(
-            self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,)),
-            -20.0, 20.0
-        )
+        # ФИКС: тот же inf*0=nan риск, что и в GDN-2 decay -- если A_log
+        # уйдёт в большое положительное значение, exp(A_log) переполняется в
+        # inf, A=-inf; если dt в какой-то позиции округлится до 0 в bf16,
+        # dt*A = 0*(-inf) = nan. Клипаем A_log перед exp и санитизируем
+        # итоговый показатель степени перед exp.
+        A_log_safe = jnp.clip(self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,)), -20.0, 20.0)
         A = -jnp.exp(A_log_safe).astype(x.dtype)
         B = nn.Dense(d_state, use_bias=False, name="B_proj", dtype=jnp.bfloat16)(x_bc)
         C = nn.Dense(d_state, use_bias=False, name="C_proj", dtype=jnp.bfloat16)(x_bc)
-        dt = jax.nn.softplus(
-            nn.Dense(d_inner, use_bias=True, name="dt_proj", dtype=jnp.bfloat16)(x_bc)
-        )
+        dt = jax.nn.softplus(nn.Dense(d_inner, use_bias=True, name="dt_proj", dtype=jnp.bfloat16)(x_bc))
 
-        # ФИКС: dt ∈ [0.01, 1.0] — не даём SSM-шагу быть ни слишком маленьким
-        # (иначе dA→1, нет decay), ни гигантским. Сохраняем dtype.
-        dt = jnp.clip(
-            dt,
-            jnp.array(1e-2, dtype=dt.dtype),
-            jnp.array(1.0, dtype=dt.dtype),
-        )
+        # ФИКС #1: dt-коридор. Если dt микроскопический (округляется к 0 в
+        # bf16), dA = exp(dt*A) -> 1, decay фактически отсутствует, и state
+        # копит бесконечность через associative_scan. Если dt гигантский --
+        # SSM делает неадекватно большой шаг за один токен. Ограничиваем
+        # разумным коридором [1e-2, 1.0] до того, как dt участвует в
+        # dA_exponent.
+        dt = jnp.clip(dt, jnp.array(1e-2, dtype=dt.dtype), jnp.array(1.0, dtype=dt.dtype))
 
-        dA_exponent = jnp.nan_to_num(
-            jnp.einsum("bld,d->bld", dt, A), nan=0.0, posinf=0.0, neginf=-20.0
-        )
+        dA_exponent = jnp.nan_to_num(jnp.einsum("bld,d->bld", dt, A), nan=0.0, posinf=0.0, neginf=-20.0)
         dA = jnp.exp(dA_exponent)
-
-        # ФИКС: потолок на decay — минимум 1% забывания за шаг.
-        # При chunk_size=256 это даёт (0.99)^256 ≈ 0.08.
-        dA = jnp.clip(
-            dA,
-            jnp.array(0.0, dtype=dA.dtype),
-            jnp.array(0.99, dtype=dA.dtype),
-        )
+        # ФИКС #2 (главный тормоз): даже при "плохих" весах decay не может
+        # приближаться к 1 -- иначе на chunk_size=256 произведение decay по
+        # чанку почти не затухает и state растёт неограниченно.
+        # 0.99**256 ~= 0.08 -- гарантирует, что state забывает старое внутри
+        # одного чанка независимо от того, что выучили A_log/dt_proj.
+        dA = jnp.clip(dA, jnp.array(0.0, dtype=dA.dtype), jnp.array(0.99, dtype=dA.dtype))
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
-            raise ValueError(
-                f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}."
-            )
+            raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
         num_chunks = l // chunk_size
 
         def _combine(state1, state2):
@@ -351,13 +345,18 @@ class Mamba2J(nn.Module):
             t = t.reshape(b, num_chunks, chunk_size, *trailing)
             return jnp.moveaxis(t, 1, 0)
 
-        # ФИКС: jnp.clip(t, -1e3, 1e3) с Python float upcast'ит bfloat16 → float32.
-        # Используем bound той же разрядности, что и тензор.
-        def _sanitize(t, bound=1e3):
-            b = jnp.array(bound, dtype=t.dtype)
-            return jnp.nan_to_num(
-                jnp.clip(t, -b, b), nan=0.0, posinf=float(b), neginf=-float(b)
-            )
+        # ФИКС: та же санитизация-рубеж, что и в GDN-2 -- независимо от
+        # источника nan/inf выше по графу (A_log/exp, dt/softplus, B/C
+        # проекции), гарантируем, что в рекуррентный scan всегда приходят
+        # конечные значения.
+        def _sanitize(t):
+            # ФИКС #4: явный bound той же разрядности, что и t. Голый
+            # Python-scalar в jnp.clip обычно ок, но внутри associative_scan
+            # смешение carry/init разной разрядности (bf16 vs fp32-scalar
+            # default) может дать TypeError на некоторых backend'ах --
+            # закрываем это явным bound с astype под dtype самого t.
+            bound = jnp.array(1e3, dtype=t.dtype)
+            return jnp.nan_to_num(jnp.clip(t, -bound, bound), nan=0.0, posinf=1e3, neginf=-1e3)
 
         dA, dt, B, C, x_conv = map(_sanitize, (dA, dt, B, C, x_conv))
 
@@ -375,15 +374,14 @@ class Mamba2J(nn.Module):
             da_c, dt_c, B_c, C_c, xconv_c = chunk_inputs
 
             dB_c = jnp.einsum("bcd,bcs->bcds", dt_c, B_c)
-            # ФИКС: dB_c не должен взрываться до 2000+
-            bound_db = jnp.array(1e3, dtype=dB_c.dtype)
-            dB_c = jnp.clip(dB_c, -bound_db, bound_db)
-
+            # ФИКС #3: dB_c -- это input gate, записывающий сигнал в state за
+            # один шаг. Диагностика на реальном прогоне ловила dB_c до ~2384
+            # -- клип здесь бьёт именно по источнику того выброса, до того
+            # как он попадёт в C_input_c/associative_scan.
+            dB_c = jnp.clip(dB_c, jnp.array(-1e3, dtype=dB_c.dtype), jnp.array(1e3, dtype=dB_c.dtype))
             C_input_c = dB_c * xconv_c[..., None]
 
-            P_local, S_local = jax.lax.associative_scan(
-                _combine, (da_c, C_input_c), axis=1
-            )
+            P_local, S_local = jax.lax.associative_scan(_combine, (da_c, C_input_c), axis=1)
 
             global_da = P_local * carry_da[:, None, :]
             global_h = P_local[..., None] * carry_h[:, None, :, :] + S_local
@@ -396,18 +394,19 @@ class Mamba2J(nn.Module):
         _chunk_step = jax.checkpoint(_chunk_step)
 
         _, y_chunks = jax.lax.scan(
-            _chunk_step,
-            (carry_da_init, carry_h_init),
-            (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch),
+            _chunk_step, (carry_da_init, carry_h_init), (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch)
         )
         y = jnp.moveaxis(y_chunks, 0, 1).reshape(b, l, d_inner)
 
         out = y * jax.nn.silu(res)
-        # ФИКС: финальный клип на выход Mamba2J
-        bound_out = jnp.array(1e4, dtype=out.dtype)
-        out = jnp.clip(out, -bound_out, bound_out)
-
+        # ФИКС #5: последний рубеж перед residual stream -- даже если весь
+        # scan остался конечным, финальное умножение y*silu(res) может дать
+        # усиление (оба множителя уже прошли клип по отдельности, но их
+        # произведение -- нет). Не пускаем большие значения в out_proj/residual.
+        out = jnp.clip(out, jnp.array(-1e4, dtype=out.dtype), jnp.array(1e4, dtype=out.dtype))
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out)
+
+
 # ==========================================
 # Gated DeltaNet-2 (GDN-2)
 # ==========================================
@@ -768,7 +767,7 @@ class BlockDARLayer(nn.Module):
         delta = jnp.nan_to_num(jnp.clip(delta, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return delta
-                       
+
 class BlockDAR(nn.Module):
     cfg: ModelConfig
     block_idx: int
