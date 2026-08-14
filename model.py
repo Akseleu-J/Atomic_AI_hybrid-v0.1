@@ -690,8 +690,41 @@ class BlockDAR(nn.Module):
                 lambda: None,
             )
 
+            # ФИКС (найдено по логу инцидента на шаге 780, см. переписку /
+            # HANDOFF: единственная non-finite точка -- block=4 layer=14
+            # gdn2 -- каскадом ломает ВСЁ, что идёт после неё, вплоть до
+            # backward-градиентов на layer=0). Причина: residual stream
+            # current_x был ЕДИНСТВЕННЫМ местом во всём проекте без
+            # clip/nan_to_num -- только finite-диагностика, ничего активно
+            # не чинящая. В отличие от него параметры (train.py, клип ±1e2
+            # после apply_updates), входы GDN-2/Mamba2 (клип ±1e3 внутри
+            # каждого модуля), градиенты на границе custom_vjp (клип ±1e4)
+            # -- все защищены. current_x накапливается через 18 сложений
+            # (6 блоков x 3 слоя) без единого ограничения -- один
+            # большой-но-конечный выброс (например, из Mamba2 после дрейфа
+            # весов на 780 шагах) уходит непосредственно на вход следующего
+            # слоя (bf16 nn.Dense в q_proj/k_proj/v_proj) ДО того, как
+            # собственная внутренняя санитизация этого слоя (клип ±1e3
+            # ПОСЛЕ conv+silu) вообще успевает сработать -- overflow
+            # происходит в первых же матмулах.
+            #
+            # Печатаем max|abs| ДО санитизации (не только finite/non-finite)
+            # -- чтобы на следующем прогоне видеть сам факт и величину
+            # дрейфа задолго до фактического overflow, а не только момент
+            # уже случившейся катастрофы.
+            _cx_next = current_x + delta
+            cx_abs_max = jnp.max(jnp.abs(jnp.nan_to_num(_cx_next, nan=0.0, posinf=0.0, neginf=0.0)))
+            jax.lax.cond(
+                cx_abs_max > 1e2,
+                lambda: jax.debug.print(
+                    "[RESID-DIAG] ⚠️ current_x после layer={l} (block={b}) max|abs|={m:.3e} "
+                    "ДО санитизации -- дрейф residual stream", b=self.block_idx, l=layer_idx, m=cx_abs_max,
+                ),
+                lambda: None,
+            )
+
             local_deltas.append(delta)
-            current_x = current_x + delta
+            current_x = jnp.nan_to_num(jnp.clip(_cx_next, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         block_delta = sum(local_deltas)
         new_history = jnp.concatenate(
@@ -708,7 +741,10 @@ class BlockDAR(nn.Module):
             lambda: None,
         )
 
-        output = current_x + moe_out
+        # ФИКС: тот же пробел на выходе блока -- output = current_x + moe_out
+        # был последним необработанным сложением residual stream перед тем,
+        # как результат уходит в history_blocks / следующий BlockDAR.
+        output = jnp.nan_to_num(jnp.clip(current_x + moe_out, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return output, new_history
 
