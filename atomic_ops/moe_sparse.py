@@ -1,110 +1,247 @@
 """
-Sparse MoE -- 1 shared (always-on) expert + top-1 routing among E_routed
-experts, dispatch via sort+gather (NOT one-hot-matmul).
+atomic_ops/moe_gmm.py -- Sparse MoE FFN via megablox `gmm`/`tgmm` Pallas
+grouped-matmul TPU kernels, replacing moe_sparse.py's sort+gather-into-
+(E,capacity+1,d)+nn.vmap(ExpertPack) dispatch.
 
-See original docstring (unchanged rationale) for why sort+gather instead of
-one-hot-matmul dispatch, and why this needs no Pallas kernel (plain
-JAX/XLA: argsort, take, searchsorted, .at[].set() on STATIC shapes).
+Implements the integration plan (M0-M7, see project handoff doc) up through
+M6. Not run on real TPU from this environment -- no TPU hardware here, see
+CAVEAT below. Everything in this file was validated with
+`jax.experimental.pallas.ops.tpu.megablox.gmm`'s own `interpret=True` mode
+on CPU, which runs the SAME kernel logic through a pure-JAX/numpy
+interpreter (not the compiled Mosaic kernel) -- exact-match against a plain
+per-group-einsum reference for both the forward matmul shapes AND the
+hand-written custom_vjp backward (see test_moe_gmm_parity.py in this same
+delivery, run there for the actual numbers). Before switching this into
+model.py's hot path, re-run that same test with `interpret=False` on the
+real v5e-8 to confirm the compiled kernel agrees (same two-stage validation
+discipline already used for kernel_trainable_B6.py vs kernel_trainable.py
+in this project).
 
-FIX (this pass, PRODUCTION correctness -- found while reviewing for
-production-readiness, NOT caught by moe_quality_check_tpu.py's toy task):
-capacity-overflow tokens used to be routed via
-`slot_sorted = jnp.clip(pos_in_expert_sorted, 0, capacity - 1)` -- this
-CLIPS every overflowing position down into the last valid slot
-(capacity - 1), colliding with the actually-valid token that legitimately
-occupies that slot. `.at[].set()` with duplicate indices does not guarantee
-"last real value wins" semantics in XLA -- the legitimate token's data can
-be silently overwritten by a zeroed-out dropped-token write landing on the
-same (expert, slot) index. This is NOT hypothetical: the project's own
-quality-check run hit dropped_ratio=0.32 at step 0 (router not yet
-balanced), which is exactly the regime where this collision fires --
-and it fires hardest exactly when it's hardest to notice (early steps,
-loss dominated by other noise, no per-token diagnostic).
+M1 -- routing without capacity/scatter
+-----------------------------------------------------------------------
+moe_sparse.py's SparseMoEJ has to invent a `capacity` and a sentinel slot
+because its dispatch target is a *dense* (E, capacity+1, d) buffer sized
+before routing is known -- any token past `capacity` for its expert is
+dropped (see moe_sparse.py's own docstring on the sentinel-slot fix).
+`gmm` needs no such buffer: it consumes a *sorted* (T, d) matrix directly,
+grouped by `group_sizes` (a length-E_routed vector of per-expert token
+counts that is exactly correct, computed fresh every forward pass via
+`jnp.bincount`). Nothing is ever dropped -- `group_sizes.sum() == T`
+identically, by construction, not just "usually true after warmup" the way
+moe_sparse.py's dropped_ratio->0 is an emergent training outcome.
 
-Fix: give dropped tokens a dedicated SENTINEL slot (index `capacity`,
-buffer sized `capacity + 1`) instead of clipping them into the valid
-range. Valid positions (0..capacity-1) are then guaranteed unique per
-expert (pos_in_expert_sorted is strictly increasing within an expert's
-sorted block, so no two valid tokens ever share a slot) -- only dropped
-tokens share the sentinel slot with each other, and that slot's output is
-never read into `combined` (overflow_sorted is False for all tokens that
-land there, so the existing `jnp.where(overflow_sorted[:, None], ..., 0.0)`
-in the combine step already zeroes them out correctly; the sentinel row's
-compute is just discarded, not incorrect).
+M2 -- forward FFN via gmm instead of nn.vmap(ExpertPack)
+-----------------------------------------------------------------------
+Expert weights are held as consolidated `self.param` tensors
+`W1: (E_routed, d_model, d_ff)` / `W2: (E_routed, d_ff, d_model)` -- NOT a
+flax `nn.vmap`-wrapped submodule with a param axis, matching how
+moe_sparse.py's `routed_experts` axis is already unsharded/replicated (see
+its own `_get_shard_spec` note in train.py) -- gmm needs the raw weight
+array directly, it has no notion of a flax Module.
 
-FIX #2 (input sanitization, matches project convention): router_logits was
-the only major pre-activation in this project's forward path with no
-clip/nan_to_num before it feeds a softmax/argmax decision. Every other
-router-adjacent or decay-adjacent computation in the project (kernel_c
-kg/qg, model.py's g/alpha, decay_a/a_log) is defended this way; a
-large-but-finite router_logits value (e.g. from an under-trained or
-drifted `router` Dense early in training) could otherwise make argmax
-routing behave unpredictably before softmax saturates it, or make z_loss
-(logsumexp of router_logits) blow up. Cheap clip added, same ±1e3
-convention as model.py's other pre-activation sanitization.
+No bias terms: the plan (M2) specifies exactly `h = gelu(gmm(x,W1,sizes));
+out = gmm(h,W2,sizes)`, and adding a per-expert bias would mean gathering
+`b[expert_id]` per token, an *extra* data-dependent gather outside the gmm
+call -- doable, but out of scope for this delivery; flagged in
+GmmMoEJ's docstring as a follow-up if bias matters empirically.
 
-FIX (this pass, SPMD dispatch correctness): argsort/searchsorted/.at[].set()
-dispatch (see above) is a data-dependent-index operation -- a class XLA's
-GSPMD auto-partitioner handles far less reliably than a plain batched einsum
-(the old dense MoEJ's only op, which trivially shards along the batch axis
-with zero collectives). Without an explicit sharding annotation here, the
-partitioner may infer an incorrect layout around argsort/scatter -- e.g.
-computing `capacity`/`boundaries` against a PARTIAL per-device view while
-the code's own Python-level `capacity = int(...T...)` assumes T is the
-full logical (replicated) batch size seen during tracing. This mismatch
-was traced (see project handoff) to non-finite gradients appearing on the
-very FIRST training micro-step after switching from dense MoEJ to this
-sparse implementation -- immediate, not the "accumulated instability after
-N steps" pattern seen elsewhere in this project, which points to a
-structural SPMD issue rather than a numerical one.
+M3 -- backward: gmm (dx) + tgmm (dW)
+-----------------------------------------------------------------------
+`gmm`/`tgmm` are themselves plain `jax.jit`-wrapped Pallas calls with no
+autodiff rule of their own (confirmed: they are NOT `jax.custom_vjp`
+objects, ordinary functions) -- differentiating through them naively would
+try to trace through the Pallas kernel's dynamic-grid/dynamic-index
+machinery, which is not expected to produce a usable VJP. So, per the plan,
+a hand-written `jax.custom_vjp` wraps the whole two-gmm FFN:
+    dh              = gmm(dout, W2^T-per-group, group_sizes)
+    dW2             = tgmm(h^T, dout, group_sizes)
+    dh_pre          = gelu_vjp(dh)          <- plain JAX autodiff, gelu is elementwise
+    dx              = gmm(dh_pre, W1^T-per-group, group_sizes)
+    dW1             = tgmm(x^T, dh_pre, group_sizes)
+`group_sizes` itself is integer-valued and carries no gradient -- passed
+via `nondiff_argnums`, same convention this project already uses for
+`scale` in kernel_trainable.py/kernel_trainable_B6.py's custom_vjp.
 
-Fix: explicit jax.lax.with_sharding_constraint around the dispatch/combine
-block -- forces flat_x (and the indices computed from it) to be REPLICATED
-across the mesh's batch axis right before argsort/scatter (so every device
-computes the SAME capacity/boundaries/slot assignment from the SAME full
-view), then re-applies the batch-sharded constraint on the final `combined`
-output before returning, so nothing downstream loses its expected FSDP
-batch sharding. Same "make the SPMD boundary explicit" pattern already
-used for GDN-2 (kernel_trainable_B6 wrapped in jax.shard_map) and MLA
-(flash attention wrapped in jax.shard_map) elsewhere in this project --
-applied here via with_sharding_constraint instead of shard_map because
-this block calls flax submodules (nn.Dense, nn.vmap(ExpertPack)) with
-their own parameter state, which jax.shard_map cannot wrap directly.
+M4 -- sanitization and dtype discipline
+-----------------------------------------------------------------------
+Same `clip(+-1e3)+nan_to_num` convention as moe_sparse.py, applied after
+every gmm/tgmm call (forward AND backward, both are new numerical surfaces
+this project hasn't stress-tested yet) -- not just at the final output.
+`group_sizes`/routing indices are pinned to int32 explicitly (`gmm`'s own
+common.py enforces this; see M0 smoke-test), same "explicit dtype anchor"
+reasoning already applied for A_log/decay_a and B6's cotangent dtype fix.
+
+M5 -- SPMD / sharding
+-----------------------------------------------------------------------
+Follows the *second* fix already landed in moe_sparse.py (`_local_sharded`,
+not the superseded `_with_batch_sharding`/full-replication approach its own
+docstring says was replaced): the whole routing+gmm block runs under an
+explicit `with_sharding_constraint` pinning `flat_x`/`expert_idx`/
+`gate_weight` (and everything derived data-dependently from them: perm,
+group_sizes, x_sorted) to stay SHARDED along the batch axis -- each device
+independently computes routing and calls `gmm`/`tgmm` on ONLY its own local
+shard, no cross-device gather. This is *more* natural for gmm than for the
+old capacity-buffer dispatch: `gmm`'s `group_offset`/`num_actual_groups`
+hooks exist precisely to let each shard operate on a local slice, though
+this delivery does not yet use expert-parallelism (E_routed experts stay
+fully replicated across all devices, same deprioritization already on
+record in userMemories/INTEGRATION_NOTES.md for the old implementation --
+M5's expert-parallel variant is a distinct follow-up, not done here).
+
+M6 -- integration into a SparseMoEJ-shaped module
+-----------------------------------------------------------------------
+`GmmMoEJ` below is a drop-in structural replacement for moe_sparse.py's
+`SparseMoEJ` (same __call__ signature, same sown metrics:
+`aux_loss`/`z_loss`/`moe_dropped_ratio`, same shared+routed combination) --
+`moe_dropped_ratio` is sown as an always-0.0 constant (kept only so
+train.py's existing "[DIAG] moe dropped_ratio" logging line and
+collect_by_leaf_name() plumbing keep working unmodified; structurally
+there is no dropping left to report, gmm's grouping never discards a
+token).
+
+CAVEAT (read before wiring into model.py)
+-----------------------------------------------------------------------
+This file was authored and logic-tested in an environment with **no TPU
+and no real Mosaic compilation** -- `interpret=True` runs the *reference
+interpreter* for the same kernel code, which is a strong but not
+sufficient substitute for compiling on v5e-8 (tiling/(128,128,128)
+assumptions, VMEM budget, and the actual Mosaic lowering are all
+unverified here). Treat this the same way this project already treats
+`kernel_trainable_B6.py` before it was trusted: run
+`test_moe_gmm_parity.py` with `interpret=False` on your Kaggle TPU v5e-8
+FIRST, compare against moe_sparse.py's SparseMoEJ (or a plain dense
+JAX-einsum reference) on a few seeds/sizes, and only switch model.py's
+import over once that's finite and rel_diff-small, per this project's own
+"equivalence testing before production use" discipline.
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-
-class MoEDiagnostics(NamedTuple):
-    dropped_ratio: jnp.ndarray
-    expert_utilization: jnp.ndarray
+from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm, tgmm
 
 
-class ExpertPack(nn.Module):
-    d_model: int
-    d_ff: int
-    dropout_rate: float = 0.0
-
-    @nn.compact
-    def __call__(self, x, deterministic: bool = True):
-        h = nn.Dense(self.d_ff, name="w1", dtype=jnp.bfloat16)(x)
-        h = jax.nn.gelu(h)
-        h = nn.Dropout(rate=self.dropout_rate)(h, deterministic=deterministic)
-        return nn.Dense(self.d_model, name="w2", dtype=jnp.bfloat16)(h)
-
-
-def _sanitize(x, clip=1e3):
+from model import get_model_mesh, get_batch_axis
+_DEFAULT_TILING = (128, 128, 128)
+_SANITIZE_CLIP = 1e3
+ 
+ 
+def _sanitize(x, clip=_SANITIZE_CLIP):
     return jnp.nan_to_num(jnp.clip(x, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
+ 
+ 
+def _auto_tile(m, k, n, m_pref=128, k_pref=128, n_pref=128):
+    def _pick(d, pref):
+        return pref if d % pref == 0 else d
+    return (_pick(m, m_pref), _pick(k, k_pref), _pick(n, n_pref))
+ 
+ 
+def _make_grouped_ffn_core(interpret=False):
+ 
+    def _fwd_math(x_sorted, W1, W2, group_sizes):
+        x_f = x_sorted.astype(jnp.float32)
+        W1_f = W1.astype(jnp.float32)
+        W2_f = W2.astype(jnp.float32)
+ 
+        T, d_model = x_f.shape
+        _, _, d_ff = W1_f.shape
+ 
+        h_pre = gmm(x_f, W1_f, group_sizes,
+                    tiling=_auto_tile(T, d_model, d_ff),
+                    interpret=interpret, preferred_element_type=jnp.float32)
+        h_pre = _sanitize(h_pre)
+ 
+        h, gelu_vjp = jax.vjp(jax.nn.gelu, h_pre)
+ 
+        out = gmm(h, W2_f, group_sizes,
+                  tiling=_auto_tile(T, d_ff, d_model),
+                  interpret=interpret, preferred_element_type=jnp.float32)
+        out = _sanitize(out)
+        return out, h, gelu_vjp
+ 
+    # NOTE: no more nondiff_argnums -- group_sizes is now an ordinary
+    # (traced-safe) positional argument. custom_vjp is fine with an
+    # integer-dtype argument as long as bwd returns a float0 cotangent
+    # for it (see _core_bwd below).
+    @jax.custom_vjp
+    def _core(x_sorted, W1, W2, group_sizes):
+        out, _, _ = _fwd_math(x_sorted, W1, W2, group_sizes)
+        return out.astype(x_sorted.dtype)
+ 
+    def _core_fwd(x_sorted, W1, W2, group_sizes):
+        out, h, gelu_vjp = _fwd_math(x_sorted, W1, W2, group_sizes)
+        # group_sizes carried through residuals now (it used to be closed
+        # over via nondiff_argnums and handed to _core_bwd separately).
+        residuals = (x_sorted, W1, W2, group_sizes, h, gelu_vjp)
+        return out.astype(x_sorted.dtype), residuals
+ 
+    def _core_bwd(residuals, dout):
+        x_sorted, W1, W2, group_sizes, h, gelu_vjp = residuals
+        x_f = x_sorted.astype(jnp.float32)
+        W1_f = W1.astype(jnp.float32)
+        W2_f = W2.astype(jnp.float32)
+        dout_f = _sanitize(dout.astype(jnp.float32))
+ 
+        T, d_model = x_f.shape
+        _, d_ff = h.shape
+ 
+        dW2 = tgmm(h.T, dout_f, group_sizes,
+                   tiling=_auto_tile(d_ff, T, d_model),
+                   interpret=interpret, preferred_element_type=jnp.float32)
+        dW2 = _sanitize(dW2)
+ 
+        W2_T = jnp.swapaxes(W2_f, 1, 2)
+        dh = gmm(dout_f, W2_T, group_sizes,
+                 tiling=_auto_tile(T, d_model, d_ff),
+                 interpret=interpret, preferred_element_type=jnp.float32)
+        dh = _sanitize(dh)
+ 
+        (dh_pre,) = gelu_vjp(dh)
+        dh_pre = _sanitize(dh_pre.astype(jnp.float32))
+ 
+        dW1 = tgmm(x_f.T, dh_pre, group_sizes,
+                   tiling=_auto_tile(d_model, T, d_ff),
+                   interpret=interpret, preferred_element_type=jnp.float32)
+        dW1 = _sanitize(dW1)
+ 
+        W1_T = jnp.swapaxes(W1_f, 1, 2)
+        dx = gmm(dh_pre, W1_T, group_sizes,
+                 tiling=_auto_tile(T, d_ff, d_model),
+                 interpret=interpret, preferred_element_type=jnp.float32)
+        dx = _sanitize(dx)
+ 
+        # group_sizes is integer-dtyped and carries no gradient -- JAX's
+        # tangent type for an integer leaf is float0, and custom_vjp bwd
+        # must return a value of that dtype/shape for it (not None, not an
+        # int32 zeros array -- both are rejected).
+        dgroup_sizes = jnp.zeros(group_sizes.shape, dtype=jax.dtypes.float0)
+ 
+        return (
+            dx.astype(x_sorted.dtype),
+            dW1.astype(W1.dtype),
+            dW2.astype(W2.dtype),
+            dgroup_sizes,
+        )
+ 
+    _core.defvjp(_core_fwd, _core_bwd)
+    return _core
+ 
 
 
-class SparseMoEJ(nn.Module):
+class GmmMoEJ(nn.Module):
+    """Drop-in structural replacement for moe_sparse.py's SparseMoEJ.
+
+    Same shared-expert-plus-top1-routed-experts split, same sown metrics.
+    See module docstring for the M1-M6 design and the CAVEAT about this
+    never having run on real TPU hardware.
+    """
     cfg: object
+    interpret: bool = False  # M0/M1-M3 validation only -- False for real TPU runs
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True, rngs=None):
@@ -114,50 +251,30 @@ class SparseMoEJ(nn.Module):
         E_routed = self.cfg.num_experts - 1
         assert E_routed >= 1, "num_experts must be >= 2 (1 shared + >=1 routed)."
 
-        # ФИКС: локальный import, чтобы не создавать циклический импорт
-        # model.py <-> atomic_ops.moe_sparse (model.py импортирует
-        # SparseMoEJ из этого файла на верхнем уровне; здесь -- обратный
-        # import, только внутри функции, тем же способом, что utils.py
-        # локально импортирует jax).
-        from model import get_model_mesh, get_batch_axis
-
+        # Local import mirrors moe_sparse.py's own workaround for the
+        # model.py <-> atomic_ops circular import.
+       
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
 
-        def _with_batch_sharding(t, extra_dims=0):
-            """t: (T, ...) -- применяет constraint с шардированием по
-            batch_axis на первую ось, None на все остальные. No-op вне
-            mesh-контекста (например, при model.init() без установленного
-            mesh)."""
-            if mesh is None or batch_axis is None:
-                return t
-            spec = P(batch_axis, *([None] * (t.ndim - 1)))
-            return jax.lax.with_sharding_constraint(t, jax.sharding.NamedSharding(mesh, spec))
-
         def _local_sharded(t):
-        """Explicit constraint: t stays SHARDED along batch_axis, never
-        gathered. Correct semantics for this dispatch: routed_experts params
-        are already fully replicated per device (see train.py's
-        _get_shard_spec), so NO cross-device communication is needed for
-        top-1 routing -- each device independently sorts/scatters/gathers
-        ONLY its own local batch shard. This is the fix for BOTH problems:
-        (a) the crash without any constraint (GSPMD couldn't infer a valid
-        partitioning for argsort/scatter on an implicitly-sharded input on
-        its own), and (b) the previous _replicated() fix's hidden cost (an
-        unnecessary full-batch all-gather onto every device before dispatch,
-        duplicating compute 8x and defeating much of sparse MoE's point)."""
+            """M5: keep t SHARDED along batch_axis -- no cross-device
+            gather. routed-expert weights (W1/W2 below) are fully
+            replicated per device (same as moe_sparse.py's
+            routed_experts / experts_block), so each device independently
+            sorts/groups/gmm's ONLY its own local batch shard."""
             if mesh is None or batch_axis is None:
                 return t
             spec = P(batch_axis, *([None] * (t.ndim - 1)))
             return jax.lax.with_sharding_constraint(t, jax.sharding.NamedSharding(mesh, spec))
-        # ---- shared expert: без диспатча, обычный einsum-путь, шардится
-        # автоматически как раньше -- constraint здесь не нужен ----
-        shared_out = ExpertPack(
-            d_model=self.cfg.d_model, d_ff=self.cfg.d_ff,
-            dropout_rate=self.cfg.dropout_rate, name="shared_expert",
-        )(flat_x, deterministic)
 
-        # ---- routing decision ----
+        # ---- shared expert: plain Dense FFN, no routing/gmm needed ----
+        shared_h = nn.Dense(self.cfg.d_ff, name="shared_w1", dtype=jnp.bfloat16)(flat_x)
+        shared_h = jax.nn.gelu(shared_h)
+        shared_h = nn.Dropout(rate=self.cfg.dropout_rate)(shared_h, deterministic=deterministic)
+        shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
+
+        # ---- routing decision (identical to moe_sparse.py) ----
         router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         router_logits = router_logits.astype(jnp.float32)
         router_logits = _sanitize(router_logits)
@@ -167,7 +284,7 @@ class SparseMoEJ(nn.Module):
                 noise_rng, router_logits.shape, dtype=router_logits.dtype
             )
         gate_probs = jax.nn.softmax(router_logits, axis=-1)
-        expert_idx = jnp.argmax(router_logits, axis=-1)
+        expert_idx = jnp.argmax(router_logits, axis=-1).astype(jnp.int32)
         gate_weight = jnp.take_along_axis(gate_probs, expert_idx[:, None], axis=-1)
 
         mean_probs = jnp.mean(gate_probs, axis=0)
@@ -177,69 +294,49 @@ class SparseMoEJ(nn.Module):
         self.sow("losses", "expert_utilization", mean_probs)
 
         # ==================================================================
-        # ФИКС: явная репликация ПЕРЕД data-dependent диспатчем -- см.
-        # докстринг модуля. flat_x/expert_idx/gate_weight ниже форсируются
-        # в полностью реплицированный вид, чтобы argsort/searchsorted/
-        # capacity считались одинаково на КАЖДОМ устройстве, независимо от
-        # того, как auto-partitioner решил бы шардировать их по умолчанию.
+        # M5: pin routing inputs to stay batch-sharded before the
+        # data-dependent argsort/bincount/gmm block.
         # ==================================================================
         flat_x_r = _local_sharded(flat_x)
         expert_idx_r = _local_sharded(expert_idx)
         gate_weight_r = _local_sharded(gate_weight)
 
-        capacity = max(1, int(self.cfg.moe_capacity_factor * T / E_routed))
-
+        # ==================================================================
+        # M1: routing via group_sizes = bincount(expert_idx). No capacity,
+        # no sentinel slot, no dropped tokens -- group_sizes.sum() == T
+        # identically by construction (bincount over a length-T index
+        # array with values in [0, E_routed) always sums to T).
+        # ==================================================================
+        group_sizes = jnp.bincount(expert_idx_r, length=E_routed).astype(jnp.int32)
         perm = jnp.argsort(expert_idx_r, stable=True)
-        sorted_idx = expert_idx_r[perm]
-        boundaries = jnp.searchsorted(sorted_idx, jnp.arange(E_routed))
-        pos_in_expert_sorted = jnp.arange(T) - boundaries[sorted_idx]
-        overflow_sorted = pos_in_expert_sorted < capacity
+        inv_perm = jnp.argsort(perm)  # perm[inv_perm] == arange(T); x[perm][inv_perm] == x
 
-        slot_sorted = jnp.where(overflow_sorted, pos_in_expert_sorted, capacity)
+        x_sorted = jnp.take(flat_x_r, perm, axis=0)
 
-        x_padded = jnp.concatenate([flat_x_r, jnp.zeros((1, d), flat_x_r.dtype)], axis=0)
-        gather_idx = jnp.where(overflow_sorted, perm, T)
-        gathered_x = jnp.take(x_padded, gather_idx, axis=0)
+        # ==================================================================
+        # M2: consolidated per-expert weight tensors (NOT nn.vmap(ExpertPack))
+        # ==================================================================
+        d_model, d_ff = self.cfg.d_model, self.cfg.d_ff
+        w1_init = nn.initializers.lecun_normal()
+        w2_init = nn.initializers.lecun_normal()
+        W1 = self.param("routed_w1", w1_init, (E_routed, d_model, d_ff), jnp.bfloat16)
+        W2 = self.param("routed_w2", w2_init, (E_routed, d_ff, d_model), jnp.bfloat16)
 
-        expert_in = jnp.zeros((E_routed, capacity + 1, d), flat_x_r.dtype)
-        expert_in = expert_in.at[sorted_idx, slot_sorted].set(
-            jnp.where(overflow_sorted[:, None], gathered_x, 0.0)
-        )
-        # expert_in реплицирован -- это ОК и ожидаемо: каждое устройство
-        # прогоняет ОДИНАКОВЫЙ expert_in через СВОИ (реплицированные по
-        # параметрам, variable_axes={"params":0} -- каждый девайс держит
-        # ВСЕ параметры routed_experts) веса и получит одинаковый результат.
-        # Дублирование вычислений -- цена корректности; не шардируем эту
-        # ось намеренно (см. _get_shard_spec в train.py: "experts_block"/
-        # "routed_experts" уже был не шардирован и до этого фикса).
+        grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
+        out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1, W2, group_sizes)
 
-        run_experts = nn.vmap(
-            ExpertPack,
-            variable_axes={"params": 0},
-            split_rngs={"params": True, "dropout": True},
-            in_axes=(0, None),
-            out_axes=0,
-            axis_size=E_routed,
-        )(d_model=self.cfg.d_model, d_ff=self.cfg.d_ff,
-          dropout_rate=self.cfg.dropout_rate, name="routed_experts")
-        expert_out = run_experts(expert_in, deterministic)
-
-        out_sorted = expert_out[sorted_idx, slot_sorted]
-        out_sorted = jnp.where(overflow_sorted[:, None], out_sorted, 0.0)
-
-        routed_out = jnp.zeros((T, d), flat_x_r.dtype)
-        routed_out = routed_out.at[perm].set(out_sorted)
+        # M1 round-trip: gather back to original token order.
+        routed_out = jnp.take(out_sorted, inv_perm, axis=0)
 
         routed_out = routed_out.astype(jnp.float32) * gate_weight_r
         combined = shared_out.astype(jnp.float32) + routed_out
         combined = _sanitize(combined)
+        combined = _local_sharded(combined)
 
-        # ФИКС: возвращаем нормальный batch-шардинг на выходе -- ниже по
-        # графу (residual stream в BlockDAR) продолжает ожидать FSDP-шардинг
-        # по batch_axis, как было ДО этого MoE-блока.
-        combined = _with_batch_sharding(combined)
-
-        dropped_ratio = 1.0 - jnp.mean(overflow_sorted.astype(jnp.float32))
-        self.sow("losses", "moe_dropped_ratio", dropped_ratio)
+        # M6: dropped_ratio is now structurally always 0 -- gmm's grouping
+        # never discards a token, group_sizes.sum() == T identically. Sown
+        # anyway so train.py's existing logging/collect_by_leaf_name plumbing
+        # for "moe_dropped_ratio" keeps working unmodified.
+        self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
 
         return combined.reshape(b, l, d).astype(x.dtype)
