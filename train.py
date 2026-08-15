@@ -39,7 +39,7 @@ except ImportError:
 # следите за первыми 2-3 циклами и увеличьте интервал, если запись занимает
 # больше половины интервала (иначе TPU будет простаивать в ожидании I/O больше,
 # чем считать).
-CHECKPOINT_EVERY_SECONDS = 20 * 60
+CHECKPOINT_EVERY_SECONDS = 27 * 60
 
 # ФИКС: автостоп при частых non-finite градиентах. Раньше скрипт тихо
 # пропускал битые шаги и полз дальше сколько угодно -- на долгом фоновом
@@ -57,7 +57,7 @@ NONFINITE_CONSECUTIVE_LIMIT = 4
 NONFINITE_WINDOW_SIZE = 15
 NONFINITE_WINDOW_RATIO = 0.25
 
-SESSION_TIME_BUDGET_SECONDS = 8 * 3600 - 15 * 60  # 9 часов минус запас на graceful stop
+SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 15 * 60  # 9 часов минус запас на graceful stop
 
 # ФИКС: 4 именованных слота на HF вместо "последние N" -- защищает от того,
 # что один плохой шаг (как на 414-м) перезатирает единственную сохранённую
@@ -73,6 +73,8 @@ HF_LATEST_KEEP_N = 1  # ФИКС: было 2 -- со слотами best_train/b
 DATASET_FRACTION = 1
 DATASET_FRACTION_SEED = 777
 
+# ПАТЧ: глобальный словарь для отслеживания асинхронных сохранений
+_PENDING_SAVES = {}
 
 # ==========================================================================
 # ФИКС от гонки на шаге 414: enable_async_checkpointing=False.
@@ -86,12 +88,13 @@ DATASET_FRACTION_SEED = 777
 # делает эту гонку структурно невозможной ценой простоя TPU во время записи.
 # ==========================================================================
 
+# ПАТЧ: make_manager — включить async
 def make_manager(local_dir, max_to_keep):
     os.makedirs(local_dir, exist_ok=True)
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
-        enable_async_checkpointing=False,
+        enable_async_checkpointing=True,   # ПАТЧ: было False
     )
     return ocp.CheckpointManager(local_dir, ocp.StandardCheckpointer(), options)
 
@@ -156,6 +159,98 @@ def save_slot(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, be
     print(f"[CKPT] Сохранён локально: {local_dir}/{step} (заняло {elapsed:.1f}с)")
     return elapsed
 
+# ========================== ПАТЧ: новые асинхронные функции ==========================
+# ФИКС (переход на async для периодического 'latest'-сейва): гонка
+# donate_argnums, из-за которой раньше стоял enable_async_checkpointing=False,
+# устраняется тем, что фоновый writer работает НЕ с live-буферами params/
+# opt_state (которые донируются следующему compiled_apply), а с их
+# независимой device-side копией (jnp.array(..., copy=True)). Копирование
+# само по себе быстрое (device-to-device, не диск) и делается синхронно
+# ЗДЕСЬ -- медленная часть (запись на /kaggle/working, наблюдавшиеся ~300с)
+# уходит в фон, не блокируя TPU.
+#
+# Используется ТОЛЬКО для периодического 'latest'-сейва во время обучения
+# (единственное место, где скорость реально важна -- срабатывает часто).
+# best_train/best_val/emergency/auto-stop/session-limit/epoch-end остаются
+# на синхронном save_slot() -- эти пути редкие, и там важнее гарантия "уже
+# на диске", чем несколько секунд экономии.
+
+def _finalize_pending_save(mngr):
+    """Дожидается фоновой записи (если есть), проверяет что файлы реально
+    появились на диске, пишет metadata.json. No-op (возвращает None), если
+    для этого mngr ничего не в процессе. ОБЯЗАТЕЛЬНО вызывать перед любым
+    следующим save() на том же mngr (orbax не документирует поведение при
+    перекрывающихся async-сохранениях на одном CheckpointManager) и перед
+    выходом из процесса (иначе фоновый writer может быть убит на середине
+    записи -- ровно та порча, от которой изначально стоял sync-режим)."""
+    key = id(mngr)
+    pending = _PENDING_SAVES.pop(key, None)
+    if pending is None:
+        return None
+
+    mngr.wait_until_finished()
+    elapsed = time.perf_counter() - pending["t0"]
+
+    step_dir = os.path.join(pending["local_dir"], str(pending["step"]))
+    os.makedirs(step_dir, exist_ok=True)
+    if not os.listdir(step_dir):
+        du = shutil.disk_usage(pending["local_dir"])
+        raise RuntimeError(
+            f"async mngr.save() для шага {pending['step']} в {pending['local_dir']} не создал "
+            f"ожидаемых файлов после wait_until_finished(). Свободно на диске: "
+            f"{du.free / 1e9:.2f} ГБ из {du.total / 1e9:.2f} ГБ."
+        )
+
+    meta = {
+        "global_step": int(pending["step"]),
+        "epoch": int(pending["epoch"]),
+        "best_val_loss": float(pending["best_val_loss"]),
+        "best_train_loss": float(pending["best_train_loss"]),
+        "timestamp": time.time(),
+    }
+    if pending["train_loss"] is not None:
+        meta["train_loss"] = float(jax.device_get(pending["train_loss"]))
+    with open(os.path.join(step_dir, "metadata.json"), "w") as f:
+        json.dump(meta, f)
+
+    # ФИКС: elapsed здесь -- время от ЗАПУСКА до момента, когда мы решили
+    # проверить (может включать время, прошедшее в фоне за несколько
+    # последующих шагов обучения, если finalize вызван не сразу) -- не
+    # путать со старой метрикой "чистое время блокирующей записи".
+    print(f"[CKPT] ✅ Async-сейв подтверждён: {pending['local_dir']}/{pending['step']} "
+          f"(от запуска до подтверждения прошло {elapsed:.1f}с, включая параллельно шедшее обучение)")
+    return pending
+
+def save_slot_async(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, best_train_loss, train_loss=None):
+    """Запускает async-сейв на НЕЗАВИСИМОЙ копии params/opt_state и сразу
+    возвращает управление -- TPU продолжает следующие шаги, пока диск пишется
+    в фоне. См. модульный комментарий выше про устранение гонки с
+    donate_argnums."""
+    _finalize_pending_save(mngr)  # завершить предыдущий async-сейв на этом mngr, если есть
+
+    params_snapshot = jax.block_until_ready(
+        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), params)
+    )
+    opt_state_snapshot = jax.block_until_ready(
+        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), opt_state)
+    )
+
+    try:
+        du = shutil.disk_usage(local_dir)
+        print(f"[CKPT] Диск перед async-сейвом: свободно {du.free / 1e9:.2f} ГБ из {du.total / 1e9:.2f} ГБ "
+              f"({100 * du.free / du.total:.1f}% свободно)")
+    except Exception as e_du:
+        print(f"[CKPT] ⚠️ Не удалось проверить место на диске: {e_du}")
+
+    t0 = time.perf_counter()
+    mngr.save(step, args=ocp.args.StandardSave({"params": params_snapshot, "opt_state": opt_state_snapshot}))
+    _PENDING_SAVES[id(mngr)] = dict(
+        step=step, local_dir=local_dir, epoch=epoch,
+        best_val_loss=best_val_loss, best_train_loss=best_train_loss,
+        train_loss=train_loss, t0=t0,
+    )
+    print(f"[CKPT] 🚀 Async-сейв запущен для шага {step} -- TPU продолжает без ожидания.")
+# ========================== КОНЕЦ ПАТЧА ==========================
 
 def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
     """Заливает {local_dir}/{step} -> HF под path_in_repo={repo_subdir}/{step},
@@ -1005,12 +1100,18 @@ def main_execution():
     nonfinite_window = deque(maxlen=NONFINITE_WINDOW_SIZE)
     _accum_window = deque(maxlen=accum_steps)
 
+    # ПАТЧ: изменённая _save_all_needed_slots с финализацией
     def _save_all_needed_slots(step, cur_train_loss_val, force_latest=True, tag="", skip_hf_upload=False):
         """Сохраняет 'latest' всегда; 'best_train' -- если побит рекорд train_loss.
         skip_hf_upload=True -- только локально, без сетевой заливки на HF (для
         случаев, когда важна скорость завершения, а не немедленная доступность
         чекпоинта на HF -- см. auto-stop по non-finite ниже)."""
         nonlocal best_train_loss
+        # ПАТЧ: финализируем любой незавершённый async-сейв 'latest'
+        finalized = _finalize_pending_save(mngr_latest)
+        if finalized is not None and not skip_hf_upload:
+            upload_slot(latest_dir, "latest", finalized["step"], "", keep_last_n=HF_LATEST_KEEP_N)
+
         if force_latest:
             save_slot(mngr_latest, latest_dir, step, params, opt_state, epoch, best_val_loss, best_train_loss, cur_train_loss_val)
             if not skip_hf_upload:
@@ -1148,10 +1249,22 @@ def main_execution():
                 global_step += 1
 
                 now = time.perf_counter()
+                # ПАТЧ: заменён блок периодического сохранения на асинхронный
                 if now - last_ckpt_time >= CHECKPOINT_EVERY_SECONDS:
-                    print(f"[CKPT] 💾 Цикл сохранения на шаге {global_step} (прошло {(now - last_ckpt_time)/60:.1f} мин)...")
-                    _save_all_needed_slots(global_step, train_loss, force_latest=True)
-                    last_ckpt_time = time.perf_counter()  # ФИКС: после реальной длительности сейва, не до
+                    # ФИКС: 'latest' теперь запускается асинхронно (см. save_slot_async) --
+                    # TPU не простаивает на время записи (~300с наблюдалось синхронно).
+                    # best_train проверяем отдельно, синхронно как раньше -- срабатывает
+                    # только на новый рекорд, не является узким местом.
+                    save_slot_async(mngr_latest, latest_dir, global_step, params, opt_state,
+                                    epoch, best_val_loss, best_train_loss, train_loss)
+                    tl = float(jax.device_get(train_loss))
+                    if tl < best_train_loss:
+                        best_train_loss = tl
+                        save_slot(mngr_best_train, best_train_dir, global_step, params, opt_state,
+                                  epoch, best_val_loss, best_train_loss, train_loss)
+                        upload_slot(best_train_dir, "best_train", global_step, f"train_loss={tl:.4f}", keep_last_n=1)
+                        print(f"[BEST_TRAIN] Новый лучший train_loss: {tl:.4f} на шаге {global_step}")
+                    last_ckpt_time = time.perf_counter()
 
                 elapsed_session = time.perf_counter() - session_start_time
                 if elapsed_session >= SESSION_TIME_BUDGET_SECONDS:
@@ -1187,14 +1300,6 @@ def main_execution():
                             f"           expert utilization std (max over layers, layer {worst_layer}): "
                             f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts - 1}"
                         )
-                    # ФИКС (интеграция SparseMoEJ): dropped_ratio -- главный
-                    # сигнал того, достаточен ли moe_capacity_factor на
-                    # реальных данных (не только на синтетическом toy-task
-                    # из moe_quality_check_tpu.py). Печатаем слой с
-                    # максимальным dropped_ratio -- если он не сходится к 0
-                    # за первые ~500-1000 эффективных шагов (в отличие от
-                    # toy-теста, где сходилось за 400), это сигнал поднять
-                    # moe_capacity_factor или router_aux_loss_coef выше 0.03.
                     if aux_info.get("moe_dropped_ratio") is not None:
                         dropped = jax.device_get(aux_info["moe_dropped_ratio"])
                         worst_drop_layer = int(dropped.argmax())
@@ -1291,6 +1396,12 @@ def main_execution():
               f"(похоже на системную проблему, не разовый выброс). Чекпоинт сохранён на последнем здоровом "
               f"состоянии. НЕ запускайте повторный resume вслепую -- сначала разберитесь с причиной "
               f"(численная стабильность, LR/warmup), иначе с высокой вероятностью упрётесь в то же самое.")
+
+    # ПАТЧ: финализировать любой незавершённый async-сейв перед выходом
+    finalized = _finalize_pending_save(mngr_latest)
+    if finalized is not None:
+        upload_slot(latest_dir, "latest", finalized["step"], "FINAL", keep_last_n=HF_LATEST_KEEP_N)
+
     print("Обучение завершено (для этой сессии).")
  
  
