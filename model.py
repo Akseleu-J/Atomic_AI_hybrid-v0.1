@@ -29,7 +29,7 @@ from jax.sharding import PartitionSpec as P
 # ==========================================================================
 from atomic_ops.kernel_trainable_B6 import gdn2_pallas_forward_trainable
 from atomic_ops.kernel_a_scores import BT as GDN2_PALLAS_BT
-from atomic_ops.moe_sparse import SparseMoEJ
+from atomic_ops.moe_gmm import GmmMoEJ
 print("[MODEL] ⚙️ GDN-2: используется честный fused-Pallas forward+backward "
       "(kernel_d_pipeline.py + kernel_bwd_b1..b5, склеены в "
       "kernel_trainable_B6.py). jax.vjp-на-референсе backward "
@@ -942,7 +942,7 @@ class BlockDAR(nn.Module):
         )
 
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
-        moe_out = SparseMoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
+        moe_out = GmmMoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
                        
         moe_finite = jnp.all(jnp.isfinite(moe_out))
         jax.lax.cond(
