@@ -134,18 +134,18 @@ class SparseMoEJ(nn.Module):
             spec = P(batch_axis, *([None] * (t.ndim - 1)))
             return jax.lax.with_sharding_constraint(t, jax.sharding.NamedSharding(mesh, spec))
 
-       def _local_sharded(t):
-    """Explicit constraint: t stays SHARDED along batch_axis, never
-    gathered. Correct semantics for this dispatch: routed_experts params
-    are already fully replicated per device (see train.py's
-    _get_shard_spec), so NO cross-device communication is needed for
-    top-1 routing -- each device independently sorts/scatters/gathers
-    ONLY its own local batch shard. This is the fix for BOTH problems:
-    (a) the crash without any constraint (GSPMD couldn't infer a valid
-    partitioning for argsort/scatter on an implicitly-sharded input on
-    its own), and (b) the previous _replicated() fix's hidden cost (an
-    unnecessary full-batch all-gather onto every device before dispatch,
-    duplicating compute 8x and defeating much of sparse MoE's point)."""
+        def _local_sharded(t):
+        """Explicit constraint: t stays SHARDED along batch_axis, never
+        gathered. Correct semantics for this dispatch: routed_experts params
+        are already fully replicated per device (see train.py's
+        _get_shard_spec), so NO cross-device communication is needed for
+        top-1 routing -- each device independently sorts/scatters/gathers
+        ONLY its own local batch shard. This is the fix for BOTH problems:
+        (a) the crash without any constraint (GSPMD couldn't infer a valid
+        partitioning for argsort/scatter on an implicitly-sharded input on
+        its own), and (b) the previous _replicated() fix's hidden cost (an
+        unnecessary full-batch all-gather onto every device before dispatch,
+        duplicating compute 8x and defeating much of sparse MoE's point)."""
             if mesh is None or batch_axis is None:
                 return t
             spec = P(batch_axis, *([None] * (t.ndim - 1)))
