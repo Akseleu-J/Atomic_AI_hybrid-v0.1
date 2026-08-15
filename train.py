@@ -892,6 +892,10 @@ def main_execution():
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_input_ids.npy",
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_labels.npy",
         ),  # codex
+         (
+        "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_input_ids.npy",
+        "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_labels.npy",
+        ),  #agentpack
         (
             "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_input_ids.npy",
             "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_labels.npy",
