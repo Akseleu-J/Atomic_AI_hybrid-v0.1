@@ -891,10 +891,13 @@ def main_execution():
         (
             "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_input_ids.npy",
             "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_labels.npy",
-        )  # kodcode
-    ]
-"""
+        ),  # kodcode
         (
+            "/kaggle/input/datasets/umirbayulgaisha/math-data/math_input_ids.npy",
+            "/kaggle/input/datasets/umirbayulgaisha/math-data/math_labels.npy",
+        ), #math
+    ]
+"""        (
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_input_ids.npy",
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_labels.npy",
         ),  # codex
@@ -903,10 +906,7 @@ def main_execution():
         "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_labels.npy",
         ),  #agentpack
         
-        (
-            "/kaggle/input/datasets/umirbayulgaisha/math-data/math_input_ids.npy",
-            "/kaggle/input/datasets/umirbayulgaisha/math-data/math_labels.npy",
-        ), #math
+        
         (
             "/kaggle/input/datasets/akseleu1j/rstar-dataset/rstar_input_ids.npy",
             "/kaggle/input/datasets/akseleu1j/rstar-dataset/rstar_labels.npy",
