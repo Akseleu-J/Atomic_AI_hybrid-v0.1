@@ -236,14 +236,8 @@ def _make_grouped_ffn_core(interpret=False):
 
 
 class GmmMoEJ(nn.Module):
-    """Drop-in structural replacement for moe_sparse.py's SparseMoEJ.
-
-    Same shared-expert-plus-top1-routed-experts split, same sown metrics.
-    See module docstring for the M1-M6 design and the CAVEAT about this
-    never having run on real TPU hardware.
-    """
     cfg: object
-    interpret: bool = False  # M0/M1-M3 validation only -- False for real TPU runs
+    interpret: bool = False
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True, rngs=None):
@@ -251,32 +245,18 @@ class GmmMoEJ(nn.Module):
         flat_x = x.reshape(-1, d)
         T = flat_x.shape[0]
         E_routed = self.cfg.num_experts - 1
-        assert E_routed >= 1, "num_experts must be >= 2 (1 shared + >=1 routed)."
-
-        # Local import mirrors moe_sparse.py's own workaround for the
-        # model.py <-> atomic_ops circular import.
+        assert E_routed >= 1
         from model import get_model_mesh, get_batch_axis
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
 
-        def _local_sharded(t):
-            """M5: keep t SHARDED along batch_axis -- no cross-device
-            gather. routed-expert weights (W1/W2 below) are fully
-            replicated per device (same as moe_sparse.py's
-            routed_experts / experts_block), so each device independently
-            sorts/groups/gmm's ONLY its own local batch shard."""
-            if mesh is None or batch_axis is None:
-                return t
-            spec = P(batch_axis, *([None] * (t.ndim - 1)))
-            return jax.lax.with_sharding_constraint(t, jax.sharding.NamedSharding(mesh, spec))
-
-        # ---- shared expert: plain Dense FFN, no routing/gmm needed ----
+        # ---- shared expert / router: обычные flax-операции, авто-
+        # партиционируются GSPMD без проблем, shard_map не нужен ----
         shared_h = nn.Dense(self.cfg.d_ff, name="shared_w1", dtype=jnp.bfloat16)(flat_x)
         shared_h = jax.nn.gelu(shared_h)
         shared_h = nn.Dropout(rate=self.cfg.dropout_rate)(shared_h, deterministic=deterministic)
         shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
 
-        # ---- routing decision (identical to moe_sparse.py) ----
         router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         router_logits = router_logits.astype(jnp.float32)
         router_logits = _sanitize(router_logits)
@@ -295,50 +275,60 @@ class GmmMoEJ(nn.Module):
             jax.scipy.special.logsumexp(router_logits, axis=-1))))
         self.sow("losses", "expert_utilization", mean_probs)
 
-        # ==================================================================
-        # M5: pin routing inputs to stay batch-sharded before the
-        # data-dependent argsort/bincount/gmm block.
-        # ==================================================================
-        flat_x_r = _local_sharded(flat_x)
-        expert_idx_r = _local_sharded(expert_idx)
-        gate_weight_r = _local_sharded(gate_weight)
-
-        # ==================================================================
-        # M1: routing via group_sizes = bincount(expert_idx). No capacity,
-        # no sentinel slot, no dropped tokens -- group_sizes.sum() == T
-        # identically by construction (bincount over a length-T index
-        # array with values in [0, E_routed) always sums to T).
-        # ==================================================================
-        group_sizes = jnp.bincount(expert_idx_r, length=E_routed).astype(jnp.int32)
-        perm = jnp.argsort(expert_idx_r, stable=True)
-        inv_perm = jnp.argsort(perm)  # perm[inv_perm] == arange(T); x[perm][inv_perm] == x
-
-        x_sorted = jnp.take(flat_x_r, perm, axis=0)
-
-        # ==================================================================
-        # M2: consolidated per-expert weight tensors (NOT nn.vmap(ExpertPack))
-        # ==================================================================
         d_model, d_ff = self.cfg.d_model, self.cfg.d_ff
-        w1_init = nn.initializers.lecun_normal()
-        w2_init = nn.initializers.lecun_normal()
-        W1 = self.param("routed_w1", w1_init, (E_routed, d_model, d_ff), jnp.bfloat16)
-        W2 = self.param("routed_w2", w2_init, (E_routed, d_ff, d_model), jnp.bfloat16)
+        W1 = self.param("routed_w1", nn.initializers.lecun_normal(),
+                         (E_routed, d_model, d_ff), jnp.bfloat16)
+        W2 = self.param("routed_w2", nn.initializers.lecun_normal(),
+                         (E_routed, d_ff, d_model), jnp.bfloat16)
 
-        grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
-        out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1, W2, group_sizes)
+        # ==================================================================
+        # ФИКС: весь диспетчинг (argsort/bincount/gmm/tgmm) переносится
+        # ЦЕЛИКОМ внутрь shard_map -- Mosaic custom-call (gmm/tgmm) не
+        # умеет auto-partition (см. "Mosaic kernels cannot be automatically
+        # partitioned" -- та же причина, по которой GDN-2/MLA уже
+        # оборачивают свои Pallas-вызовы в shard_map в этом проекте).
+        # with_sharding_constraint (старый _local_sharded) годится только
+        # для обычных HLO-операций, НЕ для Pallas custom-call -- этого
+        # блока внутри shard_map он больше не касается: каждое устройство
+        # получает свой ЛОКАЛЬНЫЙ x/expert_idx/gate_weight КАК ЕСТЬ
+        # (обычный jax-массив без sharding-аннотаций внутри тела shard_map)
+        # и целиком самостоятельно считает routing+FFN на своих токенах --
+        # никакого cross-device gather/comm не требуется и не происходит.
+        # ==================================================================
+        def _dispatch_and_ffn(flat_x_local, expert_idx_local, gate_weight_local, W1_local, W2_local):
+            T_local = flat_x_local.shape[0]
+            group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
+            perm = jnp.argsort(expert_idx_local, stable=True)
+            inv_perm = jnp.argsort(perm)
 
-        # M1 round-trip: gather back to original token order.
-        routed_out = jnp.take(out_sorted, inv_perm, axis=0)
+            x_sorted = jnp.take(flat_x_local, perm, axis=0)
+            grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
+            out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
 
-        routed_out = routed_out.astype(jnp.float32) * gate_weight_r
+            routed_out_local = jnp.take(out_sorted, inv_perm, axis=0)
+            return routed_out_local
+
+        if mesh is not None and batch_axis is not None:
+            in_specs = (
+                P(batch_axis, None),   # flat_x
+                P(batch_axis),         # expert_idx
+                P(batch_axis, None),   # gate_weight
+                P(None, None, None),   # W1 -- реплицирован
+                P(None, None, None),   # W2 -- реплицирован
+            )
+            out_specs = P(batch_axis, None)
+            sharded_dispatch = jax.shard_map(
+                _dispatch_and_ffn, mesh=mesh,
+                in_specs=in_specs, out_specs=out_specs,
+                check_vma=False,
+            )
+            routed_out = sharded_dispatch(flat_x, expert_idx, gate_weight, W1, W2)
+        else:
+            routed_out = _dispatch_and_ffn(flat_x, expert_idx, gate_weight, W1, W2)
+
+        routed_out = routed_out.astype(jnp.float32) * gate_weight
         combined = shared_out.astype(jnp.float32) + routed_out
         combined = _sanitize(combined)
-        combined = _local_sharded(combined)
 
-        # M6: dropped_ratio is now structurally always 0 -- gmm's grouping
-        # never discards a token, group_sizes.sum() == T identically. Sown
-        # anyway so train.py's existing logging/collect_by_leaf_name plumbing
-        # for "moe_dropped_ratio" keeps working unmodified.
         self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
-
         return combined.reshape(b, l, d).astype(x.dtype)
