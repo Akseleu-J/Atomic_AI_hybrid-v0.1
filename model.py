@@ -942,8 +942,16 @@ class BlockDAR(nn.Module):
         )
 
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
-        moe_out = GmmMoEJ(cfg=self.cfg, name="moe")(norm_2, deterministic=deterministic, rngs=rngs)
-                       
+        # ФИКС (M6): top_k GmmMoEJ раньше брался ТОЛЬКО из class-level
+        # default (GmmMoEJ.top_k=2), никак не связанного с cfg.top_k --
+        # т.е. реальный роутинг был top-2 "случайно", а cfg.top_k оставался
+        # мёртвым полем с устаревшим комментарием про SparseMoEJ (top-1).
+        # Явно прокидываем cfg.top_k -- теперь это единственная точка
+        # конфигурации top-k, видимая в train.py рядом с остальными
+        # MoE-гиперпараметрами.
+        moe_out = GmmMoEJ(cfg=self.cfg, top_k=self.cfg.top_k, name="moe")(
+            norm_2, deterministic=deterministic, rngs=rngs
+        )                       
         moe_finite = jnp.all(jnp.isfinite(moe_out))
         jax.lax.cond(
             jnp.logical_not(moe_finite),
