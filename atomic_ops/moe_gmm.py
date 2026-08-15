@@ -255,7 +255,7 @@ class GmmMoEJ(nn.Module):
 
         # Local import mirrors moe_sparse.py's own workaround for the
         # model.py <-> atomic_ops circular import.
-        from model import get_model_mesh, get_betch_axis
+        from model import get_model_mesh, get_batch_axis
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
 
