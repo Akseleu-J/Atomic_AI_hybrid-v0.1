@@ -7,7 +7,7 @@ import signal
 import shutil
 import sys
 from collections import deque
- 
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,7 +16,7 @@ import orbax.checkpoint as ocp
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
- 
+
 # ==================== HF HUB RELAY ====================
 try:
     from kaggle_secrets import UserSecretsClient
@@ -33,14 +33,14 @@ try:
 except ImportError:
     _HAS_HF = False
     print("[WARN] pip install -q huggingface_hub")
- 
+
 # ФИКС: раз в 25 минут. ВАЖНО: с синхронным чекпоинтингом (см. ниже) реальная
 # длительность записи будет видна в логах как время выполнения save_all_slots() --
 # следите за первыми 2-3 циклами и увеличьте интервал, если запись занимает
 # больше половины интервала (иначе TPU будет простаивать в ожидании I/O больше,
 # чем считать).
 CHECKPOINT_EVERY_SECONDS = 10 * 60
- 
+
 # ФИКС: автостоп при частых non-finite градиентах. Раньше скрипт тихо
 # пропускал битые шаги и полз дальше сколько угодно -- на долгом фоновом
 # запуске (ночь, 8+ часов) это означает риск потратить всю сессию впустую,
@@ -56,9 +56,9 @@ CHECKPOINT_EVERY_SECONDS = 10 * 60
 NONFINITE_CONSECUTIVE_LIMIT = 4
 NONFINITE_WINDOW_SIZE = 15
 NONFINITE_WINDOW_RATIO = 0.25
- 
+
 SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 15 * 60  # 9 часов минус запас на graceful stop
- 
+
 # ФИКС: 4 именованных слота на HF вместо "последние N" -- защищает от того,
 # что один плохой шаг (как на 414-м) перезатирает единственную сохранённую
 # копию. Слоты:
@@ -69,11 +69,11 @@ HF_LATEST_KEEP_N = 1  # ФИКС: было 2 -- со слотами best_train/b
                        # хранилось до 4 полных копий (params+opt_state), это, похоже, и
                        # переполняло диск /kaggle/working (см. диагностику в save_slot).
                        # N-1 всё равно доступен на HF при необходимости отката.
- 
+
 DATASET_FRACTION = 1
 DATASET_FRACTION_SEED = 777
- 
- 
+
+
 # ==========================================================================
 # ФИКС от гонки на шаге 414: enable_async_checkpointing=False.
 # Async-сохранение копирует params/opt_state с device на host в ФОНОВОМ
@@ -85,7 +85,7 @@ DATASET_FRACTION_SEED = 777
 # необратимо. Синхронный save() блокирует до полного завершения записи, что
 # делает эту гонку структурно невозможной ценой простоя TPU во время записи.
 # ==========================================================================
- 
+
 def make_manager(local_dir, max_to_keep):
     os.makedirs(local_dir, exist_ok=True)
     options = ocp.CheckpointManagerOptions(
@@ -94,11 +94,11 @@ def make_manager(local_dir, max_to_keep):
         enable_async_checkpointing=False,
     )
     return ocp.CheckpointManager(local_dir, ocp.StandardCheckpointer(), options)
- 
- 
+
+
 def save_slot(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, best_train_loss, train_loss=None):
     step_dir = os.path.join(local_dir, str(step))
- 
+
     # ФИКС: если предыдущая попытка сейва этого же шага упала (например, из-за
     # нехватки места на диске), могла остаться "осиротевшая" пустая директория
     # step_dir. orbax mngr.save() может спутаться с уже существующим (пустым)
@@ -108,7 +108,7 @@ def save_slot(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, be
     if os.path.exists(step_dir) and not os.listdir(step_dir):
         print(f"[CKPT] ⚠️ Найдена пустая осиротевшая директория {step_dir}, удаляю перед сейвом...")
         os.rmdir(step_dir)
- 
+
     # ФИКС: диагностика места на диске прямо в логе -- если сейв упадёт снова,
     # сразу будет видно, было ли место или проблема в чём-то другом.
     try:
@@ -117,12 +117,12 @@ def save_slot(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, be
               f"({100 * du.free / du.total:.1f}% свободно)")
     except Exception as e_du:
         print(f"[CKPT] ⚠️ Не удалось проверить место на диске: {e_du}")
- 
+
     t0 = time.perf_counter()
     mngr.save(step, args=ocp.args.StandardSave({"params": params, "opt_state": opt_state}))
     mngr.wait_until_finished()
     elapsed = time.perf_counter() - t0
- 
+
     # ФИКС: раньше metadata.json писался без проверки/создания директории --
     # обычно orbax успевал создать step_dir к этому моменту, но не гарантированно
     # (например, если предыдущий сейв был прерван и внутренняя бухгалтерия
@@ -140,7 +140,7 @@ def save_slot(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, be
             f"чекпоинтов). Если места достаточно -- возможна рассинхронизация внутренней "
             f"бухгалтерии CheckpointManager, проверьте состояние {local_dir}."
         )
- 
+
     meta = {
         "global_step": int(step),
         "epoch": int(epoch),
@@ -155,8 +155,8 @@ def save_slot(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, be
         json.dump(meta, f)
     print(f"[CKPT] Сохранён локально: {local_dir}/{step} (заняло {elapsed:.1f}с)")
     return elapsed
- 
- 
+
+
 def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
     """Заливает {local_dir}/{step} -> HF под path_in_repo={repo_subdir}/{step},
     затем чистит старые шаги ИМЕННО внутри этого repo_subdir (не трогая
@@ -181,7 +181,7 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
             commit_message=f"[{repo_subdir}] step {step} {msg}",
         )
         print(f"[HF] ✅ Uploaded: {repo_subdir}/{step}")
- 
+
         try:
             all_files = api.list_repo_files(HF_REPO_ID, repo_type="model")
             prefix = f"{repo_subdir}/"
@@ -207,8 +207,8 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
             print(f"[HF] ⚠️ Не удалось получить список файлов для чистки {repo_subdir}: {e_list}")
     except Exception as e:
         print(f"[HF] ❌ Upload error ({repo_subdir}): {e}")
- 
- 
+
+
 def download_slot(local_dir, repo_subdir):
     """Скачивает все шаги указанного слота с HF в local_dir. Возвращает
     максимальный найденный локально номер шага (или None)."""
@@ -243,13 +243,13 @@ def download_slot(local_dir, repo_subdir):
     except Exception as e:
         print(f"[HF] Download failed для слота '{repo_subdir}': {e}")
         return None
- 
- 
+
+
 from model import FullHybridMoEModel, ModelConfig, set_model_mesh, get_model_mesh
 from optimizer import compute_loss, make_hybrid_optimizer
 from utils import path_to_str
- 
- 
+
+
 # ==========================================================================
 # ДИАГНОСТИКА non-finite градиентов: относим каждый лист параметров к одной
 # из "подозреваемых" групп (те же кандидаты, что обсуждали: GDN-2, Mamba2,
@@ -259,8 +259,8 @@ from utils import path_to_str
 # Временная мера -- после локализации источника этот блок можно убрать.
 # ==========================================================================
 _DIAG_GROUPS = ("gdn2", "mamba2", "mla", "moe", "muon_decay", "embed", "other")
- 
- 
+
+
 def _classify_leaf_group(path_str: str) -> str:
     if "gdn2" in path_str:
         return "gdn2"
@@ -273,8 +273,8 @@ def _classify_leaf_group(path_str: str) -> str:
     if "embed" in path_str or "lm_head" in path_str:
         return "embed"
     return "other"
- 
- 
+
+
 def make_grad_group_map(params):
     """Строит pytree той же формы, что params/grads, где каждый лист -- это
     ИМЯ группы (питоновская строка, статична, не трейсится). Вычисляется
@@ -282,8 +282,8 @@ def make_grad_group_map(params):
     return jax.tree_util.tree_map_with_path(
         lambda path, _: _classify_leaf_group(path_to_str(path)), params
     )
- 
- 
+
+
 def build_group_nonfinite_check(grad_group_map):
     """Возвращает функцию (avg_grads) -> None, которая ВНУТРИ jit печатает
     через jax.debug.print, в каких группах есть non-finite градиент.
@@ -291,7 +291,7 @@ def build_group_nonfinite_check(grad_group_map):
     его листья используются только для группировки на python-уровне --
     сам traversal и суммирование masks делается в jax."""
     leaves_g, treedef = jax.tree_util.tree_flatten(grad_group_map)
- 
+
     def _check(avg_grads):
         leaves_grad = jax.tree_util.tree_leaves(avg_grads)
         for group in _DIAG_GROUPS:
@@ -309,40 +309,40 @@ def build_group_nonfinite_check(grad_group_map):
                 lambda: None,
             )
     return _check
- 
- 
+
+
 def make_tpu_mesh():
     devices = jax.devices()
     n = len(devices)
     mesh_devices = mesh_utils.create_device_mesh((n,), devices)
     return Mesh(mesh_devices, axis_names=("tpu_nodes",))
- 
- 
+
+
 def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: int,
                            seq_len: int = 8192, accum_steps: int = 1):
     mesh = make_tpu_mesh()
     n_devices = mesh.shape["tpu_nodes"]
- 
+
     if batch_size % n_devices != 0:
         raise ValueError(
             f"batch_size={batch_size} must be divisible by n_devices={n_devices}."
         )
- 
+
     batch_axis = "tpu_nodes"
     set_model_mesh(mesh, batch_axis=batch_axis)
- 
+
     tx = make_hybrid_optimizer(total_steps=total_steps)
     model = FullHybridMoEModel(cfg=config)
- 
+
     init_rng = jax.random.PRNGKey(0)
     abstract_params = jax.eval_shape(
         lambda: model.init(init_rng, jnp.zeros((batch_size, seq_len), dtype=jnp.int32))
     )["params"]
- 
+
     data_sharding = NamedSharding(mesh, P("tpu_nodes", None))
- 
+
     MIN_SHARD_SIZE = 128
- 
+
     def _get_shard_spec(path, param):
         if not hasattr(param, "shape") or param.ndim == 0:
             return NamedSharding(mesh, P())
@@ -357,15 +357,15 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         spec = [None] * param.ndim
         spec[best_axis] = "tpu_nodes"
         return NamedSharding(mesh, P(*spec))
- 
+
     param_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, abstract_params)
- 
+
     # ДИАГНОСТИКА: строим карту групп один раз (вне jit, на python-уровне) и
     # компилируем функцию-проверку non-finite по группам для использования
     # внутри distributed_apply_step.
     grad_group_map = make_grad_group_map(abstract_params)
     _group_nonfinite_check = build_group_nonfinite_check(grad_group_map)
- 
+
     # ФИКС: масштаб градиента для decay_a (GDN-2) / A_log (Mamba2) -- те же
     # экспоненцируемые decay-параметры, что многократно оказывались
     # источником non-finite. Реализовано на уровне градиента (а НЕ отдельной
@@ -376,19 +376,19 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     def _decay_scale_leaf(path, param):
         path_str = path_to_str(path)
         return 0.2 if ("decay_a" in path_str or "a_log" in path_str) else 1.0
- 
+
     _decay_grad_scale = jax.tree_util.tree_map_with_path(_decay_scale_leaf, abstract_params)
- 
+
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
     opt_state_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, opt_state_abstract)
- 
+
     def model_apply_wrapped(variables, input_ids, rngs=None, deterministic=True, **kwargs):
         return model.apply(
             variables, input_ids,
             rngs=rngs, deterministic=deterministic,
             **kwargs
         )
- 
+
     def distributed_train_step_micro(p, s, b, r, accum_grads):
         def loss_fn(param):
             return compute_loss(
@@ -400,16 +400,16 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         (loss, aux_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
         new_accum = jax.tree_util.tree_map(lambda a, g: a + g, accum_grads, grads)
         return p, s, new_accum, loss, aux_info
- 
+
     def distributed_apply_step(p, s, accum_grads, n_accum):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
- 
+
         # ДИАГНОСТИКА: печатаем, в каких группах параметров градиент
         # non-finite -- до клиппинга/nan_to_num, чтобы видеть "сырой" источник.
         _group_nonfinite_check(avg_grads)
- 
+
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
- 
+
         # ФИКС: если в градиентах просочился NaN/Inf (bf16-overflow в chunked CE,
         # associative_scan в GDN-2/Mamba2, Muon-ортогонализация и т.п.), старый
         # код давал global_norm=NaN -> clip_factor=NaN -> НОВЫЕ params = NaN*p
@@ -423,20 +423,20 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         is_finite = jnp.isfinite(global_norm)
         safe_norm = jnp.where(is_finite, global_norm, 1.0)
         clip_factor = jnp.where(is_finite, jnp.minimum(1.0, 1.0 / (safe_norm + 1e-6)), 0.0)
- 
+
         avg_grads = jax.tree_util.tree_map(
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) * clip_factor,
             avg_grads,
         )
- 
+
         # ФИКС: масштабируем градиент для decay_a/A_log (см. _decay_grad_scale
         # выше) -- эффективно снижает LR для этой узкой, повторяющейся
         # "горячей точки" non-finite, не трогая структуру opt_state.
         avg_grads = jax.tree_util.tree_map(lambda g, s: g * s, avg_grads, _decay_grad_scale)
- 
+
         updates, new_s = tx.update(avg_grads, s, p)
         new_p = optax.apply_updates(p, updates)
- 
+
         # ФИКС: последний общий рубеж -- клип самих ПАРАМЕТРОВ (не
         # активаций/градиентов, это уже сделано выше и в model.py). Диагностика
         # показала, что даже после санитизации градиента в gdn2_recurrence_safe
@@ -461,24 +461,24 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             lambda: jax.debug.print("[PARAM-DIAG] ⚠️ Обнаружен параметр с |w|>=100 ДО клипа -- веса разрослись."),
             lambda: None,
         )
- 
+
         zero_accum = jax.tree_util.tree_map(jnp.zeros_like, accum_grads)
         return new_p, new_s, zero_accum, is_finite
- 
+
     def distributed_val_step(p, b):
         return compute_loss(
             p, model_apply_wrapped, b, config,
             rngs=None,
             deterministic=True,
         )
- 
+
     aux_info_sharding = {
         "ce_loss": NamedSharding(mesh, P()),
         "aux_loss": NamedSharding(mesh, P()),
         "z_loss": NamedSharding(mesh, P()),
         "expert_utilization": NamedSharding(mesh, P(None)),
     }
- 
+
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
         donate_argnums=(0, 1, 4),
@@ -497,7 +497,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             aux_info_sharding,
         ),
     )
- 
+
     compiled_apply = jax.jit(
         distributed_apply_step,
         donate_argnums=(0, 1, 2),
@@ -514,23 +514,23 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P()),  # is_finite
         ),
     )
- 
+
     compiled_val = jax.jit(
         distributed_val_step,
         in_shardings=(param_sharding, {"input_ids": data_sharding, "labels": data_sharding}),
         out_shardings=NamedSharding(mesh, P()),
     )
- 
+
     return (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
             param_sharding, opt_state_sharding, data_sharding)
- 
- 
+
+
 def resolve_source_files(output_dir, prefix):
     merged_ids = os.path.join(output_dir, f"{prefix}_input_ids.npy")
     merged_lbls = os.path.join(output_dir, f"{prefix}_labels.npy")
     if os.path.exists(merged_ids) and os.path.exists(merged_lbls):
         return [(merged_ids, merged_lbls)]
- 
+
     shard_ids_paths = sorted(
         glob.glob(os.path.join(output_dir, f"{prefix}_shard_ids_*.npy")),
         key=lambda p: int(re.search(r"_(\d+)\.npy$", p).group(1)),
@@ -546,8 +546,8 @@ def resolve_source_files(output_dir, prefix):
             f"{prefix}_input_ids.npy, ни шардов {prefix}_shard_ids_*.npy. Проверьте путь."
         )
     return pairs
- 
- 
+
+
 def build_manifest(file_pairs):
     manifest = []
     total = 0
@@ -558,8 +558,8 @@ def build_manifest(file_pairs):
         print(f"[DATA] {os.path.basename(ids_path)}: {n_rows:,} блоков")
     print(f"[DATA] Комбинированный пул: {total:,} блоков из {len(manifest)} файл(ов)")
     return manifest
- 
- 
+
+
 def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_split=0.05,
                              dataset_fraction=1.0, fraction_seed=777, skip_batches=0):
     manifest = build_manifest(file_pairs)
@@ -569,16 +569,16 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
     context_length = np.load(manifest[0][0], mmap_mode="r").shape[1]
     if context_length > seq_len:
         context_length = seq_len
- 
+
     mmap_cache = {}
- 
+
     def _get_mmap(path):
         arr = mmap_cache.get(path)
         if arr is None:
             arr = np.load(path, mmap_mode="r")
             mmap_cache[path] = arr
         return arr
- 
+
     def _gather_batch(global_indices):
         shard_of = np.searchsorted(offsets, global_indices, side="right") - 1
         ids_out = np.empty((len(global_indices), context_length), dtype=np.int32)
@@ -592,7 +592,7 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
             ids_out[m] = ids_full[:, :seq_len]
             lbls_out[m] = lbls_full[:, :seq_len]
         return ids_out, lbls_out
- 
+
     all_idx = np.arange(total_blocks)
     if dataset_fraction < 1.0:
         frac_rng = np.random.RandomState(fraction_seed)
@@ -601,17 +601,17 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
         all_idx.sort()
         print(f"[DATA] Подвыборка {dataset_fraction*100:.0f}%: {n_keep:,} из {total_blocks:,} блоков "
               f"(seed={fraction_seed}, детерминированно между рестартами)")
- 
+
     pool_size = len(all_idx)
     val_size = int(pool_size * val_split)
     train_size = pool_size - val_size
- 
+
     split_rng = np.random.RandomState(42)
     shuffled = np.copy(all_idx)
     split_rng.shuffle(shuffled)
     train_idx_pool = shuffled[:train_size]
     val_idx_pool = shuffled[train_size:]
- 
+
     def _generator(pool, is_train=True, skip_first=0):
         idx_local = np.copy(pool)
         local_rng = np.random.RandomState(123)
@@ -636,15 +636,15 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                 }
             if not is_train:
                 break
- 
+
     return (
         _generator(train_idx_pool, True, skip_first=skip_batches),
         lambda: _generator(val_idx_pool, False),
         train_size // batch_size,
         val_size // batch_size,
     )
- 
- 
+
+
 def main_execution():
     ckpt_root = "/kaggle/working/orbax_checkpoints"
     latest_dir = os.path.join(ckpt_root, "latest")
@@ -652,27 +652,27 @@ def main_execution():
     best_val_dir = os.path.join(ckpt_root, "best_val")
     for d in (latest_dir, best_train_dir, best_val_dir):
         os.makedirs(d, exist_ok=True)
- 
+
     mngr_latest = make_manager(latest_dir, max_to_keep=HF_LATEST_KEEP_N)
     mngr_best_train = make_manager(best_train_dir, max_to_keep=1)
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
- 
+
     # ФИКС: явный флаг чистого старта -- гарантирует свежий запуск НЕЗАВИСИМО
     # от того, остался ли где-то (локально или на HF) недочищенный чекпоинт.
     # Раньше "чистый старт" зависел от того, что resume_step случайно
     # окажется None -- если забыть удалить один из слотов на HF, скрипт
     # молча резюмировался бы со старого (потенциально "нездорового") чекпоинта.
     # FORCE_FRESH_START=True полностью пропускает поиск/скачивание чекпоинтов.
-    FORCE_FRESH_START = False  # <-- поставьте False, чтобы вернуть обычный resume
- 
+    FORCE_FRESH_START = True  # <-- поставьте False, чтобы вернуть обычный resume
+
     # ФИКС: ручной override источника восстановления -- на случай, если
     # 'latest' испорчен (NaN-эпизод и т.п.), а известный здоровый чекпоинт
-    # лежит в другом слоте. "latest" -- обычное поведение. "best_train" /
+    # лежит в другом слоте. "latest" -- обычное поведение. "best_train" 
     # "best_val" -- форсированное восстановление именно из этого слота (один
     # раз, для отката после инцидента), ПОСЛЕ чего он копируется в 'latest' и
     # обучение дальше продолжается как обычно.
     RESUME_FROM_SLOT = "best_train"  # <-- используется только если FORCE_FRESH_START=False
- 
+
     if FORCE_FRESH_START:
         resume_step = None
         print("[RESUME] 🆕 FORCE_FRESH_START=True -- пропускаю поиск чекпоинтов, начинаю с нуля.")
@@ -696,12 +696,12 @@ def main_execution():
         resume_step = override_mngr.latest_step()
         if resume_step is not None:
             print(f"[LOCAL] 📦 Found checkpoint ({RESUME_FROM_SLOT}): step {resume_step}")
- 
+
         if resume_step is None and _HAS_HF:
             resume_step = download_slot(override_dir, RESUME_FROM_SLOT)
             if resume_step is not None:
                 override_mngr = make_manager(override_dir, max_to_keep=1)
- 
+
         if resume_step is not None:
             src = os.path.join(override_dir, str(resume_step))
             dst = os.path.join(latest_dir, str(resume_step))
@@ -712,13 +712,13 @@ def main_execution():
             mngr_latest = make_manager(latest_dir, max_to_keep=HF_LATEST_KEEP_N)
         else:
             print(f"[RESUME OVERRIDE] ⚠️ Не найден чекпоинт в слоте '{RESUME_FROM_SLOT}' ни локально, ни на HF.")
- 
+
     resume = (resume_step is not None)
     start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
     best_train_loss = float("inf")
- 
+
     config = ModelConfig(
         d_model=512,
         d_state=128,
@@ -773,20 +773,20 @@ def main_execution():
             "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_labels.npy",
         ),  # syntheticcode
     ]
- 
+
     for ids_path, lbls_path in file_pairs:
         if not os.path.exists(ids_path):
             raise FileNotFoundError(f"Не найден файл: {ids_path}")
         if not os.path.exists(lbls_path):
             raise FileNotFoundError(f"Не найден файл: {lbls_path}")
     print("Все файлы найдены.")
- 
+
     manifest = build_manifest(file_pairs)
     total_blocks_full = sum(n for _, _, n in manifest)
     total_blocks = int(total_blocks_full * DATASET_FRACTION)
     print(f"Всего блоков (полный пул): {total_blocks_full:,}")
     print(f"Всего блоков (после {DATASET_FRACTION*100:.0f}% подвыборки): {total_blocks:,}")
- 
+
     micro_batch_size = 8
     accum_steps = 4
     effective_batch_size = micro_batch_size * accum_steps
@@ -796,24 +796,24 @@ def main_execution():
     eval_every_steps = 1000
     eval_batches = 40
     eval_patience = 4
- 
+
     val_split = 0.05
     val_size = int(total_blocks * val_split)
     train_size = total_blocks - val_size
- 
+
     train_steps_per_epoch = train_size // effective_batch_size
     total_train_steps = train_steps_per_epoch * epochs
     micro_steps_per_epoch = train_size // micro_batch_size
- 
+
     print(f"[TPU] Компиляция XLA графа под {total_train_steps} эффективных шагов "
           f"({epochs} эпох(и) x {train_steps_per_epoch} шагов, accum={accum_steps})...")
- 
+
     (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
      param_sharding, opt_state_sharding, data_sharding) = (
         make_shard_and_compile(config, total_train_steps, micro_batch_size, seq_len, accum_steps)
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
- 
+
     _sanity_stream, _, _, _ = dataloader_multi_source(
         file_pairs, micro_batch_size, data_sharding, seq_len=seq_len,
         dataset_fraction=DATASET_FRACTION, fraction_seed=DATASET_FRACTION_SEED,
@@ -829,7 +829,7 @@ def main_execution():
     print(f"[SANITY] Валидных labels в батче: {n_valid}/{valid_mask.size} ({100*n_valid/valid_mask.size:.1f}%)")
     if n_valid == 0:
         raise ValueError("Все labels в первом батче маскированы (pad) — loss будет NaN!")
- 
+
     ids_np_chk = jax.device_get(test_batch["input_ids"])
     lbls_np_chk = jax.device_get(test_batch["labels"])
     valid_chk = lbls_np_chk[:, :-1] != -100
@@ -843,7 +843,7 @@ def main_execution():
             "датасет не сдвинут на 1 токен. Останавливаю обучение до фикса данных."
         )
     del _sanity_stream
- 
+
     global_rng = jax.random.PRNGKey(42)
     init_params_fn = jax.jit(
         lambda rng: model.init(rng, jnp.zeros((micro_batch_size, seq_len), dtype=jnp.int32))["params"],
@@ -853,20 +853,20 @@ def main_execution():
     print(f"[MEM] Доступно памяти на чипе 0: {jax.local_devices()[0].memory_stats()}")
     total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"Общее количество параметров: {total_params:,} (≈ {total_params / 1e9:.2f} млрд)")
- 
+
     weights_bytes = sum(x.nbytes for x in jax.tree_util.tree_leaves(params))
     n_devices_display = mesh.shape["tpu_nodes"]
     print(f"Размер весов модели (глобально): {weights_bytes / 1e9:.2f} ГБ "
           f"(с FSDP на чип реально хранится в среднем ~{weights_bytes / 1e9 / n_devices_display:.2f} ГБ)")
- 
+
     opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
- 
+
     zero_accum = jax.jit(
         lambda p: jax.tree_util.tree_map(jnp.zeros_like, p),
         out_shardings=param_sharding,
     )(params)
     accum_grads = zero_accum
- 
+
     if resume and resume_step is not None:
         print(f"[RESUME] ⬆️ Restoring step {resume_step} из 'latest'...")
         try:
@@ -880,7 +880,7 @@ def main_execution():
                 lambda p: jax.tree_util.tree_map(jnp.zeros_like, p),
                 out_shardings=param_sharding,
             )(params)
- 
+
             meta_path = os.path.join(latest_dir, str(resume_step), "metadata.json")
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
@@ -892,7 +892,7 @@ def main_execution():
             else:
                 global_step = resume_step
             global_rng = jax.random.PRNGKey(42 + global_step)
- 
+
             # ФИКС: sanity-проверка после restore -- ловим "застрял на ln(vocab)"
             # сразу, не через сотни шагов. Не идеальная защита (веса могут быть
             # тихо повреждены не до NaN/init-уровня), но отсекает самый частый случай.
@@ -901,9 +901,9 @@ def main_execution():
             print(f"[RESUME DEBUG] param_norm={param_norm:.4f}, has_nan={has_nan}")
             if has_nan:
                 raise ValueError("Восстановленные params содержат NaN -- чекпоинт повреждён.")
- 
+
             print(f"[RESUME] ✅ Restored: step={global_step}, best_val={best_val_loss:.4f}, best_train={best_train_loss:.4f}")
- 
+
             # ФИКС: если resume_step попал в latest_dir через ручной
             # shutil.copytree (override-путь RESUME_FROM_SLOT != "latest"),
             # CheckpointManager НЕ знает об этом шаге через свою внутреннюю
@@ -923,21 +923,21 @@ def main_execution():
                 )
                 mngr_latest.wait_until_finished()
                 print(f"[RESUME OVERRIDE] ✅ Шаг {global_step} перерегистрирован штатно.")
- 
+
         except Exception as e:
             print(f"[RESUME] ❌ Error: {e}. Starting fresh.")
             resume = False
             global_step = 0
     else:
         print("[RESUME] 🆕 Fresh start.")
- 
+
     skip_micro_steps = global_step * accum_steps
     train_stream, val_factory, _, val_steps = dataloader_multi_source(
         file_pairs, micro_batch_size, data_sharding, seq_len=seq_len,
         dataset_fraction=DATASET_FRACTION, fraction_seed=DATASET_FRACTION_SEED,
         skip_batches=skip_micro_steps,
     )
- 
+
     _dummy_batch = {
         "input_ids": jax.device_put(jnp.zeros((micro_batch_size, seq_len), dtype=jnp.int32), data_sharding),
         "labels": jax.device_put(jnp.zeros((micro_batch_size, seq_len), dtype=jnp.int32), data_sharding),
@@ -949,7 +949,7 @@ def main_execution():
     print(f"[MEM ANALYSIS] HBM arguments: {_analysis.argument_size_in_bytes / 1e9:.2f} ГБ")
     print(f"[MEM ANALYSIS] HBM output:    {_analysis.output_size_in_bytes / 1e9:.2f} ГБ")
     print("[TPU] Компиляция готова -- переходим к реальному обучению.")
- 
+
     stopped_early = False
     stopped_by_time_budget = False
     stopped_by_nonfinite_limit = False
@@ -957,12 +957,13 @@ def main_execution():
     epochs_without_improvement = 0
     best_eval_loss = float("inf")
     epoch = start_epoch
- 
+
     # ФИКС: состояние для автостопа при частых non-finite (см. константы
     # NONFINITE_* вверху файла).
     nonfinite_consecutive_count = 0
     nonfinite_window = deque(maxlen=NONFINITE_WINDOW_SIZE)
- 
+    _accum_window = deque(maxlen=accum_steps)
+
     def _save_all_needed_slots(step, cur_train_loss_val, force_latest=True, tag="", skip_hf_upload=False):
         """Сохраняет 'latest' всегда; 'best_train' -- если побит рекорд train_loss.
         skip_hf_upload=True -- только локально, без сетевой заливки на HF (для
@@ -981,7 +982,7 @@ def main_execution():
                 if not skip_hf_upload:
                     upload_slot(best_train_dir, "best_train", step, f"train_loss={tl:.4f}", keep_last_n=1)
                 print(f"[BEST_TRAIN] Новый лучший train_loss: {tl:.4f} на шаге {step}")
- 
+
     def emergency_save(signum=None, frame=None):
         print(f"\n🚨 [EMERGENCY] Saving step {global_step}...")
         try:
@@ -990,19 +991,19 @@ def main_execution():
         except Exception as e:
             print(f"🚨 ❌ Emergency save failed: {e}")
         sys.exit(0)
- 
+
     signal.signal(signal.SIGTERM, emergency_save)
     signal.signal(signal.SIGINT, emergency_save)
- 
+
     total_tokens_processed = 0
     epoch_start_time = time.perf_counter()
     last_ckpt_time = time.perf_counter()
     session_start_time = time.perf_counter()
- 
+
     for epoch in range(start_epoch, epochs):
         for micro_step in range(micro_steps_per_epoch):
             global_rng, step_rng = jax.random.split(global_rng)
- 
+
             _t0 = time.perf_counter()
             try:
                 batch = next(train_stream)
@@ -1010,9 +1011,15 @@ def main_execution():
                 print("[DATA] Поток данных исчерпан для этой эпохи.")
                 break
             _t_data = time.perf_counter() - _t0
- 
+
+            _accum_window.append({
+                "input_ids": jax.device_get(batch["input_ids"]),
+                "labels": jax.device_get(batch["labels"]),
+                "step_rng": jax.device_get(step_rng),
+            })
+
             total_tokens_processed += micro_batch_size * seq_len
- 
+
             _t1 = time.perf_counter()
             params, opt_state, accum_grads, train_loss, aux_info = compiled_train_micro(
                 params, opt_state, batch, step_rng, accum_grads
@@ -1020,10 +1027,12 @@ def main_execution():
             if micro_step < 30:
                 jax.block_until_ready(train_loss)
             _t_compute = time.perf_counter() - _t1
- 
+
             if (micro_step + 1) % accum_steps == 0:
                 effective_step = (micro_step + 1) // accum_steps
- 
+
+                _params_pre_apply_host = jax.tree_util.tree_map(jax.device_get, params)
+
                 _t_apply = time.perf_counter()
                 params, opt_state, accum_grads, was_finite = compiled_apply(
                     params, opt_state, accum_grads, accum_steps
@@ -1031,7 +1040,7 @@ def main_execution():
                 if micro_step < 30:
                     jax.block_until_ready(params)
                 _t_apply_total = time.perf_counter() - _t_apply
- 
+
                 # ФИКС: узнаём, был ли шаг пропущен из-за NaN/Inf в градиенте
                 # (веса НЕ обновились -- см. distributed_apply_step). Раньше
                 # это происходило тихо и необратимо портило все параметры.
@@ -1040,7 +1049,23 @@ def main_execution():
                     print(f"[WARNING] ⚠️ Non-finite градиент на global_step={global_step + 1} -- "
                           f"обновление ПРОПУЩЕНО, веса не изменены. Если это повторяется часто, "
                           f"стоит посмотреть на LR/warmup или численную стабильность GDN-2/Mamba2/Muon.")
- 
+
+                    # ВСТАВКА: снэпшот с pre-apply params + весь accum-window
+                    snap_dir = os.path.join(ckpt_root, "nonfinite_snapshots", str(global_step + 1))
+                    os.makedirs(snap_dir, exist_ok=True)
+                    snap_mngr = make_manager(snap_dir, max_to_keep=1)
+                    snap_mngr.save(global_step + 1, args=ocp.args.StandardSave(
+                        {"params": _params_pre_apply_host, "opt_state": opt_state}
+                    ))
+                    snap_mngr.wait_until_finished()
+                    for i, entry in enumerate(_accum_window):
+                        np.save(os.path.join(snap_dir, f"micro_{i}_input_ids.npy"), entry["input_ids"])
+                        np.save(os.path.join(snap_dir, f"micro_{i}_labels.npy"), entry["labels"])
+                        np.save(os.path.join(snap_dir, f"micro_{i}_step_rng.npy"), np.asarray(entry["step_rng"]))
+                    with open(os.path.join(snap_dir, "SNAPSHOT_META.json"), "w") as f:
+                        json.dump({"n_micro": len(_accum_window), "global_step": int(global_step + 1)}, f)
+                    print(f"[SNAPSHOT] Saved {len(_accum_window)} micro-steps + PRE-APPLY params to {snap_dir}")
+
                 # ФИКС: автостоп при частых non-finite -- см. константы
                 # NONFINITE_* и комментарий там же. Считаем ДО global_step+=1,
                 # чтобы номер шага в логе соответствовал именно проблемному шагу.
@@ -1049,7 +1074,7 @@ def main_execution():
                     nonfinite_consecutive_count = 0
                 else:
                     nonfinite_consecutive_count += 1
- 
+
                 window_ratio = sum(nonfinite_window) / len(nonfinite_window)
                 hit_consecutive_limit = nonfinite_consecutive_count >= NONFINITE_CONSECUTIVE_LIMIT
                 hit_window_limit = (
@@ -1078,15 +1103,15 @@ def main_execution():
                     stopped_by_nonfinite_limit = True
                     stopped_early = True
                     break
- 
+
                 global_step += 1
- 
+
                 now = time.perf_counter()
                 if now - last_ckpt_time >= CHECKPOINT_EVERY_SECONDS:
                     print(f"[CKPT] 💾 Цикл сохранения на шаге {global_step} (прошло {(now - last_ckpt_time)/60:.1f} мин)...")
                     _save_all_needed_slots(global_step, train_loss, force_latest=True)
                     last_ckpt_time = time.perf_counter()  # ФИКС: после реальной длительности сейва, не до
- 
+
                 elapsed_session = time.perf_counter() - session_start_time
                 if elapsed_session >= SESSION_TIME_BUDGET_SECONDS:
                     print(f"[SESSION LIMIT] Достигнут бюджет времени сессии "
@@ -1095,7 +1120,7 @@ def main_execution():
                     stopped_by_time_budget = True
                     stopped_early = True
                     break
- 
+
                 if micro_step < 30:
                     total_step_time = _t_compute + _t_apply_total
                     print(f"[TIMING] effective step {effective_step}: "
@@ -1103,7 +1128,7 @@ def main_execution():
                           f"TPU compute={_t_compute*1000:.0f}мс  "
                           f"apply={_t_apply_total*1000:.0f}мс  "
                           f"(доля данных: {_t_data/(total_step_time+_t_data)*100:.0f}%)")
- 
+
                 if effective_step % 10 == 0:
                     print(
                         f"Epoch: {epoch} | Step: {effective_step}/{train_steps_per_epoch} | "
@@ -1121,7 +1146,7 @@ def main_execution():
                             f"           expert utilization std (max over layers, layer {worst_layer}): "
                             f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts}"
                         )
- 
+
                 if global_step % eval_every_steps == 0:
                     val_stream = val_factory()
                     eval_loss = 0.0
