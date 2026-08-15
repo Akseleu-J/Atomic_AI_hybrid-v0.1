@@ -126,7 +126,7 @@ from jax.sharding import PartitionSpec as P
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm, tgmm
 
 
-from model import get_model_mesh, get_batch_axis
+from ..model import get_model_mesh, get_batch_axis
 _DEFAULT_TILING = (128, 128, 128)
 _SANITIZE_CLIP = 1e3
  
