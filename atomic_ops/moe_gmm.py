@@ -126,13 +126,7 @@ from jax.sharding import PartitionSpec as P
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm, tgmm
 
 
-import sys
-import os
 
-
-root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if root_dir not in sys.path:
-    sys.path.insert(0, root_dir)
 
 
 _DEFAULT_TILING = (128, 128, 128)
