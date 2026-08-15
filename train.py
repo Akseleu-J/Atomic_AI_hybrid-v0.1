@@ -39,7 +39,7 @@ except ImportError:
 # следите за первыми 2-3 циклами и увеличьте интервал, если запись занимает
 # больше половины интервала (иначе TPU будет простаивать в ожидании I/O больше,
 # чем считать).
-CHECKPOINT_EVERY_SECONDS = 10 * 60
+CHECKPOINT_EVERY_SECONDS = 20 * 60
 
 # ФИКС: автостоп при частых non-finite градиентах. Раньше скрипт тихо
 # пропускал битые шаги и полз дальше сколько угодно -- на долгом фоновом
@@ -57,7 +57,7 @@ NONFINITE_CONSECUTIVE_LIMIT = 4
 NONFINITE_WINDOW_SIZE = 15
 NONFINITE_WINDOW_RATIO = 0.25
 
-SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 15 * 60  # 9 часов минус запас на graceful stop
+SESSION_TIME_BUDGET_SECONDS = 8 * 3600 - 15 * 60  # 9 часов минус запас на graceful stop
 
 # ФИКС: 4 именованных слота на HF вместо "последние N" -- защищает от того,
 # что один плохой шаг (как на 414-м) перезатирает единственную сохранённую
@@ -268,6 +268,12 @@ def _classify_leaf_group(path_str: str) -> str:
         return "mamba2"
     if "mla" in path_str:
         return "mla"
+    # ФИКС (интеграция SparseMoEJ, atomic_ops/moe_sparse.py): SparseMoEJ's
+    # submodules are named "shared_expert"/"routed_experts"/"router" (not
+    # the dense MoEJ's "experts_block") -- all still live under the same
+    # top-level "moe" module name in BlockDARLayer, so the existing "moe"
+    # substring match already covers them; "router" kept explicit too so
+    # this still works if router logic is ever pulled out to its own name.
     if "experts_block" in path_str or "moe" in path_str or "router" in path_str:
         return "moe"
     if "embed" in path_str or "lm_head" in path_str:
@@ -346,7 +352,17 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     def _get_shard_spec(path, param):
         if not hasattr(param, "shape") or param.ndim == 0:
             return NamedSharding(mesh, P())
-        if "experts_block" in path_to_str(path):
+        path_str = path_to_str(path)
+        # ФИКС (интеграция SparseMoEJ, atomic_ops/moe_sparse.py):
+        # "routed_experts" params carry an nn.vmap expert axis (axis 0,
+        # size E_routed) the same way the old dense "experts_block" did --
+        # standard FSDP axis-picking below doesn't know about that vmap
+        # axis and could pick it (or another axis) to shard across
+        # devices in a way that breaks the vmap structure. Kept
+        # unsharded, same treatment as "experts_block" always had.
+        # "shared_expert"/"router" are plain Dense layers (no vmap axis),
+        # so they fall through to the normal FSDP logic below unchanged.
+        if "experts_block" in path_str or "routed_experts" in path_str:
             return NamedSharding(mesh, P(*([None] * param.ndim)))
         best_axis, best_size = None, -1
         for i, size in enumerate(param.shape):
@@ -472,11 +488,16 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             deterministic=True,
         )
 
+    # ФИКС (интеграция SparseMoEJ): moe_dropped_ratio -- новый sown value,
+    # same (n_moe_layers,)-vector shape as expert_utilization, needs its
+    # own out_sharding entry or jax.jit's donate/out_shardings machinery
+    # will not know how to place it.
     aux_info_sharding = {
         "ce_loss": NamedSharding(mesh, P()),
         "aux_loss": NamedSharding(mesh, P()),
         "z_loss": NamedSharding(mesh, P()),
         "expert_utilization": NamedSharding(mesh, P(None)),
+        "moe_dropped_ratio": NamedSharding(mesh, P(None)),
     }
 
     compiled_train_micro = jax.jit(
@@ -663,6 +684,13 @@ def main_execution():
     # окажется None -- если забыть удалить один из слотов на HF, скрипт
     # молча резюмировался бы со старого (потенциально "нездорового") чекпоинта.
     # FORCE_FRESH_START=True полностью пропускает поиск/скачивание чекпоинтов.
+    #
+    # ВАЖНО для этого прогона: переход MoEJ -> SparseMoEJ меняет структуру
+    # params pytree (experts_block -> shared_expert/routed_experts, router
+    # shape меняется с num_experts на num_experts-1 выходов) -- resume со
+    # старого dense-чекпоинта СТРУКТУРНО несовместим и упадёт на
+    # restore(). FORCE_FRESH_START=True здесь обязателен для первого
+    # sparse-прогона, не только "по умолчанию безопасно".
     FORCE_FRESH_START = True  # <-- поставьте False, чтобы вернуть обычный resume
 
     # ФИКС: ручной override источника восстановления -- на случай, если
@@ -720,36 +748,49 @@ def main_execution():
     best_train_loss = float("inf")
 
     config = ModelConfig(
-        d_model=512,
+        d_model=768,
         d_state=128,
         d_conv=4,
         expand=2,
-        n_heads=4,
-        d_latent=512,
-        d_ff=3072,
-        num_experts=8,
-        top_k=2,
-        num_layers=18,
+        n_heads=6,            # 768/6 = 128 = MXU tile, required by kernel_a_scores.py assert
+        d_latent=768,
+        d_ff=4096,
+        num_experts=8,        # 1 shared + 7 routed (atomic_ops/moe_sparse.py's SparseMoEJ)
+        top_k=1,              # ФИКС: SparseMoEJ routes top-1 among the 7 routed experts (argmax
+                               # over router_logits) -- was 2 (unused, dense MoEJ ignored this
+                               # field entirely). Now documents the ACTUAL routing behavior;
+                               # SparseMoEJ still doesn't read this field directly (top-1 is
+                               # hardcoded via jnp.argmax), this is documentation, not wiring.
+        moe_capacity_factor=1.25,  # confirmed via atomic_ops_moe_bench_tpu.py: dropped_ratio->0
+                                     # by the end of the quality-check run at this factor.
+        # ФИКС: поднят с 0.01 -- quality-check (moe_quality_check_tpu.py)
+        # валидировал балансировку роутера именно при coef=0.1, где
+        # dropped_ratio уверенно сходится к 0 за 400 шагов. 0.01 на порядок
+        # ниже и НЕ был проверен на предмет того, достаточно ли давления на
+        # балансировку при таком уровне -- 0.03 выбран как промежуточное,
+        # более консервативное значение для первого реального прогона;
+        # следить за dropped_ratio/expert_util std в логе и поднять до 0.1,
+        # если балансировка на реальных данных окажется хуже, чем в тесте.
+        router_aux_loss_coef=0.03,
+        router_z_loss_coef=0.0001,
+        num_layers=24,         # 8 blocks x layers_per_block=3
         layers_per_block=3,
         vocab_size=128256,
-        dropout_rate=0.1,
-        router_aux_loss_coef=0.01,
-        router_z_loss_coef=0.0001,
-        moe_capacity_factor=1.0,
         tie_embeddings=True,
         label_smoothing=0.0,
         router_noise_std=0.1,
         use_flash_attention=True,
-        deltanet_chunk_size=256,
-        layer_types = (
-        "gdn2", "gdn2", "mla",      # block 0
-        "gdn2", "mamba2", "gdn2",   # block 1
-        "gdn2", "gdn2", "gdn2",     # block 2
-        "gdn2", "gdn2", "mla",      # block 3
-        "gdn2", "mamba2", "gdn2",   # block 4
-        "gdn2", "gdn2", "mla",     # block 5
-        
-    )
+        deltanet_chunk_size=256,   # must equal kernel_a_scores.BT
+        layer_types=(
+            "gdn2", "gdn2", "mla",
+            "gdn2", "mamba2", "gdn2",
+            "gdn2", "gdn2", "gdn2",
+            "gdn2", "gdn2", "mla",
+            "gdn2", "mamba2", "gdn2",
+            "gdn2", "gdn2", "mla",
+            "gdn2", "gdn2", "mla",       # new block 6 — mirrors block 0
+            "gdn2", "mamba2", "gdn2",    # new block 7 — mirrors block 1
+        ),
     )
     file_pairs = [
         (
@@ -1144,7 +1185,22 @@ def main_execution():
                         worst_layer = int(util_std_per_layer.argmax())
                         print(
                             f"           expert utilization std (max over layers, layer {worst_layer}): "
-                            f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts}"
+                            f"{util_std_per_layer[worst_layer]:.4f} | ideal ~= 0, uniform = 1/{config.num_experts - 1}"
+                        )
+                    # ФИКС (интеграция SparseMoEJ): dropped_ratio -- главный
+                    # сигнал того, достаточен ли moe_capacity_factor на
+                    # реальных данных (не только на синтетическом toy-task
+                    # из moe_quality_check_tpu.py). Печатаем слой с
+                    # максимальным dropped_ratio -- если он не сходится к 0
+                    # за первые ~500-1000 эффективных шагов (в отличие от
+                    # toy-теста, где сходилось за 400), это сигнал поднять
+                    # moe_capacity_factor или router_aux_loss_coef выше 0.03.
+                    if aux_info.get("moe_dropped_ratio") is not None:
+                        dropped = jax.device_get(aux_info["moe_dropped_ratio"])
+                        worst_drop_layer = int(dropped.argmax())
+                        print(
+                            f"           moe dropped_ratio (max over layers, layer {worst_drop_layer}): "
+                            f"{dropped[worst_drop_layer]:.4f}  (ideal ~= 0 after warmup)"
                         )
 
                 if global_step % eval_every_steps == 0:
@@ -1240,4 +1296,3 @@ def main_execution():
  
 if __name__ == "__main__":
     main_execution()
- 
