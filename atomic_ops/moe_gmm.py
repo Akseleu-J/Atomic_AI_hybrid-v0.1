@@ -236,8 +236,25 @@ def _make_grouped_ffn_core(interpret=False):
 
 
 class GmmMoEJ(nn.Module):
+    """Top-k=2 версия. Каждый токен маршрутизируется к ДВУМ из E_routed
+    экспертов (top_k=2 через jax.lax.top_k), веса гейта перенормируются
+    внутри выбранной пары (softmax только по 2 значениям, не по всем
+    E_routed) -- тот же приём, что Switch/GShard-стиль top-k MoE.
+
+    Диспетчинг реализован как ОДИН gmm/tgmm-проход над 2T строками:
+    каждый токен дублируется дважды (по одной копии на каждый из двух
+    выбранных экспертов), затем ОБЫЧНАЯ top-1-механика (argsort по
+    expert_idx / bincount / gmm) применяется к этому 2T-массиву без
+    изменений в самом _make_grouped_ffn_core -- gmm/tgmm агностичны к
+    происхождению group_sizes, им всё равно T это или 2T строк.
+
+    combine: для каждого исходного токена суммируются его ДВЕ выходные
+    строки (первая и вторая копия), взвешенные перенормированными
+    top-2 гейтами.
+    """
     cfg: object
     interpret: bool = False
+    top_k: int = 2
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True, rngs=None):
@@ -245,18 +262,19 @@ class GmmMoEJ(nn.Module):
         flat_x = x.reshape(-1, d)
         T = flat_x.shape[0]
         E_routed = self.cfg.num_experts - 1
-        assert E_routed >= 1
+        k = self.top_k
+        assert E_routed >= k, f"num_experts-1={E_routed} must be >= top_k={k}."
         from model import get_model_mesh, get_batch_axis
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
 
-        # ---- shared expert / router: обычные flax-операции, авто-
-        # партиционируются GSPMD без проблем, shard_map не нужен ----
+        # ---- shared expert ----
         shared_h = nn.Dense(self.cfg.d_ff, name="shared_w1", dtype=jnp.bfloat16)(flat_x)
         shared_h = jax.nn.gelu(shared_h)
         shared_h = nn.Dropout(rate=self.cfg.dropout_rate)(shared_h, deterministic=deterministic)
         shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
 
+        # ---- routing: top-k среди E_routed ----
         router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
         router_logits = router_logits.astype(jnp.float32)
         router_logits = _sanitize(router_logits)
@@ -265,11 +283,20 @@ class GmmMoEJ(nn.Module):
             router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
                 noise_rng, router_logits.shape, dtype=router_logits.dtype
             )
-        gate_probs = jax.nn.softmax(router_logits, axis=-1)
-        expert_idx = jnp.argmax(router_logits, axis=-1).astype(jnp.int32)
-        gate_weight = jnp.take_along_axis(gate_probs, expert_idx[:, None], axis=-1)
 
-        mean_probs = jnp.mean(gate_probs, axis=0)
+        # M1': top-k выбор + перенормировка гейтов ВНУТРИ выбранной пары
+        # (не softmax по всем E_routed -- иначе вес каждого выбранного
+        # эксперта занижен относительно "честного" top-k распределения).
+        top_vals, top_idx = jax.lax.top_k(router_logits, k=k)          # (T, k)
+        top_idx = top_idx.astype(jnp.int32)
+        top_gate = jax.nn.softmax(top_vals, axis=-1)                    # (T, k), суммируется в 1 по строке
+
+        # aux_loss/z_loss считаются по ПОЛНОМУ softmax(router_logits) --
+        # это диагностика балансировки роутера как такового (Switch-style
+        # load-balancing loss смотрит на распределение по ВСЕМ экспертам,
+        # не только выбранным), а не по факту 2T-дисптача.
+        full_probs = jax.nn.softmax(router_logits, axis=-1)
+        mean_probs = jnp.mean(full_probs, axis=0)
         self.sow("losses", "aux_loss", E_routed * jnp.sum(mean_probs * mean_probs))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(
             jax.scipy.special.logsumexp(router_logits, axis=-1))))
@@ -282,21 +309,13 @@ class GmmMoEJ(nn.Module):
                          (E_routed, d_ff, d_model), jnp.bfloat16)
 
         # ==================================================================
-        # ФИКС: весь диспетчинг (argsort/bincount/gmm/tgmm) переносится
-        # ЦЕЛИКОМ внутрь shard_map -- Mosaic custom-call (gmm/tgmm) не
-        # умеет auto-partition (см. "Mosaic kernels cannot be automatically
-        # partitioned" -- та же причина, по которой GDN-2/MLA уже
-        # оборачивают свои Pallas-вызовы в shard_map в этом проекте).
-        # with_sharding_constraint (старый _local_sharded) годится только
-        # для обычных HLO-операций, НЕ для Pallas custom-call -- этого
-        # блока внутри shard_map он больше не касается: каждое устройство
-        # получает свой ЛОКАЛЬНЫЙ x/expert_idx/gate_weight КАК ЕСТЬ
-        # (обычный jax-массив без sharding-аннотаций внутри тела shard_map)
-        # и целиком самостоятельно считает routing+FFN на своих токенах --
-        # никакого cross-device gather/comm не требуется и не происходит.
+        # M2': дублирование токенов под 2T-диспетчинг (k копий на токен,
+        # каждая помечена одним из k выбранных экспертов, взвешена своим
+        # перенормированным гейтом). Порядок по оси-k сохраняется через
+        # concatenate -- используется для обратного split на combine.
         # ==================================================================
-        def _dispatch_and_ffn(flat_x_local, expert_idx_local, gate_weight_local, W1_local, W2_local):
-            T_local = flat_x_local.shape[0]
+        def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
+            T_rep = flat_x_local.shape[0]  # = k * T_local_device
             group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
             perm = jnp.argsort(expert_idx_local, stable=True)
             inv_perm = jnp.argsort(perm)
@@ -305,30 +324,75 @@ class GmmMoEJ(nn.Module):
             grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
             out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
 
-            routed_out_local = jnp.take(out_sorted, inv_perm, axis=0)
-            return routed_out_local
+            return jnp.take(out_sorted, inv_perm, axis=0)  # (T_rep, d), тот же порядок, что flat_x_local
+
+        # flat_x_rep: (k*T, d) -- k конкатенированных копий flat_x, в
+        # порядке [копия под top-1-выбор для каждого токена][копия под
+        # top-2-выбор для каждого токена]...
+        flat_x_rep = jnp.concatenate([flat_x] * k, axis=0)
+        expert_idx_rep = jnp.concatenate(
+            [top_idx[:, j] for j in range(k)], axis=0
+        )  # (k*T,)
 
         if mesh is not None and batch_axis is not None:
+            def _dispatch_local_topk(flat_x_local, top_idx_local, top_gate_local, W1_local, W2_local):
+                # Внутри shard_map: flat_x_local -- (T_local, d),
+                # top_idx_local/top_gate_local -- (T_local, k).
+                flat_x_rep_local = jnp.concatenate([flat_x_local] * k, axis=0)
+                expert_idx_rep_local = jnp.concatenate(
+                    [top_idx_local[:, j] for j in range(k)], axis=0
+                )
+                out_rep_local = _dispatch_and_ffn(flat_x_rep_local, expert_idx_rep_local, W1_local, W2_local)
+                # ФИКС: split+weighted-combine (M3') ПЕРЕНЕСЕНЫ ВНУТРЬ shard_map.
+                # Причина: out_rep_local имеет форму (k*T_local, d) --
+                # если вернуть её КАК ЕСТЬ наружу под out_specs=P(batch_axis,
+                # None), shard_map соберёт глобальный массив КОНКАТЕНАЦИЕЙ
+                # ПО УСТРОЙСТВАМ вдоль batch_axis: [dev0: copy0,copy1][dev1:
+                # copy0,copy1]... -- а код снаружи ожидал бы порядок
+                # [copy0_ВСЕ][copy1_ВСЕ]. Эти два порядка совпадают ТОЛЬКО
+                # при n_devices=1 -- при n_devices>1 расходятся, давая
+                # finite, но НЕВЕРНЫЙ результат (см. M5-topk2 тест,
+                # rel_err=0.157). Комбинирование должно происходить на
+                # ЛОКАЛЬНЫХ per-device T_local-строках, ДО того как
+                # shard_map соберёт результат по batch_axis -- тогда наружу
+                # уходит уже готовый (T_local, d), без всякой k-неоднозначности.
+                out_chunks_local = jnp.split(out_rep_local, k, axis=0)  # k x (T_local, d)
+                combined_local = jnp.zeros_like(flat_x_local, dtype=jnp.float32)
+                for j in range(k):
+                    combined_local = combined_local + out_chunks_local[j].astype(jnp.float32) * top_gate_local[:, j:j+1]
+                return combined_local  # (T_local, d) -- однозначно совпадает с out_specs
+
             in_specs = (
                 P(batch_axis, None),   # flat_x
-                P(batch_axis),         # expert_idx
-                P(batch_axis, None),   # gate_weight
-                P(None, None, None),   # W1 -- реплицирован
-                P(None, None, None),   # W2 -- реплицирован
+                P(batch_axis, None),   # top_idx
+                P(batch_axis, None),   # top_gate
+                P(None, None, None),   # W1
+                P(None, None, None),   # W2
             )
             out_specs = P(batch_axis, None)
             sharded_dispatch = jax.shard_map(
-                _dispatch_and_ffn, mesh=mesh,
+                _dispatch_local_topk, mesh=mesh,
                 in_specs=in_specs, out_specs=out_specs,
                 check_vma=False,
             )
-            routed_out = sharded_dispatch(flat_x, expert_idx, gate_weight, W1, W2)
+            routed_out = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
         else:
-            routed_out = _dispatch_and_ffn(flat_x, expert_idx, gate_weight, W1, W2)
-
-        routed_out = routed_out.astype(jnp.float32) * gate_weight
+            # без mesh: split+combine остаются снаружи, как было -- здесь
+            # неоднозначности порядка нет, потому что shard_map не участвует.
+            routed_out_rep = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
+            out_chunks = jnp.split(routed_out_rep, k, axis=0)
+            routed_out = jnp.zeros_like(flat_x, dtype=jnp.float32)
+            for j in range(k):
+                routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1]
+        # ==================================================================
+        # M3': combine -- разбить (k*T, d) обратно на k кусков по T строк
+        # каждый (тот же порядок конкатенации, что при dispatch), взвесить
+        # top_gate[:, j] и просуммировать.
+        # ==================================================================
+        
         combined = shared_out.astype(jnp.float32) + routed_out
         combined = _sanitize(combined)
 
         self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
         return combined.reshape(b, l, d).astype(x.dtype)
+        
