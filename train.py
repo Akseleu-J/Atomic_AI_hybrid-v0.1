@@ -897,7 +897,8 @@ def main_execution():
             "/kaggle/input/datasets/umirbayulgaisha/math-data/math_labels.npy",
         ), #math
     ]
-"""        (
+    """        
+        (
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_input_ids.npy",
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_labels.npy",
         ),  # codex
@@ -915,7 +916,7 @@ def main_execution():
              "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_input_ids.npy",
             "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_labels.npy",
         ),  # syntheticcode
-        """
+    """
 
     for ids_path, lbls_path in file_pairs:
         if not os.path.exists(ids_path):
