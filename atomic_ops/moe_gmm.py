@@ -126,7 +126,16 @@ from jax.sharding import PartitionSpec as P
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm, tgmm
 
 
-from ..model import get_model_mesh, get_batch_axis
+import sys
+import os
+
+
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+from model import get_model_mesh, get_betch_axis
+
+
 _DEFAULT_TILING = (128, 128, 128)
 _SANITIZE_CLIP = 1e3
  
