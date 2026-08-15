@@ -457,7 +457,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         # unsharded, same treatment as "experts_block" always had.
         # "shared_expert"/"router" are plain Dense layers (no vmap axis),
         # so they fall through to the normal FSDP logic below unchanged.
-        if "experts_block" in path_str or "routed_experts" in path_str:
+        if ("experts_block" in path_str or "routed_experts" in path_str
+                or "routed_w1" in path_str or "routed_w2" in path_str):
             return NamedSharding(mesh, P(*([None] * param.ndim)))
         best_axis, best_size = None, -1
         for i, size in enumerate(param.shape):
