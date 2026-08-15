@@ -925,7 +925,7 @@ class BlockDAR(nn.Module):
             _cx_next = current_x + delta
             cx_abs_max = jnp.max(jnp.abs(jnp.nan_to_num(_cx_next, nan=0.0, posinf=0.0, neginf=0.0)))
             jax.lax.cond(
-                cx_abs_max > 1e2,
+                cx_abs_max > 1e3,
                 lambda: jax.debug.print(
                     "[RESID-DIAG] ⚠️ current_x после layer={l} (block={b}) max|abs|={m} "
                     "ДО санитизации -- дрейф residual stream", b=self.block_idx, l=layer_idx, m=cx_abs_max,
