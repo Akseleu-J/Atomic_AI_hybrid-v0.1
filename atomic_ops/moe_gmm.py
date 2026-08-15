@@ -133,7 +133,6 @@ import os
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
-from model import get_model_mesh, get_betch_axis
 
 
 _DEFAULT_TILING = (128, 128, 128)
@@ -262,7 +261,7 @@ class GmmMoEJ(nn.Module):
 
         # Local import mirrors moe_sparse.py's own workaround for the
         # model.py <-> atomic_ops circular import.
-       
+        from model import get_model_mesh, get_betch_axis
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
 
