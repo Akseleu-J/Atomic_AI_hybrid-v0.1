@@ -1,4 +1,5 @@
 import math
+import os
 from functools import partial
 
 import jax
@@ -59,6 +60,36 @@ def get_model_mesh():
 
 def get_batch_axis():
     return _batch_axis
+
+
+# ==========================================================================
+# ДИАГНОСТИКА (сквозная, переиспользует тот же флаг, что kernel_d_pipeline.py
+# использует для GDN-2 -- GDN2_FWD_DIAG=1, по умолчанию OFF, нулевой оверхед
+# в обычном обучении). Добавлена сюда (module-level, model.py) для
+# использования внутри Mamba2J -- см. её докстринг ниже: диагностика нужна,
+# чтобы увидеть, реально ли новый RMSNorm перед out_proj сбивает амплитуду
+# SSM-выхода, а не просто гадать по [RESID-DIAG] на несколько слоёв позже.
+# ==========================================================================
+_GDN2_FWD_DIAG = os.environ.get("GDN2_FWD_DIAG", "0") == "1"
+
+
+def _diag_maxabs(tag: str, x):
+    """No-op (возвращает x без изменений) если GDN2_FWD_DIAG=0. Иначе печатает
+    finite/non-finite статус и max|abs| конечной части -- чисто диагностика,
+    значение не меняет ни в каком режиме."""
+    if not _GDN2_FWD_DIAG:
+        return x
+
+    finite_mask = jnp.isfinite(x)
+    all_finite = jnp.all(finite_mask)
+    safe_x = jnp.where(finite_mask, x, 0.0)
+    max_abs = jnp.max(jnp.abs(safe_x))
+
+    jax.debug.print(
+        "[MAMBA2-FWD-DIAG] " + tag + ": all_finite={f}  max_abs={m:.3e}",
+        f=all_finite, m=max_abs,
+    )
+    return x
 
 
 # ==========================================================================
@@ -268,6 +299,18 @@ class MLAJ(nn.Module):
             out = jnp.einsum("bhqk,bhkd->bhqd", attn, V)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
+
+        # ФИКС (по аналогии с out_norm в GatedDeltaNet2J / ssm_out_norm в
+        # Mamba2J -- см. их докстринги): MLA была единственным из трёх типов
+        # саблеера БЕЗ нормировки выхода перед финальной проекцией. До этого
+        # момента make_grad_sanitizer чинил только градиент на backward, но
+        # ничего не ограничивал в forward -- амплитуда выхода attention могла
+        # свободно плавать перед W_o и уходить в history_blocks/local_deltas
+        # ненормированной, ровно как это было прослежено для Mamba2 (RESID-DIAG,
+        # рост current_x после mla-слоёв в block0/3/6). RMSNorm здесь -- тот же
+        # приём, применённый к последнему из трёх недостающих мест.
+        out = nn.RMSNorm(epsilon=1e-6, name="attn_out_norm")(out).astype(x.dtype)
+
         out = make_grad_sanitizer("mla_flash_attn_out")(out)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o", dtype=jnp.bfloat16)(out)
 
@@ -408,7 +451,29 @@ class Mamba2J(nn.Module):
             _chunk_step, (carry_da_init, carry_h_init), (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch)
         )
         y = jnp.moveaxis(y_chunks, 0, 1).reshape(b, l, d_inner)
- 
+
+        # ДИАГНОСТИКА (GDN2_FWD_DIAG=1): величина SSM-выхода ДО нормировки --
+        # чтобы видеть, насколько велика амплитуда, которую ниже гасит
+        # RMSNorm, вместо того чтобы узнавать о ней только по [RESID-DIAG]
+        # в BlockDAR несколько слоёв спустя.
+        y = _diag_maxabs("mamba2_ssm_out_pre_norm", y)
+
+        # ФИКС (закрывает дыру, симметричную out_norm в GatedDeltaNet2J):
+        # раньше выход SSM-скана шёл прямо в out_proj через
+        # y * silu(res) -> clip(±1e4) -> out_proj, БЕЗ какой-либо нормировки --
+        # единственный из трёх типов саблеера без неё на момент инцидентов
+        # RESID-DIAG на layer=13/14 (block4, mamba2). Клип ограничивает
+        # диапазон, но не масштаб/распределение -- значение могло свободно
+        # плавать от ~1 до 1e4 и оттуда накапливаться в local_deltas/
+        # history_blocks, откуда его читают все последующие блоки через
+        # HybridDARAttention/IntraBlockAttention. RMSNorm здесь -- ровно тот
+        # же приём, что уже стоит на выходе GDN-2 (out_norm), применённый
+        # ДО гейта silu(res), а не после -- чтобы сам гейт не мог снова
+        # растащить масштаб уже отнормированного значения.
+        y = nn.RMSNorm(epsilon=1e-6, name="ssm_out_norm")(y).astype(x_bc.dtype)
+
+        y = _diag_maxabs("mamba2_ssm_out_post_norm", y)
+
         out = y * jax.nn.silu(res)
         # ФИКС #5: последний рубеж перед residual stream -- даже если весь
         # scan остался конечным, финальное умножение y*silu(res) может дать
@@ -523,6 +588,20 @@ class GatedDeltaNet2J(nn.Module):
         alpha = jnp.exp(g)
 
         out_gate = nn.Dense(d, use_bias=False, name="out_gate", dtype=jnp.bfloat16)(x)
+        # ФИКС (закрывает дыру, названную прямо в докстринге BlockDARLayer
+        # ниже по файлу -- "GatedDeltaNet2J: out_gate ничем не клипируется до
+        # silu(out_gate)*out -> out_proj"): out (после out_norm) уже
+        # нормирован, но out_gate -- сырой выход Dense, ничем не ограниченный.
+        # jax.nn.silu растёт линейно на больших положительных x (не насыщается,
+        # в отличие от sigmoid), так что при разросшихся весах out_gate
+        # (Muon-таргет без weight decay в среднем растёт быстрее AdamW/Lion --
+        # см. optimizer.py) итоговый множитель silu(out_gate) может быть
+        # произвольно большим и растащить уже отнормированный out обратно в
+        # residual stream -- ровно тот путь усиления, который приводил к
+        # RESID-DIAG выбросам после gdn2-слоёв. Клип на уровне входа в out_gate
+        # тем же способом (±1e2), что и клип параметров в train.py после
+        # apply_updates -- дёшево, не меняет остальную математику.
+        out_gate = jnp.clip(out_gate, -1e2, 1e2)
 
         def _sanitize(t):
             return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
@@ -777,6 +856,11 @@ class BlockDARLayer(nn.Module):
         # ограниченный вход (mixed) может дать неограниченный delta на
         # выходе. Клип здесь, в источнике, закрывает это независимо от
         # внутреннего механизма амплификации.
+        #
+        # ОБНОВЛЕНИЕ: сам источник (out_gate без клипа в GatedDeltaNet2J,
+        # отсутствие RMSNorm на выходе Mamba2 и MLA) закрыт выше по стеку
+        # (см. фиксы в GatedDeltaNet2J/Mamba2J/MLAJ) -- этот клип остаётся
+        # как второй, независимый рубеж обороны, а не единственная защита.
         delta = jnp.nan_to_num(jnp.clip(delta, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return delta
