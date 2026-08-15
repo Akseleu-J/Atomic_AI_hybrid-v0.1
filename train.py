@@ -851,12 +851,18 @@ def main_execution():
         n_heads=6,            # 768/6 = 128 = MXU tile, required by kernel_a_scores.py assert
         d_latent=768,
         d_ff=4096,
-        num_experts=8,        # 1 shared + 7 routed (atomic_ops/moe_sparse.py's SparseMoEJ)
-        top_k=1,              # ФИКС: SparseMoEJ routes top-1 among the 7 routed experts (argmax
-                               # over router_logits) -- was 2 (unused, dense MoEJ ignored this
-                               # field entirely). Now documents the ACTUAL routing behavior;
-                               # SparseMoEJ still doesn't read this field directly (top-1 is
-                               # hardcoded via jnp.argmax), this is documentation, not wiring.
+        num_experts=8,        # 1 shared + 7 routed (atomic_ops/moe_gmm.py's GmmMoEJ)
+        # ФИКС (M6, переход SparseMoEJ -> GmmMoEJ top-k=2): старый комментарий
+        # здесь описывал SparseMoEJ (top-1 через argmax, top_k=1 было чисто
+        # документацией, само поле никуда не читалось). GmmMoEJ (текущий
+        # импорт в model.py) РЕАЛЬНО читает cfg.top_k (см. фикс в model.py:
+        # GmmMoEJ(cfg=self.cfg, top_k=self.cfg.top_k, ...)) и провалидирован
+        # именно с top_k=2 -- forward/backward/sharding parity против
+        # плотного JAX-референса, rel_err ~4-5e-3 (test_moe_gmm_topk_parity.py,
+        # test_moe_gmm_topk_sharding.py). top_k=1 здесь означал бы, что
+        # каждый токен идёт лишь к одному эксперту -- меньше выразительности
+        # роутинга, чем провалидированный top-2 путь.
+        top_k=2,
         moe_capacity_factor=1.25,  # confirmed via atomic_ops_moe_bench_tpu.py: dropped_ratio->0
                                      # by the end of the quality-check run at this factor.
         # ФИКС: поднят с 0.01 -- quality-check (moe_quality_check_tpu.py)
