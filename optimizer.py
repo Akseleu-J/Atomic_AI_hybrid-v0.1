@@ -134,6 +134,18 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
             return "adamw_decay"
         if "norm" in path_str or "bias" in path_str:
             return "adamw_nodecay"
+        # ФИКС (интеграция SparseMoEJ, atomic_ops/moe_sparse.py): router --
+        # маленький, чувствительный к начальной балансировке Dense(d_model,
+        # E_routed). Muon-ортогонализация (агрессивное обновление
+        # направления, без weight decay до фикса выше) на этом конкретном
+        # слое рискует резко раскачать routing-решения до того, как
+        # утилизация экспертов успеет устаканиться -- именно тот режим
+        # (высокий dropped_ratio на первых шагах, пока роутер не
+        # сбалансирован), где ошибка маршрутизации дороже всего. AdamW без
+        # decay -- мягче и предсказуемее для этого конкретного слоя, тот же
+        # выбор, что уже сделан для norm/bias.
+        if "router" in path_str:
+            return "adamw_nodecay"
         if param.ndim >= 2:
             if "mamba" in path_str:
                 return "lion"
@@ -247,15 +259,25 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     )
 
     expert_util_stacked = None
+    dropped_ratio_stacked = None
     if not deterministic:
         final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
         z_losses = collect_by_leaf_name(sowed_vars["losses"], "z_loss")
         expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
+        # ФИКС (интеграция SparseMoEJ): moe_dropped_ratio sown per-layer by
+        # SparseMoEJ (atomic_ops/moe_sparse.py) -- same collection pattern
+        # as expert_utilization/aux_loss/z_loss above. Absent for the dense
+        # MoEJ path, so this stays None (and downstream consumers must
+        # handle that, same as expert_utilization already does) if the
+        # model is ever switched back to the dense MoE for cross-checking.
+        dropped_ratios = collect_by_leaf_name(sowed_vars["losses"], "moe_dropped_ratio")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
         if expert_utils:
             expert_util_stacked = jnp.stack(expert_utils)
+        if dropped_ratios:
+            dropped_ratio_stacked = jnp.stack(dropped_ratios)
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
@@ -280,6 +302,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "aux_loss": aux_loss,
             "z_loss": z_loss,
             "expert_utilization": expert_util_stacked,
+            "moe_dropped_ratio": dropped_ratio_stacked,   # NEW
         }
         return total_loss, aux_info
     return total_loss
