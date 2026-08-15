@@ -134,18 +134,22 @@ class SparseMoEJ(nn.Module):
             spec = P(batch_axis, *([None] * (t.ndim - 1)))
             return jax.lax.with_sharding_constraint(t, jax.sharding.NamedSharding(mesh, spec))
 
-        def _replicated(t):
-            """Форсирует ПОЛНУЮ репликацию t по всем осям mesh -- каждое
-            устройство видит ОДИНАКОВЫЙ полный тензор. Нужно ПЕРЕД
-            argsort/searchsorted/scatter (см. FIX в докстринге модуля):
-            data-dependent dispatch должен считать capacity/boundaries по
-            одному и тому же полному view на каждом устройстве, а не по
-            своему локальному шарду батча."""
-            if mesh is None:
+       def _local_sharded(t):
+    """Explicit constraint: t stays SHARDED along batch_axis, never
+    gathered. Correct semantics for this dispatch: routed_experts params
+    are already fully replicated per device (see train.py's
+    _get_shard_spec), so NO cross-device communication is needed for
+    top-1 routing -- each device independently sorts/scatters/gathers
+    ONLY its own local batch shard. This is the fix for BOTH problems:
+    (a) the crash without any constraint (GSPMD couldn't infer a valid
+    partitioning for argsort/scatter on an implicitly-sharded input on
+    its own), and (b) the previous _replicated() fix's hidden cost (an
+    unnecessary full-batch all-gather onto every device before dispatch,
+    duplicating compute 8x and defeating much of sparse MoE's point)."""
+            if mesh is None or batch_axis is None:
                 return t
-            spec = P(*([None] * t.ndim))
+            spec = P(batch_axis, *([None] * (t.ndim - 1)))
             return jax.lax.with_sharding_constraint(t, jax.sharding.NamedSharding(mesh, spec))
-
         # ---- shared expert: без диспатча, обычный einsum-путь, шардится
         # автоматически как раньше -- constraint здесь не нужен ----
         shared_out = ExpertPack(
@@ -179,9 +183,9 @@ class SparseMoEJ(nn.Module):
         # capacity считались одинаково на КАЖДОМ устройстве, независимо от
         # того, как auto-partitioner решил бы шардировать их по умолчанию.
         # ==================================================================
-        flat_x_r = _replicated(flat_x)
-        expert_idx_r = _replicated(expert_idx)
-        gate_weight_r = _replicated(gate_weight)
+        flat_x_r = _local_sharded(flat_x)
+        expert_idx_r = _local_sharded(expert_idx)
+        gate_weight_r = _local_sharded(gate_weight)
 
         capacity = max(1, int(self.cfg.moe_capacity_factor * T / E_routed))
 
