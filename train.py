@@ -889,6 +889,12 @@ def main_execution():
     )
     file_pairs = [
         (
+            "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_labels.npy",
+        )  # kodcode
+    ]
+"""
+        (
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_input_ids.npy",
         "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_labels.npy",
         ),  # codex
@@ -896,10 +902,7 @@ def main_execution():
         "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_input_ids.npy",
         "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_labels.npy",
         ),  #agentpack
-        (
-            "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_input_ids.npy",
-            "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_labels.npy",
-        ),  # kodcode
+        
         (
             "/kaggle/input/datasets/umirbayulgaisha/math-data/math_input_ids.npy",
             "/kaggle/input/datasets/umirbayulgaisha/math-data/math_labels.npy",
@@ -912,7 +915,7 @@ def main_execution():
              "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_input_ids.npy",
             "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_labels.npy",
         ),  # syntheticcode
-    ]
+        """
 
     for ids_path, lbls_path in file_pairs:
         if not os.path.exists(ids_path):
