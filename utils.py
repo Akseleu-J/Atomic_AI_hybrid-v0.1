@@ -1,3 +1,31 @@
+def path_to_str(path) -> str:
+    """Turn a jax.tree_util key-path into a lowercase string for substring matching.
+
+    `jax.tree_util.tree_map_with_path` hands back a tuple of key objects whose type
+    depends on the container at that point in the pytree:
+      - DictKey            (dict / FrozenDict entries)   -> has `.key`
+      - FlattenedIndexKey   (flattened containers)         -> has `.key`
+      - GetAttrKey          (NamedTuple fields)             -> has `.name`
+      - SequenceKey         (list / plain tuple entries)   -> has `.idx`
+
+    A flax params pytree is dict-only, so `str(p.key)` alone happens to work there.
+    An optax optimizer-state pytree (from `optax.chain`/`multi_transform`/NamedTuple
+    states like `MuonState`) mixes in GetAttrKey and SequenceKey entries, and `p.key`
+    raises `AttributeError: 'SequenceKey' object has no attribute 'key'` on those.
+    This checks all the attribute names generically instead of assuming `.key`.
+    """
+    parts = []
+    for p in path:
+        if hasattr(p, "key"):
+            parts.append(str(p.key))
+        elif hasattr(p, "name"):
+            parts.append(str(p.name))
+        elif hasattr(p, "idx"):
+            parts.append(str(p.idx))
+        else:
+            parts.append(str(p))
+    return "".join(parts).lower()
+    
 def collect_by_leaf_name(tree, target_name):
     import jax
 
