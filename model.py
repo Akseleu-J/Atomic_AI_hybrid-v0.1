@@ -479,7 +479,7 @@ class Mamba2J(nn.Module):
         # scan остался конечным, финальное умножение y*silu(res) может дать
         # усиление (оба множителя уже прошли клип по отдельности, но их
         # произведение -- нет). Не пускаем большие значения в out_proj/residual.
-        out = jnp.clip(out, jnp.array(-1e4, dtype=out.dtype), jnp.array(1e4, dtype=out.dtype))
+        out = jnp.clip(out, jnp.array(-3e2, dtype=out.dtype), jnp.array(3e2, dtype=out.dtype))
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out)
  
  
