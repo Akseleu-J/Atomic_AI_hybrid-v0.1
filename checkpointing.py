@@ -168,17 +168,19 @@ def _finalize_pending_save(mngr):
 
 
 def save_slot_async(mngr, local_dir, step, params, opt_state, epoch, best_val_loss, best_train_loss, train_loss=None):
-    """Запускает async-сейв на НЕЗАВИСИМОЙ копии params/opt_state и сразу
-    возвращает управление -- TPU продолжает следующие шаги, пока диск пишется
-    в фоне."""
+    """Запускает async-сейв. ФИКС (OOM на шаге 4527, RESOURCE_EXHAUSTED): раньше
+    снапшот делался jnp.array(x, copy=True) -- это дубль НА УСТРОЙСТВЕ (HBM), то
+    есть на пике держались одновременно живые params+opt_state И их device-side
+    копия, поверх чего тут же запускался следующий train_step -- не хватило ~1.17G
+    при 375M свободных. orbax при записи на диск всё равно требует данные на host,
+    поэтому on-device дубль был лишним и просто дорогим риском OOM. Снимаем снапшот
+    сразу на host (jax.device_get) -- orbax.StandardSave прекрасно принимает numpy
+    массивы наравне с jax arrays, а HBM во время снапшота вообще не растёт вторым
+    полным дублем."""
     _finalize_pending_save(mngr)
 
-    params_snapshot = jax.block_until_ready(
-        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), params)
-    )
-    opt_state_snapshot = jax.block_until_ready(
-        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), opt_state)
-    )
+    params_snapshot = jax.tree_util.tree_map(jax.device_get, params)
+    opt_state_snapshot = jax.tree_util.tree_map(jax.device_get, opt_state)
 
     try:
         du = shutil.disk_usage(local_dir)
@@ -195,7 +197,6 @@ def save_slot_async(mngr, local_dir, step, params, opt_state, epoch, best_val_lo
         train_loss=train_loss, t0=t0,
     )
     print(f"[CKPT] 🚀 Async-сейв запущен для шага {step} -- TPU продолжает без ожидания.")
-
 
 def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
     """Заливает {local_dir}/{step} -> HF под path_in_repo={repo_subdir}/{step},
