@@ -3,6 +3,12 @@ train_setup.py -- диагностика non-finite по группам пара
 шардинг / компиляция train-step'ов, multi-source dataloader.
 
 Вынесено из train.py. Логика не менялась -- перенос как есть.
+
+ФИКС (dataloader, по гипотезе "смешение источников в одном батче триггерит
+RESID-DIAG на layer=22/mamba2" -- см. чат): dataloader_multi_source теперь
+поддерживает три режима подачи данных (mode="mixed"/"sequential"/
+"round_robin") и per-source fraction (третий элемент в file_pairs). Все
+остальные функции в этом файле -- БЕЗ ИЗМЕНЕНИЙ.
 """
 from __future__ import annotations
 
@@ -295,9 +301,15 @@ def resolve_source_files(output_dir, prefix):
 
 
 def build_manifest(file_pairs):
+    """ФИКС: теперь принимает и 2-tuple (ids_path, lbls_path), и 3-tuple
+    (ids_path, lbls_path, fraction) -- третий элемент здесь просто
+    игнорируется (используется выше по стеку, в dataloader_multi_source, до
+    вызова build_manifest), чтобы старые вызовы с 2-tuple продолжали
+    работать без изменений."""
     manifest = []
     total = 0
-    for ids_path, lbls_path in file_pairs:
+    for entry in file_pairs:
+        ids_path, lbls_path = entry[0], entry[1]
         n_rows = np.load(ids_path, mmap_mode="r").shape[0]
         manifest.append((ids_path, lbls_path, n_rows))
         total += n_rows
@@ -307,11 +319,63 @@ def build_manifest(file_pairs):
 
 
 def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_split=0.05,
-                             dataset_fraction=1.0, fraction_seed=777, skip_batches=0):
-    manifest = build_manifest(file_pairs)
+                             dataset_fraction=1.0, fraction_seed=777, skip_batches=0,
+                             mode="mixed"):
+    """
+    file_pairs: список (ids_path, lbls_path) ИЛИ (ids_path, lbls_path, fraction)
+    -- fraction (0.0-1.0) для ИМЕННО ЭТОГО источника, по умолчанию 1.0, если
+    не указан (полная обратная совместимость со старым 2-tuple форматом).
+
+    ФИКС (гипотеза: смешанные батчи из разнородных источников -- один из
+    возможных факторов частого RESID-DIAG на layer=22/mamba2 при полном
+    6-датасетном пуле против стабильных 4000-6000 шагов на 2 источниках --
+    см. чат): три режима подачи данных, mode=
+
+      "mixed" (default, СТАРОЕ поведение, byte-for-byte то же самое, если
+        вызвать без явного mode=) -- все источники в одном глобально
+        перемешанном пуле, один батч может содержать строки из НЕСКОЛЬКИХ
+        источников сразу.
+
+      "sequential" -- источники проходятся ПО ОЧЕРЕДИ целиком, в порядке
+        file_pairs: сначала ВСЕ шаги первого источника (с локальным shuffle
+        внутри источника на каждый повторный проход), потом полностью
+        второй, и т.д. Ни один батч не смешивает разные источники, но
+        модель подолгу (сотни-тысячи шагов) видит только один источник
+        подряд -- ближе к curriculum learning, чем к обычному перемешанному
+        обучению; риск временного смещения градиентного сигнала в сторону
+        "текущего" источника, если LR всё ещё заметен (cosine decay ещё не
+        близко к alpha).
+
+      "round_robin" -- на каждом МИКРО-шаге ровно один источник, источники
+        чередуются по кругу в порядке file_pairs (0,1,...,S-1,0,1,...).
+        Внутри батча источники не смешиваются, но и не залипают надолго --
+        за accum_steps подряд идущих микрошага эффективный шаг (после
+        суммирования градиентов) обычно видит несколько РАЗНЫХ источников.
+        ВАЖНО: посещает каждый источник с РАВНОЙ частотой (1/n_sources за
+        цикл) НЕЗАВИСИМО от его размера -- в отличие от "mixed", где
+        вероятность строки из источника ~ пропорциональна его размеру.
+        Для маленьких источников (agentpack/rstar/syntheticcode) это
+        эффективно ПЕРЕВЕШИВАЕТ их относительно природной доли -- нормально
+        для короткого диагностического прогона, но не для финального
+        полного обучения без явного контроля через per-source fraction.
+
+    Каждый батч в mode="round_robin" несёт дополнительное поле
+    "_source_idx" (индекс источника в file_pairs, для диагностики -- если
+    сработает RESID-DIAG/non-finite, можно сохранить это поле рядом со
+    снапшотом и сразу узнать источник-виновник).
+    """
+    normalized_pairs = []
+    for entry in file_pairs:
+        if len(entry) == 3:
+            ids_path, lbls_path, frac = entry
+        else:
+            ids_path, lbls_path = entry
+            frac = 1.0
+        normalized_pairs.append((ids_path, lbls_path, float(frac)))
+
+    manifest = build_manifest([(p[0], p[1]) for p in normalized_pairs])
     sizes = np.array([n for _, _, n in manifest])
     offsets = np.concatenate([[0], np.cumsum(sizes)])
-    total_blocks = int(offsets[-1])
     context_length = np.load(manifest[0][0], mmap_mode="r").shape[1]
     if context_length > seq_len:
         context_length = seq_len
@@ -339,14 +403,33 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
             lbls_out[m] = lbls_full[:, :seq_len]
         return ids_out, lbls_out
 
-    all_idx = np.arange(total_blocks)
+    # ---- per-source fraction: применяем К КАЖДОМУ источнику отдельно,
+    # ДО train/val split и ДО глобального dataset_fraction ----
+    frac_rng_per_source = np.random.RandomState(fraction_seed)
+    per_source_idx = []
+    for s, (ids_path, _, n) in enumerate(manifest):
+        local_idx = np.arange(offsets[s], offsets[s + 1])
+        frac = normalized_pairs[s][2]
+        if frac < 1.0:
+            n_keep = max(1, int(len(local_idx) * frac))
+            local_idx = frac_rng_per_source.choice(local_idx, size=n_keep, replace=False)
+            local_idx.sort()
+        if frac != 1.0:
+            print(f"[DATA] Источник {os.path.basename(ids_path)}: "
+                  f"{frac*100:.0f}% -> {len(local_idx):,} из {int(n):,} блоков")
+        per_source_idx.append(local_idx)
+
+    all_idx = np.concatenate(per_source_idx)
+
+    # ---- старый ГЛОБАЛЬНЫЙ dataset_fraction -- оставлен для обратной
+    # совместимости, применяется ПОВЕРХ уже отфильтрованного по источникам ----
     if dataset_fraction < 1.0:
         frac_rng = np.random.RandomState(fraction_seed)
-        n_keep = int(total_blocks * dataset_fraction)
+        n_keep = int(len(all_idx) * dataset_fraction)
         all_idx = frac_rng.choice(all_idx, size=n_keep, replace=False)
         all_idx.sort()
-        print(f"[DATA] Подвыборка {dataset_fraction*100:.0f}%: {n_keep:,} из {total_blocks:,} блоков "
-              f"(seed={fraction_seed}, детерминированно между рестартами)")
+        print(f"[DATA] Общая подвыборка {dataset_fraction*100:.0f}%: {n_keep:,} блоков "
+              f"(после per-source фильтра, seed={fraction_seed})")
 
     pool_size = len(all_idx)
     val_size = int(pool_size * val_split)
@@ -358,7 +441,72 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
     train_idx_pool = shuffled[:train_size]
     val_idx_pool = shuffled[train_size:]
 
-    def _generator(pool, is_train=True, skip_first=0):
+    train_pool_by_source = None
+    if mode in ("sequential", "round_robin"):
+        val_set = set(val_idx_pool.tolist())
+        train_pool_by_source = []
+        for s in range(len(manifest)):
+            src_train_idx = np.array(
+                [i for i in per_source_idx[s] if i not in val_set], dtype=np.int64
+            )
+            train_pool_by_source.append(src_train_idx)
+            print(f"[DATA] (mode={mode}) источник #{s} ({os.path.basename(manifest[s][0])}): "
+                  f"{len(src_train_idx):,} train-блоков")
+
+    def _infinite_source_batches(src_idx, seed):
+        local_rng = np.random.RandomState(seed)
+        idx_local = np.copy(src_idx)
+        while True:
+            local_rng.shuffle(idx_local)
+            n_steps = len(idx_local) // batch_size
+            for step in range(n_steps):
+                batch_idx = idx_local[step * batch_size:(step + 1) * batch_size]
+                yield _gather_batch(batch_idx)
+
+    def _round_robin_gen(pool_by_source, skip_first=0):
+        src_gens = [_infinite_source_batches(pool_by_source[s], seed=1000 + s)
+                    for s in range(len(pool_by_source))]
+        n_sources = len(src_gens)
+        step_i = 0
+        while True:
+            s = step_i % n_sources
+            ids_np, lbls_np = next(src_gens[s])
+            step_i += 1
+            if step_i <= skip_first:
+                continue
+            yield {
+                "input_ids": jax.device_put(jnp.array(ids_np), data_sharding),
+                "labels": jax.device_put(jnp.array(lbls_np), data_sharding),
+                "_source_idx": s,
+            }
+
+    def _sequential_gen(pool_by_source, skip_first=0):
+        local_rng = np.random.RandomState(123)
+        skip_remaining = skip_first
+        first_pass = True
+        while True:
+            for s, src_idx in enumerate(pool_by_source):
+                idx_local = np.copy(src_idx)
+                local_rng.shuffle(idx_local)
+                n_steps = len(idx_local) // batch_size
+                start_step = 0
+                if first_pass and skip_remaining > 0:
+                    start_step = min(skip_remaining, n_steps)
+                    skip_remaining -= start_step
+                    if start_step > 0:
+                        print(f"[DATA] Resume (sequential): пропускаем {start_step} "
+                              f"микрошагов источника #{s}.")
+                for step in range(start_step, n_steps):
+                    batch_idx = idx_local[step * batch_size:(step + 1) * batch_size]
+                    ids_np, lbls_np = _gather_batch(batch_idx)
+                    yield {
+                        "input_ids": jax.device_put(jnp.array(ids_np), data_sharding),
+                        "labels": jax.device_put(jnp.array(lbls_np), data_sharding),
+                        "_source_idx": s,
+                    }
+            first_pass = False
+
+    def _mixed_gen(pool, is_train=True, skip_first=0):
         idx_local = np.copy(pool)
         local_rng = np.random.RandomState(123)
         first_pass = True
@@ -383,9 +531,18 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
             if not is_train:
                 break
 
+    if mode == "round_robin":
+        train_gen = _round_robin_gen(train_pool_by_source, skip_first=skip_batches)
+    elif mode == "sequential":
+        train_gen = _sequential_gen(train_pool_by_source, skip_first=skip_batches)
+    elif mode == "mixed":
+        train_gen = _mixed_gen(train_idx_pool, True, skip_first=skip_batches)
+    else:
+        raise ValueError(f"Неизвестный mode={mode!r}, ожидается 'mixed'/'sequential'/'round_robin'.")
+
     return (
-        _generator(train_idx_pool, True, skip_first=skip_batches),
-        lambda: _generator(val_idx_pool, False),
+        train_gen,
+        lambda: _mixed_gen(val_idx_pool, False),
         train_size // batch_size,
         val_size // batch_size,
     )
