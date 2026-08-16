@@ -31,23 +31,19 @@ except ImportError:
 _run = None
 
 
-def init_wandb(project: str, run_name: str, config: dict, resume_id: str | None = None):
-    """Инициализирует W&B run. resume_id -- если передан, пытается
-    продолжить существующий run (полезно после resume из чекпоинта, чтобы
-    графики в W&B не начинались заново с шага 0 при каждом рестарте
-    Kaggle-сессии). Если resume_id=None или resume не удался -- создаёт
-    новый run. Возвращает run.id (строку) для сохранения в metadata.json
-    следующего чекпоинта, или None если W&B недоступен."""
+def init_wandb(project: str, run_name: str, config: dict, resume_id: str | None = None,
+                entity: str | None = None):
     global _run
     if not _HAS_WANDB:
         return None
     try:
         _run = wandb.init(
             project=project,
+            entity=entity,
             name=run_name,
             config=config,
             id=resume_id,
-            resume="allow" if resume_id else None,
+            resume="must" if resume_id else None,   # was "allow" -- fail loudly if the run isn't found
         )
         print(f"[WANDB] 🚀 Run начат: {_run.name} (id={_run.id})"
               + (f", resumed from {resume_id}" if resume_id else ""))
