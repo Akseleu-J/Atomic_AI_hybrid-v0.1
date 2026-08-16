@@ -1,18 +1,6 @@
 """
 train.py -- главный orchestration-цикл обучения.
-
-ФИКС (разбивка файла): раньше все ~1400 строк -- HF-релей, orbax
-чекпоинтинг, диагностика non-finite по группам, mesh/шардинг/компиляция,
-dataloader и сам цикл обучения -- жили в одном файле, что усложняло навигацию.
-Разнесено на:
-  - checkpointing.py  -- HF Hub relay + orbax save/restore/async
-  - train_setup.py    -- диагностика групп, mesh/shard/compile, dataloader
-  - wandb_logging.py  -- W&B логирование (новое)
-  - train.py (этот файл) -- только main_execution(), сам цикл обучения
-
-Логика самого цикла НЕ изменена относительно предыдущей версии -- только
-добавлены вызовы wandb_logging.* в тех точках, где уже существовал print()
-с тем же значением (см. пометки "ФИКС (W&B):" ниже).
+...
 """
 import os
 import time
@@ -44,6 +32,86 @@ import wandb_logging
 from model import ModelConfig, get_model_mesh
 
 
+# ==========================================================================
+# ДИАГНОСТИКА (не изменяет params/opt_state): сравнивает статистику
+# A_log/dt_proj.bias между всеми mamba2-слоями после resume -- вместо
+# слепой "хирургии" переинициализации, которая была бы преждевременна:
+# все mamba2-слои получили ОДИНАКОВОЕ число градиентных шагов в этом
+# прогоне (num_layers=24 задан с самого начала, не расширялся посреди
+# обучения), поэтому гипотеза "layer=22 моложе остальных" отпадает.
+# Реальные кандидаты -- структурная позиция (близость к выходу, глубина
+# history_blocks для block_7), а не недостаток шагов -- и их стоит сначала
+# УВИДЕТЬ в цифрах, а не лечить вслепую.
+# ==========================================================================
+def diagnose_mamba2_decay_params(params, mamba2_layer_indices, layers_per_block):
+    """Печатает mean/std/min/max для A_log и dt_proj.bias КАЖДОГО указанного
+    mamba2-слоя, плюс производные величины (dt на первом шаге при нулевом
+    входе dt_proj: softplus(bias), и итоговый decay exp(-softplus(bias)*A)
+    в характерной точке A=-exp(A_log).mean()) -- чтобы увидеть, действительно
+    ли layer=22 численно отличается от layer=4/layer=13, а не гадать."""
+    print("\n" + "=" * 70)
+    print("[MAMBA2-DIAG] Сравнение decay-параметров по mamba2-слоям")
+    print("=" * 70)
+
+    found = {}
+
+    def _collect(path, leaf):
+        if len(path) < 6:
+            return
+        keys = [str(getattr(p, "key", p)) for p in path]
+        for layer_idx in mamba2_layer_indices:
+            block_idx = layer_idx // layers_per_block
+            prefix_ok = (
+                keys[0] == f"block_{block_idx}" and keys[1] == f"layer_{layer_idx}"
+                and keys[2] == "sublayer" and keys[3] == "mamba2"
+            )
+            if not prefix_ok:
+                continue
+            if keys[4] == "A_log":
+                found.setdefault(layer_idx, {})["A_log"] = leaf
+            elif len(keys) >= 6 and keys[4] == "dt_proj" and keys[5] == "bias":
+                found.setdefault(layer_idx, {})["dt_bias"] = leaf
+
+    jax.tree_util.tree_map_with_path(lambda p, l: (_collect(p, l), l)[1], params)
+
+    for layer_idx in mamba2_layer_indices:
+        entry = found.get(layer_idx)
+        if entry is None or "A_log" not in entry or "dt_bias" not in entry:
+            print(f"[MAMBA2-DIAG] ⚠️ layer_{layer_idx}: не удалось найти A_log/dt_proj.bias "
+                  f"по ожидаемому пути -- пропускаю (проверьте пути вручную).")
+            continue
+
+        A_log = jax.device_get(entry["A_log"]).astype("float32")
+        dt_bias = jax.device_get(entry["dt_bias"]).astype("float32")
+
+        A_log_clipped = jnp.clip(A_log, -20.0, 20.0)
+        A = -jnp.exp(A_log_clipped)
+        dt_at_zero_input = jax.nn.softplus(dt_bias)  # dt если dt_proj-выход самой сети ~0
+        dt_clipped = jnp.clip(dt_at_zero_input, 1e-2, 1.0)  # тот же forward-клип, что в Mamba2J
+        # decay за один шаг в характерной точке -- exp(dt*A), усреднённый по каналам
+        decay_per_step = jnp.exp(jnp.clip(dt_clipped * A, -20.0, 0.0))
+
+        print(f"\n[MAMBA2-DIAG] layer_{layer_idx} (block_{layer_idx // layers_per_block}):")
+        print(f"    A_log:        mean={float(jnp.mean(A_log)):+.4f}  std={float(jnp.std(A_log)):.4f}  "
+              f"min={float(jnp.min(A_log)):+.4f}  max={float(jnp.max(A_log)):+.4f}")
+        print(f"    dt_proj.bias: mean={float(jnp.mean(dt_bias)):+.4f}  std={float(jnp.std(dt_bias)):.4f}  "
+              f"min={float(jnp.min(dt_bias)):+.4f}  max={float(jnp.max(dt_bias)):+.4f}")
+        print(f"    dt(at zero input, post-clip): mean={float(jnp.mean(dt_clipped)):.5f}  "
+              f"std={float(jnp.std(dt_clipped)):.5f}")
+        print(f"    decay_per_step (exp(dt*A)):   mean={float(jnp.mean(decay_per_step)):.5f}  "
+              f"std={float(jnp.std(decay_per_step)):.5f}  "
+              f"(1.0=не забывает вообще, 0.0=забывает мгновенно)")
+
+    print("\n[MAMBA2-DIAG] Как читать: если у layer_22 decay_per_step систематически "
+          "ближе к 0 или к 1 относительно layer_4/layer_13 (не просто другой std, а "
+          "смещённое mean), это говорит о специфичном для этого слоя режиме -- тогда "
+          "стоит смотреть на A_log/dt_bias std как на признак недостаточной "
+          "межканальной дифференциации decay именно здесь. Если все три слоя похожи -- "
+          "проблема НЕ в decay-параметрах, и стоит смотреть выше по стеку (DAR "
+          "history_blocks на block_7, близость к выходу).")
+    print("=" * 70 + "\n")
+
+
 def main_execution():
     ckpt_root = "/kaggle/working/orbax_checkpoints"
     latest_dir = os.path.join(ckpt_root, "latest")
@@ -56,8 +124,8 @@ def main_execution():
     mngr_best_train = make_manager(best_train_dir, max_to_keep=1)
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
-    FORCE_FRESH_START = True  # <-- поставьте False, чтобы вернуть обычный resume
-    RESUME_FROM_SLOT = "best_train"  # <-- используется только если FORCE_FRESH_START=False
+    FORCE_FRESH_START = False  # ФИКС: продолжаем с чекпоинта шага 4000, не с нуля
+    RESUME_FROM_SLOT = "latest"
 
     if FORCE_FRESH_START:
         resume_step = None
@@ -182,11 +250,6 @@ def main_execution():
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
 
-    # ФИКС (W&B): инициализация run'а. resume_id читаем из локального файла
-    # (не из orbax metadata.json, чтобы не трогать сигнатуры save_slot/
-    # save_slot_async в checkpointing.py) -- если он есть, W&B продолжит
-    # существующий run вместо создания нового при каждом рестарте
-    # Kaggle-сессии, и графики (loss/step) останутся непрерывными.
     wandb_id_path = os.path.join(ckpt_root, "wandb_run_id.txt")
     _resume_wandb_id = None
     if not FORCE_FRESH_START and os.path.exists(wandb_id_path):
@@ -294,6 +357,19 @@ def main_execution():
                 raise ValueError("Восстановленные params содержат NaN -- чекпоинт повреждён.")
 
             print(f"[RESUME] ✅ Restored: step={global_step}, best_val={best_val_loss:.4f}, best_train={best_train_loss:.4f}")
+
+            # ==================================================================
+            # ФИКС: диагностика (read-only) decay-параметров ВСЕХ трёх mamba2-
+            # слоёв сразу после restore -- см. handoff про RESID-DIAG на
+            # layer=22 и опровержение гипотезы "layer=22 моложе" (все три
+            # получили одинаковое число шагов в этом прогоне). НЕ изменяет
+            # params -- только печатает сравнение, чтобы решить, действительно
+            # ли численно layer=22 отличается, прежде чем что-либо трогать.
+            # ==================================================================
+            mamba2_layer_indices = [
+                idx for idx, t in enumerate(config.layer_types) if t == "mamba2"
+            ]
+            diagnose_mamba2_decay_params(params, mamba2_layer_indices, config.layers_per_block)
 
             if RESUME_FROM_SLOT != "latest":
                 print(f"[RESUME OVERRIDE] Перерегистрирую шаг {global_step} в mngr_latest "
@@ -534,8 +610,6 @@ def main_execution():
                         f"z={jax.device_get(aux_info['z_loss']):.5f}) | "
                         f"best_train={best_train_loss:.4f}"
                     )
-                    # ФИКС (W&B): та же информация, что уже печатается в лог,
-                    # плюс throughput (токены/сек) для графиков скорости.
                     tok_per_sec = (micro_batch_size * accum_steps * seq_len) / max(
                         (_t_compute + _t_apply_total) * accum_steps, 1e-6
                     )
