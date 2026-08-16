@@ -464,21 +464,26 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                 yield _gather_batch(batch_idx)
 
     def _round_robin_gen(pool_by_source, skip_first=0):
-        src_gens = [_infinite_source_batches(pool_by_source[s], seed=1000 + s)
+        src_gens = [_infinite_source_indices(pool_by_source[s], seed=1000 + s)
                     for s in range(len(pool_by_source))]
         n_sources = len(src_gens)
-        step_i = 0
-        while True:
-            s = step_i % n_sources
-            ids_np, lbls_np = next(src_gens[s])
-            step_i += 1
+         step_i = 0
+        if skip_first > 0:
+            print(f"[DATA] (round_robin) Быстрый пропуск {skip_first} микрошагов "
+                  f"(без чтения с диска)...")
+         while True:
+             s = step_i % n_sources
+            batch_idx = next(src_gens[s])
+             step_i += 1
             if step_i <= skip_first:
                 continue
+            ids_np, lbls_np = _gather_batch(batch_idx)
             yield {
                 "input_ids": jax.device_put(jnp.array(ids_np), data_sharding),
                 "labels": jax.device_put(jnp.array(lbls_np), data_sharding),
                 "_source_idx": s,
             }
+    
 
     def _sequential_gen(pool_by_source, skip_first=0):
         local_rng = np.random.RandomState(123)
