@@ -459,7 +459,35 @@ class Mamba2J(nn.Module):
  
         carry_da_init = jnp.ones((b, d_inner), dtype=x_bc.dtype)
         carry_h_init = jnp.zeros((b, d_inner, d_state), dtype=x_bc.dtype)
- 
+
+        # ФИКС (найдено совместно в чате -- реальная причина повторяющихся
+        # RESID-DIAG на layer=22/block=7/mamba2, воспроизводимая даже после
+        # двух раундов ужесточения ВНЕШНИХ клипов -- выхода Mamba2 ±1e4->±3e2
+        # и residual ±1e3->±5e2 для mamba2-слоёв): jax.lax.associative_scan
+        # накапливает state[t] = decay[t]*state[t-1] + input[t] ВНУТРИ
+        # одного chunk_size=256. Санитизация стояла ТОЛЬКО на входах (dA/dt/
+        # B/C/x_conv/dB_c, ДО скана) и на итоговом выходе всего chunk_step
+        # (y, ПОСЛЕ scan+RMSNorm+клип) -- ничего не ограничивало РОСТ
+        # состояния В ПРОЦЕССЕ накопления по 256 токенам, если на каком-то
+        # префиксе decay держится близко к верхней границе (0.97-0.99) на
+        # многих токенах подряд при ненулевом input. Ни внешний клип на
+        # выходе Mamba2, ни residual-клип не могут это перехватить -- они
+        # видят только результат УЖЕ ЗАВЕРШИВШЕГОСЯ накопления. Тот же
+        # принцип "клип на каждой границе ВНУТРИ рекуррентности, не только
+        # на входе/выходе", что уже применён в проекте для GDN-2 Pallas-
+        # кернелов (см. kernel_bwd_b4_intra.py, kernel_c_recompute.py --
+        # "nan_to_num alone only replaces values that are ALREADY nan/inf --
+        # it does nothing to a value that is merely huge but still finite"),
+        # но раньше не был перенесён на Mamba2's associative_scan. Клипаем
+        # C_input_c (вход в scan), S_local (сырой выход scan-а), global_h
+        # (state после combine с carry) и y_c (итог chunk_step) -- четыре
+        # промежуточные точки внутри ОДНОГО chunk_step, а не только его вход
+        # и итоговый y после всего lax.scan по чанкам. Чисто активационная
+        # правка -- НЕ меняет params/opt_state, безопасна для resume с
+        # любого существующего чекпоинта.
+        def _sanitize_scan_val(t, clip=1e4):
+            return jnp.nan_to_num(jnp.clip(t, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
+
         def _chunk_step(carry, chunk_inputs):
             carry_da, carry_h = carry
             da_c, dt_c, B_c, C_c, xconv_c = chunk_inputs
@@ -471,13 +499,17 @@ class Mamba2J(nn.Module):
             # как он попадёт в C_input_c/associative_scan.
             dB_c = jnp.clip(dB_c, jnp.array(-1e3, dtype=dB_c.dtype), jnp.array(1e3, dtype=dB_c.dtype))
             C_input_c = dB_c * xconv_c[..., None]
+            C_input_c = _sanitize_scan_val(C_input_c)  # NEW
  
             P_local, S_local = jax.lax.associative_scan(_combine, (da_c, C_input_c), axis=1)
+            S_local = _sanitize_scan_val(S_local)  # NEW
  
             global_da = P_local * carry_da[:, None, :]
             global_h = P_local[..., None] * carry_h[:, None, :, :] + S_local
+            global_h = _sanitize_scan_val(global_h)  # NEW
  
             y_c = jnp.einsum("bcds,bcs->bcd", global_h, C_c)
+            y_c = _sanitize_scan_val(y_c)  # NEW
  
             new_carry = (global_da[:, -1], global_h[:, -1])
             return new_carry, y_c
@@ -590,24 +622,6 @@ class GatedDeltaNet2J(nn.Module):
         v = jax.nn.silu(short_causal_conv("v", v_lin)).reshape(b, l, n_heads, d_head)
         v = jnp.clip(v, -50.0, 50.0)
 
-        # ФИКС (найдено через probe sublayer_out_layer{N}/intra_out: forward
-        # ПОЛНОСТЬЮ конечен, но backward регулярно даёт NaN между этими
-        # двумя точками -- т.е. внутри GatedDeltaNet2J, между выходом B1-B6
-        # chain (уже санитизирован на своей границе в kernel_trainable_B6.py)
-        # и входом в conv/q_proj/k_proj). Единственный кандидат на этом
-        # участке -- нормализация q/k. jnp.linalg.norm(x) САМ ПО СЕБЕ имеет
-        # NaN-градиент РОВНО в x=0 (d‖x‖/dx = x/‖x‖, неопределённость 0/0) --
-        # прибавление +eps в форвард-делении (q/(‖q‖+eps)) защищает ТОЛЬКО
-        # forward-деление, backward самого jnp.linalg.norm() эту особенность
-        # не лечит вообще. Если silu(conv(...)) даёт точный или почти точный
-        # нулевой вектор для каких-то токенов/каналов -- невидимо в forward
-        # (там всё гладко благодаря +eps), но backward взрывается в NaN.
-        # Прямая проверка (jax.vjp на x=jnp.zeros(4)): текущая формула даёт
-        # grad=[nan,nan,nan,nan]; rsqrt(sum(x^2)+eps^2) даёт конечный (хоть
-        # и большой, ~1e6 у сингулярности) градиент везде, включая x=0.
-        # Оборачиваем дополнительно в grad_sanitizer (тот же приём, что для
-        # mla_flash_attn_out) -- большой-но-конечный градиент у сингулярности
-        # всё ещё стоит подрезать, чтобы не разгонять его дальше по conv/Dense.
         def _safe_normalize(t):
             return t * jax.lax.rsqrt(jnp.sum(t * t, axis=-1, keepdims=True) + eps ** 2)
 
@@ -625,19 +639,6 @@ class GatedDeltaNet2J(nn.Module):
         alpha = jnp.exp(g)
 
         out_gate = nn.Dense(d, use_bias=False, name="out_gate", dtype=jnp.bfloat16)(x)
-        # ФИКС (закрывает дыру, названную прямо в докстринге BlockDARLayer
-        # ниже по файлу -- "GatedDeltaNet2J: out_gate ничем не клипируется до
-        # silu(out_gate)*out -> out_proj"): out (после out_norm) уже
-        # нормирован, но out_gate -- сырой выход Dense, ничем не ограниченный.
-        # jax.nn.silu растёт линейно на больших положительных x (не насыщается,
-        # в отличие от sigmoid), так что при разросшихся весах out_gate
-        # (Muon-таргет без weight decay в среднем растёт быстрее AdamW/Lion --
-        # см. optimizer.py) итоговый множитель silu(out_gate) может быть
-        # произвольно большим и растащить уже отнормированный out обратно в
-        # residual stream -- ровно тот путь усиления, который приводил к
-        # RESID-DIAG выбросам после gdn2-слоёв. Клип на уровне входа в out_gate
-        # тем же способом (±1e2), что и клип параметров в train.py после
-        # apply_updates -- дёшево, не меняет остальную математику.
         out_gate = jnp.clip(out_gate, -1e2, 1e2)
 
         def _sanitize(t):
@@ -837,8 +838,6 @@ class BlockDARLayer(nn.Module):
         )
         mixed = make_grad_probe(f"block{self.layer_idx}_intra_out")(mixed)
 
-        # ФИКС: нормализация перед рекуррентным/внимательным саблеером
-        # Убирает разогретый residual (1032+) на вход в Mamba2/GDN2/MLA
         mixed = nn.RMSNorm(epsilon=1e-6, name="pre_sublayer_norm")(mixed)
 
         delta = SpecializedSublayer(
@@ -846,58 +845,10 @@ class BlockDARLayer(nn.Module):
         )(mixed, causal_mask=causal_mask, cos=cos, sin=sin,
           deterministic=deterministic, rngs=rngs)
 
-        # ФИКС (найдено по инциденту, где sublayer_out_layer16_gdn2 САМ был
-        # non-finite -- т.е. входящий градиент уже испорчен ДО backward
-        # самого GDN-2/Mamba2/MLA, в отличие от предыдущего инцидента, где
-        # ломалась именно нормализация q/k ВНУТРИ sublayer'а). delta имеет
-        # широкий fan-out: current_x (этот блок), local_deltas ->
-        # IntraBlockAttention для СЛЕДУЮЩИХ слоёв ЭТОГО блока, и, самое
-        # далекобойное, history_blocks -> HybridDARAttention ВСЕХ будущих
-        # блоков. Градиент от всех этих потребителей суммируется в одну
-        # точку (dL/ddelta) -- если хотя бы один из многих путей даёт NaN,
-        # сумма NaN. make_grad_sanitizer здесь чистит именно эту
-        # аккумулированную точку ДО того, как она уходит в backward самого
-        # sublayer'а (аналитический B1-B6 chain для gdn2 -- наиболее хрупкий
-        # участок, т.к. это ручной VJP, не автодифф). Ставится МЕЖДУ
-        # SpecializedSublayer и диагностическим probe ниже -- probe
-        # по-прежнему видит сырую (незачищенную) картину для диагностики,
-        # сама защита работает на уровень глубже.
         delta = make_grad_sanitizer(f"delta_fanin_layer{self.layer_idx}_{self.layer_type}")(delta)
 
-        # ДИАГНОСТИКА (найдено по инцидентам 1067/1142: forward теперь
-        # ПОЛНОСТЬЮ конечен -- ни одного [FWD-DIAG] -- а backward всё равно
-        # даёт non-finite. Существующий пробник intra_out висит на ВХОДЕ в
-        # sublayer и загорается каскадом по всем блокам через
-        # HybridDARAttention -- не локализует. Этот пробник -- на ВЫХОДЕ
-        # sublayer'а (до клипа delta), с тегом layer_type+layer_idx -- если
-        # входящий градиент здесь уже non-finite, проблема НИЖЕ по потоку
-        # (IntraBlockAttention/HybridDARAttention/следующие слои); если
-        # здесь finite, а intra_out дальше внутри ЭТОГО ЖЕ layer/backward
-        # (см. отдельный tag) -- non-finite, значит проблема ВНУТРИ
-        # backward самого sublayer'а (B1-B6 аналитический chain для gdn2,
-        # associative_scan для mamba2, или custom VJP flash-attention).
         delta = make_grad_probe(f"sublayer_out_layer{self.layer_idx}_{self.layer_type}")(delta)
 
-        # ФИКС (подтверждено логом инцидента на шаге 943 -- без этого клипа
-        # delta от layer13/mamba2 достигала ~6.25e8, а от layer14/gdn2 --
-        # ~5.3e6, ОБЕ поверх current_x, который уже был ограничен фиксом #1
-        # (клип после current_x+delta). Фикс #1 сам по себе НЕ защищает,
-        # потому что клипается СУММА current_x+delta уже ПОСЛЕ того, как
-        # delta успевает разойтись в local_deltas/block_delta/history_blocks
-        # -- т.е. клип current_x спасает следующий шаг накопления residual
-        # stream, но не спасает IntraBlockAttention/HybridDARAttention
-        # следующих слоёв и history_blocks будущих блоков, которые читают
-        # local_deltas/history_blocks НАПРЯМУЮ, в обход current_x. Вероятный
-        # источник самой амплитуды -- GatedDeltaNet2J: out_gate ничем не
-        # клипируется до silu(out_gate)*out -> out_proj, то есть даже
-        # ограниченный вход (mixed) может дать неограниченный delta на
-        # выходе. Клип здесь, в источнике, закрывает это независимо от
-        # внутреннего механизма амплификации.
-        #
-        # ОБНОВЛЕНИЕ: сам источник (out_gate без клипа в GatedDeltaNet2J,
-        # отсутствие RMSNorm на выходе Mamba2 и MLA) закрыт выше по стеку
-        # (см. фиксы в GatedDeltaNet2J/Mamba2J/MLAJ) -- этот клип остаётся
-        # как второй, независимый рубеж обороны, а не единственная защита.
         delta = jnp.nan_to_num(jnp.clip(delta, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return delta
@@ -937,37 +888,9 @@ class BlockDAR(nn.Module):
                 lambda: None,
             )
 
-            # ДИАГНОСТИКА (этот пасс): показывает, приходит ли амплитуда,
-            # которую ниже поймает [RESID-DIAG], от УЖЕ большого current_x
-            # (накопление из предыдущих слоёв/блоков) или от delta ИМЕННО
-            # этого слоя (локальный источник) -- см. _diag_resid_breakdown
-            # выше. Управляется GDN2_FWD_DIAG=1, нулевой оверхед по
-            # умолчанию. Вызывается ДО клипа, чтобы видеть сырые величины.
             _diag_resid_breakdown(f"block={self.block_idx}_layer={layer_idx}_{layer_type}",
                                    current_x, delta)
 
-            # ФИКС (найдено по логу инцидента на шаге 780, см. переписку /
-            # HANDOFF: единственная non-finite точка -- block=4 layer=14
-            # gdn2 -- каскадом ломает ВСЁ, что идёт после неё, вплоть до
-            # backward-градиентов на layer=0). Причина: residual stream
-            # current_x был ЕДИНСТВЕННЫМ местом во всём проекте без
-            # clip/nan_to_num -- только finite-диагностика, ничего активно
-            # не чинящая. В отличие от него параметры (train.py, клип ±1e2
-            # после apply_updates), входы GDN-2/Mamba2 (клип ±1e3 внутри
-            # каждого модуля), градиенты на границе custom_vjp (клип ±1e4)
-            # -- все защищены. current_x накапливается через 18 сложений
-            # (6 блоков x 3 слоя) без единого ограничения -- один
-            # большой-но-конечный выброс (например, из Mamba2 после дрейфа
-            # весов на 780 шагах) уходит непосредственно на вход следующего
-            # слоя (bf16 nn.Dense в q_proj/k_proj/v_proj) ДО того, как
-            # собственная внутренняя санитизация этого слоя (клип ±1e3
-            # ПОСЛЕ conv+silu) вообще успевает сработать -- overflow
-            # происходит в первых же матмулах.
-            #
-            # Печатаем max|abs| ДО санитизации (не только finite/non-finite)
-            # -- чтобы на следующем прогоне видеть сам факт и величину
-            # дрейфа задолго до фактического overflow, а не только момент
-            # уже случившейся катастрофы.
             _cx_next = current_x + delta
             cx_abs_max = jnp.max(jnp.abs(jnp.nan_to_num(_cx_next, nan=0.0, posinf=0.0, neginf=0.0)))
             jax.lax.cond(
@@ -981,20 +904,6 @@ class BlockDAR(nn.Module):
 
             local_deltas.append(delta)
 
-            # ФИКС (точечный, layer=22/block=7/mamba2 -- воспроизводимо даёт
-            # RESID-DIAG чуть выше порога 1e3 при round_robin dataloader,
-            # хотя остальные mamba2-слои на меньшей глубине (layer=4,
-            # layer=13) этого не делают): общий клип ±1e3 был одинаков для
-            # ВСЕХ типов слоёв. mamba2 -- документированно наименее
-            # контрактный тип (associative_scan) на максимальной
-            # накопленной глубине (block=7 -- последний блок) -- сужаем
-            # порог именно для него, не трогая gdn2/mla. Это НЕ устраняет
-            # причину дрейфа (структурная хрупкость layer=22 на
-            # максимальной глубине, см. HANDOFF раздел про
-            # depth x instability interaction) -- только отодвигает порог
-            # раньше, чтобы санитизация срабатывала с большим запасом
-            # прочности, вместо того чтобы регулярно подходить вплотную
-            # к 1e3.
             _resid_clip = 5e2 if layer_type == "mamba2" else 1e3
             current_x = jnp.nan_to_num(
                 jnp.clip(_cx_next, -_resid_clip, _resid_clip),
@@ -1007,13 +916,6 @@ class BlockDAR(nn.Module):
         )
 
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
-        # ФИКС (M6): top_k GmmMoEJ раньше брался ТОЛЬКО из class-level
-        # default (GmmMoEJ.top_k=2), никак не связанного с cfg.top_k --
-        # т.е. реальный роутинг был top-2 "случайно", а cfg.top_k оставался
-        # мёртвым полем с устаревшим комментарием про SparseMoEJ (top-1).
-        # Явно прокидываем cfg.top_k -- теперь это единственная точка
-        # конфигурации top-k, видимая в train.py рядом с остальными
-        # MoE-гиперпараметрами.
         moe_out = GmmMoEJ(cfg=self.cfg, top_k=self.cfg.top_k, name="moe")(
             norm_2, deterministic=deterministic, rngs=rngs
         )                       
@@ -1024,9 +926,6 @@ class BlockDAR(nn.Module):
             lambda: None,
         )
 
-        # ФИКС: тот же пробел на выходе блока -- output = current_x + moe_out
-        # был последним необработанным сложением residual stream перед тем,
-        # как результат уходит в history_blocks / следующий BlockDAR.
         output = jnp.nan_to_num(jnp.clip(current_x + moe_out, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return output, new_history
