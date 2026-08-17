@@ -125,7 +125,7 @@ def main_execution():
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
     FORCE_FRESH_START = False  # ФИКС: продолжаем с чекпоинта шага 4000, не с нуля
-    RESUME_FROM_SLOT = "latest"
+    RESUME_FROM_SLOT = "best_val"
 
     if FORCE_FRESH_START:
         resume_step = None
