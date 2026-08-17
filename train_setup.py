@@ -9,6 +9,19 @@ RESID-DIAG на layer=22/mamba2" -- см. чат): dataloader_multi_source те�
 поддерживает три режима подачи данных (mode="mixed"/"sequential"/
 "round_robin") и per-source fraction (третий элемент в file_pairs). Все
 остальные функции в этом файле -- БЕЗ ИЗМЕНЕНИЙ.
+
+ФИКС #2 (этот пасс): _round_robin_gen был переписан на "быстрый пропуск без
+чтения с диска" (принимает batch_idx через next(src_gens[s]), затем сам
+вызывает _gather_batch) -- но функция-генератор индексов, которую он
+вызывал (_infinite_source_indices), нигде не была определена, только
+_infinite_source_batches (которая сразу возвращает ГОТОВЫЕ данные, а не
+индексы) -- это NameError при первом же вызове mode="round_robin".
+Добавлена _infinite_source_indices -- тот же паттерн, что и
+_infinite_source_batches, но yield'ит idx_local[...] вместо
+_gather_batch(idx_local[...]), чтобы _round_robin_gen мог пропускать уже
+пройденные микрошаги (skip_first) БЕЗ чтения с диска на каждый из них --
+именно так, как и было задумано в его собственном докстринге/принте
+"Быстрый пропуск N микрошагов (без чтения с диска)".
 """
 from __future__ import annotations
 
@@ -454,6 +467,11 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                   f"{len(src_train_idx):,} train-блоков")
 
     def _infinite_source_batches(src_idx, seed):
+        """Бесконечный генератор ГОТОВЫХ (ids_np, lbls_np) батчей одного
+        источника -- используется там, где пропуск уже пройденных
+        микрошагов не нужен (или где чтение с диска на каждый шаг
+        приемлемо). Оставлена как есть -- см. _infinite_source_indices
+        ниже для варианта, который умеет пропускать без чтения с диска."""
         local_rng = np.random.RandomState(seed)
         idx_local = np.copy(src_idx)
         while True:
@@ -462,6 +480,25 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
             for step in range(n_steps):
                 batch_idx = idx_local[step * batch_size:(step + 1) * batch_size]
                 yield _gather_batch(batch_idx)
+
+    def _infinite_source_indices(src_idx, seed):
+        """ФИКС: недостающая функция -- _round_robin_gen ниже вызывал
+        _infinite_source_indices(...), которая нигде не была определена
+        (NameError при первом же mode="round_robin"). Тот же паттерн, что
+        _infinite_source_batches выше, но yield'ит СЫРЫЕ ИНДЕКСЫ
+        (idx_local[...]), а не результат _gather_batch(...) -- это и
+        позволяет _round_robin_gen пропускать уже пройденные микрошаги при
+        resume БЕЗ обращения к диску на каждый из них: во время пропуска
+        просто прокручивается RNG/цикл индексов, а _gather_batch (реальное
+        mmap-чтение) вызывается только начиная с первого НЕ пропускаемого
+        шага -- см. _round_robin_gen."""
+        local_rng = np.random.RandomState(seed)
+        idx_local = np.copy(src_idx)
+        while True:
+            local_rng.shuffle(idx_local)
+            n_steps = len(idx_local) // batch_size
+            for step in range(n_steps):
+                yield idx_local[step * batch_size:(step + 1) * batch_size]
 
     def _round_robin_gen(pool_by_source, skip_first=0):
         src_gens = [_infinite_source_indices(pool_by_source[s], seed=1000 + s)
@@ -483,7 +520,6 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                 "labels": jax.device_put(jnp.array(lbls_np), data_sharding),
                 "_source_idx": s,
             }
-    
 
     def _sequential_gen(pool_by_source, skip_first=0):
         local_rng = np.random.RandomState(123)
