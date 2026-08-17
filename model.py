@@ -825,8 +825,7 @@ class BlockDARLayer(nn.Module):
         if history_blocks.shape[0] > 0:
             dar_sources.extend([history_blocks[j] for j in range(history_blocks.shape[0])])
         dar_sources.extend(local_deltas)
-
-        retrieved = HybridDARAttention(cfg=self.cfg, name="dar")(
+        retrieved = nn.remat(HybridDARAttention)(cfg=self.cfg, name="dar")(
             current_x, dar_sources
         )
         retrieved = make_grad_probe(f"block{self.layer_idx}_dar_out")(retrieved)
