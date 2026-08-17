@@ -93,6 +93,43 @@ def _diag_maxabs(tag: str, x):
 
 
 # ==========================================================================
+# ДИАГНОСТИКА #2 (этот пасс -- точечная локализация RESID-DIAG на
+# layer=22/block=7/mamba2 при round_robin dataloader): [RESID-DIAG] в
+# BlockDAR печатает max|abs| ПОСЛЕ current_x+delta, но не говорит, откуда
+# пришла величина -- current_x УЖЕ был близко к порогу ДО этого слоя
+# (значит проблема в накоплении по предыдущим слоям/блокам), или delta
+# именно ЭТОГО sublayer'а (mamba2 на layer=22) добавила скачок сама по
+# себе (значит проблема локальна для этого слоя). Печатает ОБА числа
+# отдельно, только когда суммарный результат уже приближается к клипу --
+# порог 5e2 выбран НИЖЕ порога самого RESID-DIAG (1e3), чтобы эта
+# диагностика срабатывала РАНЬШЕ и давала предупреждение, а не только
+# постфактум объяснение уже случившегося события. Управляется тем же
+# GDN2_FWD_DIAG=1 флагом -- по умолчанию OFF, нулевой оверхед.
+# ==========================================================================
+def _diag_resid_breakdown(tag: str, current_x_before, delta):
+    if not _GDN2_FWD_DIAG:
+        return
+
+    cx_before_abs = jnp.max(jnp.abs(jnp.nan_to_num(current_x_before, nan=0.0, posinf=0.0, neginf=0.0)))
+    delta_abs = jnp.max(jnp.abs(jnp.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)))
+
+    def _report():
+        jax.debug.print(
+            "[RESID-BREAKDOWN-DIAG] " + tag +
+            ": current_x_before={cx:.3e}  delta={d:.3e}  "
+            "(если current_x_before уже большой -- накопление ИЗ ПРЕДЫДУЩИХ слоёв; "
+            "если delta большая, а current_x_before маленький -- источник ЭТОТ слой)",
+            cx=cx_before_abs, d=delta_abs,
+        )
+
+    jax.lax.cond(
+        jnp.maximum(cx_before_abs, delta_abs) > 5e2,
+        _report,
+        lambda: None,
+    )
+
+
+# ==========================================================================
 # ДИАГНОСТИКА (2-й уровень): forward-активации уже проверены (FWD-DIAG) и
 # оказались finite, а градиент всё равно non-finite -- значит проблема
 # именно в backward конкретного узла (например, custom VJP flash-attention
@@ -900,6 +937,15 @@ class BlockDAR(nn.Module):
                 lambda: None,
             )
 
+            # ДИАГНОСТИКА (этот пасс): показывает, приходит ли амплитуда,
+            # которую ниже поймает [RESID-DIAG], от УЖЕ большого current_x
+            # (накопление из предыдущих слоёв/блоков) или от delta ИМЕННО
+            # этого слоя (локальный источник) -- см. _diag_resid_breakdown
+            # выше. Управляется GDN2_FWD_DIAG=1, нулевой оверхед по
+            # умолчанию. Вызывается ДО клипа, чтобы видеть сырые величины.
+            _diag_resid_breakdown(f"block={self.block_idx}_layer={layer_idx}_{layer_type}",
+                                   current_x, delta)
+
             # ФИКС (найдено по логу инцидента на шаге 780, см. переписку /
             # HANDOFF: единственная non-finite точка -- block=4 layer=14
             # gdn2 -- каскадом ломает ВСЁ, что идёт после неё, вплоть до
@@ -934,7 +980,26 @@ class BlockDAR(nn.Module):
             )
 
             local_deltas.append(delta)
-            current_x = jnp.nan_to_num(jnp.clip(_cx_next, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
+
+            # ФИКС (точечный, layer=22/block=7/mamba2 -- воспроизводимо даёт
+            # RESID-DIAG чуть выше порога 1e3 при round_robin dataloader,
+            # хотя остальные mamba2-слои на меньшей глубине (layer=4,
+            # layer=13) этого не делают): общий клип ±1e3 был одинаков для
+            # ВСЕХ типов слоёв. mamba2 -- документированно наименее
+            # контрактный тип (associative_scan) на максимальной
+            # накопленной глубине (block=7 -- последний блок) -- сужаем
+            # порог именно для него, не трогая gdn2/mla. Это НЕ устраняет
+            # причину дрейфа (структурная хрупкость layer=22 на
+            # максимальной глубине, см. HANDOFF раздел про
+            # depth x instability interaction) -- только отодвигает порог
+            # раньше, чтобы санитизация срабатывала с большим запасом
+            # прочности, вместо того чтобы регулярно подходить вплотную
+            # к 1e3.
+            _resid_clip = 5e2 if layer_type == "mamba2" else 1e3
+            current_x = jnp.nan_to_num(
+                jnp.clip(_cx_next, -_resid_clip, _resid_clip),
+                nan=0.0, posinf=_resid_clip, neginf=-_resid_clip,
+            )
 
         block_delta = sum(local_deltas)
         new_history = jnp.concatenate(
