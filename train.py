@@ -130,7 +130,7 @@ def main_execution():
     if FORCE_FRESH_START:
         resume_step = None
         print("[RESUME] 🆕 FORCE_FRESH_START=True -- пропускаю поиск чекпоинтов, начинаю с нуля.")
-    elif RESUME_FROM_SLOT == "latest":
+    elif RESUME_FROM_SLOT == "best_train":
         resume_step = mngr_latest.latest_step()
         if resume_step is not None:
             print(f"[LOCAL] 📦 Found checkpoint (latest): step {resume_step}")
