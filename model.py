@@ -193,6 +193,8 @@ class ModelConfig:
     d_conv: int = 4
     expand: int = 2
     n_heads: int = 8
+    n_heads_ssm: int = 8          # NEW (M0): per-head decay grouping for Mamba2's A_log.
+                                    # d_inner = d_model*expand must be divisible by this.
     d_latent: int = 384
     d_ff: int = 3072
     num_experts: int = 8
@@ -355,6 +357,8 @@ class MLAJ(nn.Module):
 # ==========================================
 # Mamba-2 (SSM)
 # ==========================================
+from atomic_ops.mamba2_ssd_reference import mamba2_ssd_reference
+
 class Mamba2J(nn.Module):
     cfg: ModelConfig
 
@@ -363,220 +367,64 @@ class Mamba2J(nn.Module):
         b, l, d = x.shape
         d_inner = d * self.cfg.expand
         d_state = self.cfg.d_state
+        n_heads_ssm = self.cfg.n_heads_ssm
+        assert d_inner % n_heads_ssm == 0, (
+            f"d_inner={d_inner} must be divisible by cfg.n_heads_ssm={n_heads_ssm}."
+        )
+        headdim = d_inner // n_heads_ssm
 
         in_proj = nn.Dense(d_inner * 2, use_bias=False, name="in_proj", dtype=jnp.bfloat16)(x)
         x_bc, res = jnp.split(in_proj, 2, axis=-1)
 
         conv_w = self.param("conv_w", nn.initializers.normal(stddev=0.02), (d_inner, self.cfg.d_conv))
         conv_b = self.param("conv_b", nn.initializers.zeros, (d_inner,))
-
         rhs = conv_w.T[:, None, :].astype(x_bc.dtype)
         res_conv = jax.lax.conv_general_dilated(
-            lhs=x_bc,
-            rhs=rhs,
-            window_strides=(1,),
+            lhs=x_bc, rhs=rhs, window_strides=(1,),
             padding=[(self.cfg.d_conv - 1, 0)],
             feature_group_count=d_inner,
-            dimension_numbers=('NHC', 'HIO', 'NHC')
+            dimension_numbers=('NHC', 'HIO', 'NHC'),
         )
         x_conv = jax.nn.silu(res_conv + conv_b[None, None, :].astype(x_bc.dtype))
 
-        # ФИКС: тот же inf*0=nan риск, что и в GDN-2 decay -- если A_log
-        # уйдёт в большое положительное значение, exp(A_log) переполняется в
-        # inf, A=-inf; если dt в какой-то позиции округлится до 0 в bf16,
-        # dt*A = 0*(-inf) = nan. Клипаем A_log перед exp и санитизируем
-        # итоговый показатель степени перед exp.
-        A_log_safe = jnp.clip(self.param("A_log", nn.initializers.uniform(scale=1.0), (d_inner,)), -20.0, 20.0)
-        # ФИКС (root cause найденной ошибки lax.concatenate bf16 vs f32):
-        # раньше было `.astype(x.dtype)` -- но x (аргумент __call__, после
-        # nn.RMSNorm без dtype=) на практике может оказаться float32
-        # (RMSNorm.scale по умолчанию float32, bf16*float32 -> float32 по
-        # правилам promotion), тогда как dt/B/C/x_conv ВСЕ идут через
-        # nn.Dense(..., dtype=bfloat16) и гарантированно bf16. Из-за этого A
-        # (и все производные dA/da_c) становились float32, а C_input_c
-        # оставался bf16 -- смешение dtype внутри одной пары элементов
-        # jax.lax.associative_scan, что и роняло lax.concatenate внутри
-        # scan'а. Берём dtype у x_bc (выход in_proj, гарантированно bf16),
-        # а не у сырого x.
-        A = -jnp.exp(A_log_safe).astype(x_bc.dtype)
+        # M0: A_log now (n_heads_ssm,) instead of (d_inner,) -- per-head decay,
+        # matches atomic_ops/mamba2_ssd_reference.py's assumption.
+        A_log = self.param("A_log", nn.initializers.uniform(scale=1.0), (n_heads_ssm,))
+        A_log_safe = jnp.clip(A_log, -20.0, 20.0).astype(jnp.float32)
+        A = -jnp.exp(A_log_safe)  # (n_heads_ssm,), float32 -- ssd_reference wants this dtype
+
         B = nn.Dense(d_state, use_bias=False, name="B_proj", dtype=jnp.bfloat16)(x_bc)
         C = nn.Dense(d_state, use_bias=False, name="C_proj", dtype=jnp.bfloat16)(x_bc)
         dt = jax.nn.softplus(nn.Dense(d_inner, use_bias=True, name="dt_proj", dtype=jnp.bfloat16)(x_bc))
-
-        # ФИКС #1: dt-коридор. Если dt микроскопический (округляется к 0 в
-        # bf16), dA = exp(dt*A) -> 1, decay фактически отсутствует, и state
-        # копит бесконечность через associative_scan. Если dt гигантский --
-        # SSM делает неадекватно большой шаг за один токен. Ограничиваем
-        # разумным коридором [1e-2, 1.0] до того, как dt участвует в
-        # dA_exponent.
         dt = jnp.clip(dt, jnp.array(1e-2, dtype=dt.dtype), jnp.array(1.0, dtype=dt.dtype))
 
-        dA_exponent = jnp.nan_to_num(jnp.einsum("bld,d->bld", dt, A), nan=0.0, posinf=0.0, neginf=-20.0)
-        dA = jnp.exp(dA_exponent)
-        # ФИКС #2 (главный тормоз): даже при "плохих" весах decay не может
-        # приближаться к 1 -- иначе на chunk_size=256 произведение decay по
-        # чанку почти не затухает и state растёт неограниченно.
-        # 0.99**256 ~= 0.08 -- гарантирует, что state забывает старое внутри
-        # одного чанка независимо от того, что выучили A_log/dt_proj.
-        dA = jnp.clip(dA, jnp.array(0.0, dtype=dA.dtype), jnp.array(0.99, dtype=dA.dtype))
+        def _sanitize(t, bound=1e3):
+            bd = jnp.array(bound, dtype=t.dtype)
+            return jnp.nan_to_num(jnp.clip(t, -bd, bd), nan=0.0, posinf=bound, neginf=-bound)
+
+        dt, B, C, x_conv = map(_sanitize, (dt, B, C, x_conv))
 
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
             raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
-        num_chunks = l // chunk_size
 
-        # ==================================================================
-        # ФИКС (associative_scan hardening -- аудит "нету ли чего рискованного
-        # в associative_scan"): _combine раньше был единственной рекуррентной
-        # функцией во всём проекте БЕЗ санитизации собственного выхода на
-        # каждом шаге. associative_scan вызывает _combine на каждом из
-        # log2(chunk_size)=8 уровней дерева редукции -- индивидуально
-        # клипированные ЛИСТОВЫЕ входы (C_input_c, через _sanitize_scan_val
-        # ДО scan) могут скомпаундиться до large-but-finite (или overflow)
-        # значения НА ПРОМЕЖУТОЧНОМ уровне дерева, что ни pre-scan, ни
-        # post-scan санитизация (на S_local/global_h/y_c) не видит -- она
-        # смотрит только на КОРЕНЬ дерева, не на внутренние узлы. Ровно тот
-        # же failure mode, что уже задокументирован и исправлен в проекте
-        # для kernel_bwd_b4_intra.py (accumulation loop, "an inf from one
-        # iteration can meet an opposite-sign inf... produce an unrecoverable
-        # NaN") и kernel_c_recompute.py ("nan_to_num alone only replaces
-        # values that are ALREADY nan/inf -- it does nothing to a value that
-        # is merely huge but still finite"), просто раньше не был перенесён
-        # на Mamba2's associative_scan.
-        #
-        # Второй, независимый риск: накопление внутри _combine раньше шло в
-        # исходном dtype несущих тензоров (bf16, т.к. carry_h_init/carry_da_init
-        # были x_bc.dtype) -- единственное рекуррентное место в проекте без
-        # fp32-апкаста (GDN-2 использует precision=HIGHEST и fp32 везде в
-        # kernel_bwd_b*/kernel_d_pipeline.py; Mamba2's associative_scan --
-        # нет). bf16 имеет ту же экспоненту, что fp32 (переполнение по
-        # модулю не более вероятно), но всего 7 бит мантиссы -- через до 8
-        # зависимых уровней дерева накопления ошибка округления растёт
-        # быстрее, чем в fp32. Апкастим c/da в fp32 один раз перед scan,
-        # даункастим y_c обратно в bf16 один раз на выходе _chunk_step --
-        # не резидентная память (тот же "временный cast" паттерн, что уже
-        # одобрен для gated RMSNorm варианта), не влияет на dtype
-        # params/opt_state.
-        # ==================================================================
-        _COMBINE_ACC_CLIP = 1e4  # тот же порядок величины, что и везде в проекте
+        # reshape (b,l,d_inner) -> (b,l,n_heads_ssm,headdim) for dt/x_conv;
+        # B/C stay (b,l,d_state) -- shared across heads, per SSD convention.
+        dt_h = dt.astype(jnp.float32).reshape(b, l, n_heads_ssm, headdim)
+        x_h = x_conv.astype(jnp.float32).reshape(b, l, n_heads_ssm, headdim)
+        B_f = B.astype(jnp.float32)
+        C_f = C.astype(jnp.float32)
 
-        def _combine(state1, state2):
-            da1, c1 = state1
-            da2, c2 = state2
-
-            da_new = da2 * da1
-            c_new = da2[..., None] * c1 + c2
-
-            # FIX (главная правка): санитизация ВНУТРИ combine, на каждом
-            # узле дерева associative_scan -- не только на входе/выходе
-            # всего scan.
-            da_new = jnp.nan_to_num(jnp.clip(da_new, 0.0, 0.99), nan=0.0, posinf=0.99, neginf=0.0)
-            c_new = jnp.nan_to_num(jnp.clip(c_new, -_COMBINE_ACC_CLIP, _COMBINE_ACC_CLIP),
-                                    nan=0.0, posinf=_COMBINE_ACC_CLIP, neginf=-_COMBINE_ACC_CLIP)
-            return da_new, c_new
-
-        def _to_chunks(t):
-            trailing = t.shape[2:]
-            t = t.reshape(b, num_chunks, chunk_size, *trailing)
-            return jnp.moveaxis(t, 1, 0)
-
-        # ФИКС: та же санитизация-рубеж, что и в GDN-2 -- независимо от
-        # источника nan/inf выше по графу (A_log/exp, dt/softplus, B/C
-        # проекции), гарантируем, что в рекуррентный scan всегда приходят
-        # конечные значения.
-        def _sanitize(t):
-            # ФИКС #4: явный bound той же разрядности, что и t. Голый
-            # Python-scalar в jnp.clip обычно ок, но внутри associative_scan
-            # смешение carry/init разной разрядности (bf16 vs fp32-scalar
-            # default) может дать TypeError на некоторых backend'ах --
-            # закрываем это явным bound с astype под dtype самого t.
-            bound = jnp.array(1e3, dtype=t.dtype)
-            return jnp.nan_to_num(jnp.clip(t, -bound, bound), nan=0.0, posinf=1e3, neginf=-1e3)
-
-        dA, dt, B, C, x_conv = map(_sanitize, (dA, dt, B, C, x_conv))
-
-        dA_ch = _to_chunks(dA)
-        dt_ch = _to_chunks(dt)
-        B_ch = _to_chunks(B)
-        C_ch = _to_chunks(C)
-        x_conv_ch = _to_chunks(x_conv)
-
-        # ФИКС: carry теперь в fp32 (было x_bc.dtype/bf16) -- см. блок выше.
-        carry_da_init = jnp.ones((b, d_inner), dtype=jnp.float32)
-        carry_h_init = jnp.zeros((b, d_inner, d_state), dtype=jnp.float32)
-
-        def _sanitize_scan_val(t, clip=1e4):
-            return jnp.nan_to_num(jnp.clip(t, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
-
-        def _chunk_step(carry, chunk_inputs):
-            carry_da, carry_h = carry
-            da_c, dt_c, B_c, C_c, xconv_c = chunk_inputs
-
-            dB_c = jnp.einsum("bcd,bcs->bcds", dt_c, B_c)
-            # ФИКС #3: dB_c -- это input gate, записывающий сигнал в state за
-            # один шаг. Диагностика на реальном прогоне ловила dB_c до ~2384
-            # -- клип здесь бьёт именно по источнику того выброса, до того
-            # как он попадёт в C_input_c/associative_scan.
-            dB_c = jnp.clip(dB_c, jnp.array(-1e3, dtype=dB_c.dtype), jnp.array(1e3, dtype=dB_c.dtype))
-            C_input_c = dB_c * xconv_c[..., None]
-            C_input_c = _sanitize_scan_val(C_input_c)
-            # ФИКС: апкаст в fp32 один раз здесь, до входа в associative_scan
-            # -- см. блок выше про накопление ошибки округления в bf16.
-            C_input_c = C_input_c.astype(jnp.float32)
-            da_c_f = da_c.astype(jnp.float32)
-
-            P_local, S_local = jax.lax.associative_scan(_combine, (da_c_f, C_input_c), axis=1)
-            S_local = _sanitize_scan_val(S_local)
-
-            global_da = P_local * carry_da[:, None, :]
-            global_h = P_local[..., None] * carry_h[:, None, :, :] + S_local
-            global_h = _sanitize_scan_val(global_h)
-
-            y_c = jnp.einsum("bcds,bcs->bcd", global_h, C_c.astype(jnp.float32),
-                              precision=jax.lax.Precision.HIGHEST)
-            y_c = _sanitize_scan_val(y_c)
-            # ФИКС: даункаст обратно в bf16 один раз здесь, на выходе шага --
-            # y дальше идёт в RMSNorm/gate/out_proj, всё остальное в модуле
-            # уже ожидает x_bc.dtype (bf16).
-            y_c = y_c.astype(x_bc.dtype)
-
-            new_carry = (global_da[:, -1], global_h[:, -1])  # carry остаётся fp32
-            return new_carry, y_c
-
-        _chunk_step = jax.checkpoint(_chunk_step)
-
-        _, y_chunks = jax.lax.scan(
-            _chunk_step, (carry_da_init, carry_h_init), (dA_ch, dt_ch, B_ch, C_ch, x_conv_ch)
+        y_h, _state_final = mamba2_ssd_reference(
+            dt_h, A, B_f, C_f, x_h, chunk_size=chunk_size
         )
-        y = jnp.moveaxis(y_chunks, 0, 1).reshape(b, l, d_inner)
+        y = y_h.reshape(b, l, d_inner).astype(x_bc.dtype)
 
-        # ДИАГНОСТИКА (GDN2_FWD_DIAG=1): величина SSM-выхода ДО нормировки --
-        # чтобы видеть, насколько велика амплитуда, которую ниже гасит
-        # RMSNorm, вместо того чтобы узнавать о ней только по [RESID-DIAG]
-        # в BlockDAR несколько слоёв спустя.
         y = _diag_maxabs("mamba2_ssm_out_pre_norm", y)
-
-        # ФИКС (закрывает дыру, симметричную out_norm в GatedDeltaNet2J):
-        # раньше выход SSM-скана шёл прямо в out_proj через
-        # y * silu(res) -> clip(±1e4) -> out_proj, БЕЗ какой-либо нормировки --
-        # единственный из трёх типов саблеера без неё на момент инцидентов
-        # RESID-DIAG на layer=13/14 (block4, mamba2). Клип ограничивает
-        # диапазон, но не масштаб/распределение -- значение могло свободно
-        # плавать от ~1 до 1e4 и оттуда накапливаться в local_deltas/
-        # history_blocks, откуда его читают все последующие блоки через
-        # HybridDARAttention/IntraBlockAttention. RMSNorm здесь -- ровно тот
-        # же приём, что уже стоит на выходе GDN-2 (out_norm), применённый
-        # ДО гейта silu(res), а не после -- чтобы сам гейт не мог снова
-        # растащить масштаб уже отнормированного значения.
         y = nn.RMSNorm(epsilon=1e-6, name="ssm_out_norm")(y).astype(x_bc.dtype)
-
         y = _diag_maxabs("mamba2_ssm_out_post_norm", y)
 
         out = y * jax.nn.silu(res)
-        # ФИКС #5: последний рубеж перед residual stream -- даже если весь
-        # scan остался конечным, финальное умножение y*silu(res) может дать
-        # усиление (оба множителя уже прошли клип по отдельности, но их
-        # произведение -- нет). Не пускаем большие значения в out_proj/residual.
         out = jnp.clip(out, jnp.array(-3e2, dtype=out.dtype), jnp.array(3e2, dtype=out.dtype))
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out)
 
