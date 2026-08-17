@@ -830,13 +830,29 @@ class BlockDARLayer(nn.Module):
             current_x, dar_sources
         )
         retrieved = make_grad_probe(f"block{self.layer_idx}_dar_out")(retrieved)
-        current_x = current_x + retrieved
+        # ФИКС (DAR dead-code): раньше здесь стояло `current_x = current_x +
+        # retrieved` -- переприсваивание ЛОКАЛЬНОЙ переменной current_x,
+        # которая нигде дальше не читалась: mixed ниже строился из
+        # block_input/local_deltas (не из current_x), а функция возвращает
+        # только delta. В результате dar-модуль (HybridDARAttention) не
+        # получал НИКАКОГО градиента -- параметры существуют в чекпоинте
+        # (flax создаёт их при первом вызове модуля независимо от того,
+        # используется ли результат), но никогда не обучались, и весь
+        # механизм ретрива истории по блокам был фактически выключен.
+        # Патч реально подмешивает retrieved в mixed -- см. ниже. Форма
+        # params/opt_state не меняется (dar-модуль уже присутствовал в
+        # pytree с той же формой), поэтому resume с текущего чекпоинта
+        # проходит штатно; ожидайте временный скачок loss/RESID-DIAG сразу
+        # после включения патча -- это следствие того, что путь впервые
+        # начинает реально влиять на forward, а не регрессия.
 
         intra_sources = [block_input] + list(local_deltas)
         mixed = IntraBlockAttention(cfg=self.cfg, name="intra")(
             intra_sources, block_input
         )
         mixed = make_grad_probe(f"block{self.layer_idx}_intra_out")(mixed)
+
+        mixed = mixed + retrieved  # ФИКС: retrieved теперь реально используется
 
         mixed = nn.RMSNorm(epsilon=1e-6, name="pre_sublayer_norm")(mixed)
 
@@ -904,7 +920,25 @@ class BlockDAR(nn.Module):
 
             local_deltas.append(delta)
 
-            _resid_clip = 5e2 if layer_type == "mamba2" else 1e3
+            # ФИКС (gdn2->mamba2 clip mismatch, systematic [RESID-DIAG] на
+            # layer=22/block=7): раньше _resid_clip зависел ТОЛЬКО от типа
+            # только что отработавшего слоя (layer_type). Из-за этого
+            # current_x мог насытиться до ±1e3 после gdn2-слоя, а затем
+            # СРАЗУ входил в mamba2-слой с более тугим порогом (±5e2) --
+            # само срабатывание диагностики происходит ДО применения этого
+            # клипа (см. cx_abs_max выше), поэтому граница gdn2->mamba2
+            # систематически показывала max|abs| в районе 1000+ каждый раз,
+            # когда current_x был близко к своему предыдущему (более
+            # широкому) потолку. Теперь клип "упреждающий" -- если
+            # СЛЕДУЮЩИЙ слой в блоке mamba2, используем более тугой порог
+            # уже СЕЙЧАС, чтобы current_x не успевал разгоняться перед
+            # входом в mamba2. Чисто активационная правка -- не меняет
+            # params/opt_state, безопасна для resume с текущего чекпоинта.
+            next_layer_type = (
+                self.cfg.layer_types[layer_idx + 1]
+                if (i + 1) < self.cfg.layers_per_block else None
+            )
+            _resid_clip = 5e2 if (layer_type == "mamba2" or next_layer_type == "mamba2") else 1e3
             current_x = jnp.nan_to_num(
                 jnp.clip(_cx_next, -_resid_clip, _resid_clip),
                 nan=0.0, posinf=_resid_clip, neginf=-_resid_clip,
