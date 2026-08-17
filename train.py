@@ -191,12 +191,12 @@ def main_execution():
         layer_types=(
             "gdn2", "gdn2", "mla",
             "gdn2", "mamba2", "gdn2",
+            "gdn2", "gdn2", "mla",
+            "gdn2", "mamba2", "gdn2",
+            "gdn2", "gdn2", "mla",
+            "gdn2", "mamba2", "gdn2",
+            "gdn2", "gdn2", "mla",
             "gdn2", "gdn2", "gdn2",
-            "gdn2", "gdn2", "mla",
-            "gdn2", "mamba2", "gdn2",
-            "gdn2", "gdn2", "mla",
-            "gdn2", "gdn2", "mla",
-            "gdn2", "mamba2", "gdn2",
         ),
     )
     file_pairs = [
