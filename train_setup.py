@@ -22,6 +22,32 @@ _gather_batch(idx_local[...]), чтобы _round_robin_gen мог пропуск
 пройденные микрошаги (skip_first) БЕЗ чтения с диска на каждый из них --
 именно так, как и было задумано в его собственном докстринге/принте
 "Быстрый пропуск N микрошагов (без чтения с диска)".
+
+ФИКС #3 (этот пасс -- W&B диагностика без jax.debug.print/callback):
+раньше _group_nonfinite_check и distributed_apply_step (для was_clipped)
+печатали диагностику через jax.debug.print ПРЯМО ВНУТРИ jit-графа. Две
+проблемы с этим:
+  (a) jax.debug.print/jax.debug.callback открывают host-callback канал на
+      КАЖДЫЙ фактический вызов -- на длинных сессиях (десятки тысяч шагов)
+      это упирается в лимит открытых файлов рантайма (OSError: Too many
+      open files), реально наблюдавшийся баг в этом проекте;
+  (b) даже если бы это не падало, вывод шёл ТОЛЬКО в консоль Kaggle,
+      которая не сохраняется между сессиями, и НИКОГДА не попадал в W&B --
+      то есть самая ценная диагностика (какая именно группа параметров
+      даёт non-finite, насколько близко global_norm подошёл к клипу)
+      была невидима постфактум.
+Обе диагностики теперь ЧИСТЫЕ функции: возвращают jnp-массивы/скаляры как
+ОБЫЧНЫЕ ВЫХОДЫ jitted distributed_apply_step, без единого debug.print/
+debug.callback внутри графа. Печать и W&B-логирование делаются на
+host-стороне в train.py, в том же месте, где уже логируются train_loss/
+aux_info -- ноль дополнительных host-callback каналов, полное покрытие
+W&B.
+
+ФИКС #4 (этот пасс): make_hybrid_optimizer теперь дополнительно
+возвращает lr_schedule (0..1 множитель, до умножения на конкретный
+base_lr каждой группы) -- нужно, чтобы train.py мог логировать
+train/lr_scale в W&B без необходимости пересчитывать warmup/cosine-decay
+формулу отдельно.
 """
 from __future__ import annotations
 
@@ -59,8 +85,9 @@ SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 5 * 60  # 9 часов минус за�
 # ==========================================================================
 # ДИАГНОСТИКА non-finite градиентов: относим каждый лист параметров к одной
 # из "подозреваемых" групп (GDN-2, Mamba2, MLA, MoE, embed, остальное),
-# затем на каждом шаге, где итоговый global_norm не конечен, печатаем через
-# jax.debug.print, у КАКИХ ИМЕННО групп есть non-finite градиент.
+# затем на каждом шаге, где итоговый global_norm не конечен, ВОЗВРАЩАЕМ
+# (не печатаем -- см. ФИКС #3 выше) булев вектор -- у КАКИХ ИМЕННО групп
+# есть non-finite градиент.
 # ==========================================================================
 _DIAG_GROUPS = ("gdn2", "mamba2", "mla", "moe", "muon_decay", "embed", "other")
 
@@ -87,27 +114,32 @@ def make_grad_group_map(params):
     )
 
 
-def build_group_nonfinite_check(grad_group_map):
-    """Возвращает функцию (avg_grads) -> None, которая ВНУТРИ jit печатает
-    через jax.debug.print, в каких группах есть non-finite градиент."""
-    leaves_g, treedef = jax.tree_util.tree_flatten(grad_group_map)
+def build_group_nonfinite_flags(grad_group_map):
+    """ФИКС (заменяет старую build_group_nonfinite_check): возвращает
+    ЧИСТУЮ функцию (avg_grads) -> jnp.ndarray формы (len(_DIAG_GROUPS),)
+    bool -- по каждой группе: есть ли в ней хоть один non-finite лист.
+    НИКАКОГО jax.debug.print/debug.callback внутри -- просто обычный
+    JAX-массив, который distributed_apply_step возвращает как один из
+    своих выходов (см. ФИКС #3 в докстринге модуля). Порядок элементов
+    массива соответствует порядку _DIAG_GROUPS -- host-сторона (train.py)
+    делает zip(_DIAG_GROUPS, flags) для печати/W&B."""
+    leaves_g, _ = jax.tree_util.tree_flatten(grad_group_map)
 
-    def _check(avg_grads):
+    def _flags(avg_grads):
         leaves_grad = jax.tree_util.tree_leaves(avg_grads)
+        flags = []
         for group in _DIAG_GROUPS:
             idxs = [i for i, g in enumerate(leaves_g) if g == group]
             if not idxs:
+                flags.append(jnp.array(False))
                 continue
-            flags = [jnp.logical_not(jnp.all(jnp.isfinite(leaves_grad[i]))) for i in idxs]
-            group_flag = jnp.any(jnp.stack(flags)) if len(flags) > 1 else flags[0]
-            jax.lax.cond(
-                group_flag,
-                lambda g=group: jax.debug.print(
-                    "[DIAG] ⚠️ non-finite градиент обнаружен в группе: {g}", g=g
-                ),
-                lambda: None,
-            )
-    return _check
+            group_flags = jnp.stack([
+                jnp.logical_not(jnp.all(jnp.isfinite(leaves_grad[i]))) for i in idxs
+            ])
+            flags.append(jnp.any(group_flags))
+        return jnp.stack(flags)
+
+    return _flags
 
 
 def make_tpu_mesh():
@@ -130,7 +162,10 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     batch_axis = "tpu_nodes"
     set_model_mesh(mesh, batch_axis=batch_axis)
 
-    tx = make_hybrid_optimizer(total_steps=total_steps)
+    # ФИКС #4: make_hybrid_optimizer теперь возвращает (tx, lr_schedule) --
+    # lr_schedule прокидывается наружу для W&B-логирования в train.py
+    # (train/lr_scale), не только для внутреннего использования optax'ом.
+    tx, lr_schedule = make_hybrid_optimizer(total_steps=total_steps)
     model = FullHybridMoEModel(cfg=config)
 
     init_rng = jax.random.PRNGKey(0)
@@ -162,7 +197,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     param_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, abstract_params)
 
     grad_group_map = make_grad_group_map(abstract_params)
-    _group_nonfinite_check = build_group_nonfinite_check(grad_group_map)
+    _group_nonfinite_flags = build_group_nonfinite_flags(grad_group_map)
 
     def _decay_scale_leaf(path, param):
         path_str = path_to_str(path)
@@ -195,7 +230,10 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     def distributed_apply_step(p, s, accum_grads, n_accum):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
-        _group_nonfinite_check(avg_grads)
+        # ФИКС #3: чистая функция, возвращает jnp-массив -- НЕ печатает
+        # ничего внутри jit. Разбор/печать/W&B -- на host-стороне в
+        # train.py, после device_get.
+        group_nonfinite_flags = _group_nonfinite_flags(avg_grads)
 
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
 
@@ -217,17 +255,16 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             lambda pp: jnp.nan_to_num(jnp.clip(pp, -1e2, 1e2), nan=0.0, posinf=1e2, neginf=-1e2),
             new_p,
         )
+        # ФИКС #3: was_clipped тоже больше не печатается через
+        # jax.lax.cond(...jax.debug.print...) -- просто bool-скаляр,
+        # возвращаемый как обычный выход, ровно как is_finite уже был.
         was_clipped = jnp.any(jnp.stack([
             jnp.any(jnp.abs(leaf) >= 1e2) for leaf in jax.tree_util.tree_leaves(p)
         ]))
-        jax.lax.cond(
-            was_clipped,
-            lambda: jax.debug.print("[PARAM-DIAG] ⚠️ Обнаружен параметр с |w|>=100 ДО клипа -- веса разрослись."),
-            lambda: None,
-        )
 
         zero_accum = jax.tree_util.tree_map(jnp.zeros_like, accum_grads)
-        return new_p, new_s, zero_accum, is_finite
+        return (new_p, new_s, zero_accum, is_finite,
+                global_norm, clip_factor, group_nonfinite_flags, was_clipped)
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -276,7 +313,11 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             param_sharding,
             opt_state_sharding,
             param_sharding,
-            NamedSharding(mesh, P()),  # is_finite
+            NamedSharding(mesh, P()),        # is_finite
+            NamedSharding(mesh, P()),        # global_norm
+            NamedSharding(mesh, P()),        # clip_factor
+            NamedSharding(mesh, P(None)),    # group_nonfinite_flags, shape (len(_DIAG_GROUPS),)
+            NamedSharding(mesh, P()),        # was_clipped
         ),
     )
 
@@ -287,7 +328,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     )
 
     return (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
-            param_sharding, opt_state_sharding, data_sharding)
+            param_sharding, opt_state_sharding, data_sharding, lr_schedule)
 
 
 def resolve_source_files(output_dir, prefix):
