@@ -50,6 +50,18 @@ fraction) -- см. её докстринг: fraction применяется к �
 вынесено в один явный словарь SOURCE_FRACTIONS рядом с file_pairs, чтобы
 крутить пропорции источников одним взглядом, не листая пути. build_manifest
 и dataloader_multi_source НЕ менялись -- обе уже штатно принимают 3-tuple.
+
+ФИКС (этот пасс, host-side group-diagnostics + W&B): раньше per-group
+non-finite флаги, global grad norm, clip factor и флаг клипа параметров
+печатались ИЗНУТРИ jit через jax.debug.print и вообще не попадали в W&B --
+это отдельный host-callback канал, который жил своей жизнью в консоли.
+compiled_apply (train_setup.py) теперь возвращает эти величины как обычные
+outputs (global_norm, clip_factor, group_nonfinite_flags, was_clipped),
+поэтому здесь -- обычный host-side jax.device_get() + разбор по _DIAG_GROUPS
+(тот же порядок групп, что train_setup.py использует для сборки
+group_nonfinite_flags) и логирование в W&B на каждом эффективном шаге.
+Печать в консоль сохранена, но теперь она условная (только если реально
+что-то не так), а не безусловный debug.print на каждом шаге.
 """
 import os
 import time
@@ -75,6 +87,7 @@ from train_setup import (
     DATASET_FRACTION, DATASET_FRACTION_SEED,
     NONFINITE_CONSECUTIVE_LIMIT, NONFINITE_WINDOW_SIZE, NONFINITE_WINDOW_RATIO,
     SESSION_TIME_BUDGET_SECONDS,
+    _DIAG_GROUPS,   # ФИКС: нужно для host-side разбора group_nonfinite_flags
 )
 import wandb_logging
 
@@ -93,8 +106,8 @@ def main_execution():
     mngr_best_train = make_manager(best_train_dir, max_to_keep=1)
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
-    FORCE_FRESH_START = True  # <-- поставьте False, чтобы вернуть обычный resume
-    RESUME_FROM_SLOT = "latest"  # <-- используется только если FORCE_FRESH_START=False
+    FORCE_FRESH_START = False  # <-- поставьте False, чтобы вернуть обычный resume
+    RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
 
     if FORCE_FRESH_START:
         resume_step = None
@@ -260,8 +273,11 @@ def main_execution():
     print(f"[TPU] Компиляция XLA графа под {total_train_steps} эффективных шагов "
           f"({epochs} эпох(и) x {train_steps_per_epoch} шагов, accum={accum_steps})...")
 
+    # ФИКС: make_shard_and_compile (train_setup.py) теперь возвращает
+    # дополнительно lr_schedule 10-м элементом -- unpacking обновлён под
+    # 10 значений, иначе ValueError: too many values to unpack.
     (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
-     param_sharding, opt_state_sharding, data_sharding) = (
+     param_sharding, opt_state_sharding, data_sharding, lr_schedule) = (
         make_shard_and_compile(config, total_train_steps, micro_batch_size, seq_len, accum_steps)
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
@@ -513,7 +529,8 @@ def main_execution():
                 _params_pre_apply_host = jax.tree_util.tree_map(jax.device_get, params)
 
                 _t_apply = time.perf_counter()
-                params, opt_state, accum_grads, was_finite = compiled_apply(
+                (params, opt_state, accum_grads, was_finite,
+                 global_norm, clip_factor, group_nonfinite_flags, was_clipped) = compiled_apply(
                     params, opt_state, accum_grads, accum_steps
                 )
                 if micro_step < 30:
@@ -521,6 +538,35 @@ def main_execution():
                 _t_apply_total = time.perf_counter() - _t_apply
 
                 step_was_finite = bool(jax.device_get(was_finite))
+
+                # ФИКС: раньше это печаталось внутри jit через debug.print
+                # (и НЕ логировалось в W&B вообще). Теперь -- обычный
+                # host-side разбор, ноль host-callback каналов, полное
+                # покрытие W&B.
+                _global_norm_val = float(jax.device_get(global_norm))
+                _clip_factor_val = float(jax.device_get(clip_factor))
+                _group_flags_np = jax.device_get(group_nonfinite_flags)
+                _was_clipped_val = bool(jax.device_get(was_clipped))
+
+                _nonfinite_groups_this_step = [
+                    name for name, flag in zip(_DIAG_GROUPS, _group_flags_np) if bool(flag)
+                ]
+                if _nonfinite_groups_this_step:
+                    print(f"[DIAG] ⚠️ non-finite градиент в группах: {_nonfinite_groups_this_step} "
+                          f"на global_step={global_step + 1}")
+                if _was_clipped_val:
+                    print(f"[PARAM-DIAG] ⚠️ Обнаружен параметр с |w|>=100 ДО клипа -- веса разрослись "
+                          f"на global_step={global_step + 1}")
+
+                wandb_step_diag_metrics = {
+                    "train/global_grad_norm": _global_norm_val,
+                    "train/clip_factor": _clip_factor_val,
+                    "train/param_clip_triggered": int(_was_clipped_val),
+                }
+                for name in _DIAG_GROUPS:
+                    wandb_step_diag_metrics[f"nonfinite/group_{name}"] = int(name in _nonfinite_groups_this_step)
+                wandb_logging.log_metrics(global_step + 1, wandb_step_diag_metrics)
+
                 if not step_was_finite:
                     print(f"[WARNING] ⚠️ Non-finite градиент на global_step={global_step + 1} -- "
                           f"обновление ПРОПУЩЕНО, веса не изменены. Если это повторяется часто, "
@@ -549,6 +595,7 @@ def main_execution():
                             "n_micro": len(_accum_window),
                             "global_step": int(global_step + 1),
                             "source_idx_per_micro": [entry["source_idx"] for entry in _accum_window],
+                            "nonfinite_groups": _nonfinite_groups_this_step,
                         }, f)
                     print(f"[SNAPSHOT] Saved {len(_accum_window)} micro-steps + PRE-APPLY params to {snap_dir}")
                 else:
@@ -777,6 +824,18 @@ def main_execution():
         upload_slot(latest_dir, "latest", finalized["step"], "FINAL", keep_last_n=HF_LATEST_KEEP_N)
 
     print("Обучение завершено (для этой сессии).")
+
+    # ФИКС: финальная сводка прогона -- фиксируется как W&B summary (не
+    # временной ряд), чтобы в таблице/сравнении ранов сразу были видны
+    # итоговые best_train/best_val, на каком шаге всё закончилось и по
+    # какой причине (обычное завершение / time budget / non-finite auto-stop).
+    wandb_logging.set_summary({
+        "final/best_train_loss": best_train_loss,
+        "final/best_val_loss": best_val_loss,
+        "final/global_step": global_step,
+        "final/stopped_by_time_budget": stopped_by_time_budget,
+        "final/stopped_by_nonfinite_limit": stopped_by_nonfinite_limit,
+    })
     wandb_logging.finish()
 
 
