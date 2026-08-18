@@ -4,23 +4,6 @@ Milestone MB2 -- Pallas backward kernel for M3's intra-chunk stage
 mamba2_bwd_intra_reference.py's module docstring for the full ownership
 accounting and why this half can be tested in isolation from MB1
 (state-recurrence).
-
-BC/N_SUB sub-blocking mirrors kernel_mamba2_b_intra.py's forward
-(_resolve_bc) exactly -- same chunk_size>=128 multi-sub-block /
-chunk_size<128 single-sub-block behavior.
-
-Sanitization: same convention as kernel_bwd_b4_intra.py -- clip after
-EVERY accumulation write inside the (si,sj) sub-block loop, not just at
-the end, for the same "opposite-sign inf meeting mid-loop -> unrecoverable
-NaN" reason documented there. dx_ref is used as a scratch accumulator for
-d_dBx_2 during the loop (same "scratch accumulates during the loop, real
-value overwritten at the end" trick kernel_bwd_b4_intra.py uses for its
-own db_ref).
-
-state_end's own backward (dwrite/dB_1) is a single full-chunk (C,D)x(D,S)
-matmul, NOT sub-blocked -- state_end's forward is already a single
-whole-chunk contraction (kernel_mamba2_b_intra.py's `state_end =
-write.T @ B_full`), no (BT,BT) intermediate to avoid materializing there.
 """
 from __future__ import annotations
 
@@ -145,15 +128,6 @@ def _kernel_body_b2(dt_ref, x_ref, b_ref, c_ref, cumdecay_ref, dydiag_ref, dstat
 
 
 def intra_chunk_ssd_bwd_pallas(dt, x, B, C, cumdecay, dy, dstate_end_grad, chunk_size, interpret=False):
-    """dt,x,dy: (bsz,L,n_heads_ssm,headdim). B,C: (bsz,L,d_state).
-    cumdecay: (bsz,n_heads_ssm,n_chunks,chunk_size,headdim) -- M2 output.
-    dstate_end_grad: (bsz,n_heads_ssm,n_chunks,headdim,d_state) -- cotangent
-    for M3's state_end (== dstate_new passed through unchanged from MB1's
-    scan, see kernel_mamba2_bwd_b1_state.py's dstate_end assignment).
-
-    Returns ddt, dx, dB, dC (PARTIAL for ddt/dC -- see module docstring),
-    dcumdecay (PARTIAL, same per-chunk layout as the `cumdecay` input --
-    MB4 consumes it directly in this layout)."""
     bsz, L, n_heads_ssm, headdim = dt.shape
     d_state = B.shape[-1]
     assert L % chunk_size == 0
@@ -196,9 +170,6 @@ def intra_chunk_ssd_bwd_pallas(dt, x, B, C, cumdecay, dy, dstate_end_grad, chunk
         return jnp.moveaxis(t, 1, 3).reshape(bsz, L, n_heads_ssm, headdim)
 
     def unreshape_bc(t):
-        # sum over heads -- undoes the forward broadcast (B/C are shared
-        # across heads, so their true gradient is the sum of every head's
-        # local contribution, same rule autodiff applies to a broadcast).
         t = jnp.sum(t, axis=1)
         return t.reshape(bsz, L, d_state)
 
