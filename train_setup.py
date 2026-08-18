@@ -48,6 +48,21 @@ W&B.
 base_lr каждой группы) -- нужно, чтобы train.py мог логировать
 train/lr_scale в W&B без необходимости пересчитывать warmup/cosine-decay
 формулу отдельно.
+
+ФИКС #5 (этот пасс -- AttributeError: 'function' object has no attribute
+'init'): optax.GradientTransformation сам является NamedTuple из двух
+полей (init, update) -- то есть тоже обычный 2-tuple. Пока optimizer.py
+не обновлён на фактический возврат (tx, lr_schedule) (ФИКС #4 выше
+описывает НАМЕРЕНИЕ, но реализация в optimizer.py может отставать),
+безусловная распаковка `tx, lr_schedule = make_hybrid_optimizer(...)` НЕ
+падает с ошибкой сразу -- она молча распаковывает сам
+GradientTransformation: tx становится функцией tx.init, а lr_schedule --
+функцией tx.update. Дальше `tx.init(...)` закономерно падает с
+"'function' object has no attribute 'init'", и трейсбек указывает на
+СЛЕДУЮЩУЮ строку (jax.eval_shape(lambda: tx.init(...))), что маскирует
+реальную причину. make_shard_and_compile теперь явно проверяет тип
+результата make_hybrid_optimizer вместо слепой распаковки -- см.
+make_shard_and_compile ниже.
 """
 from __future__ import annotations
 
@@ -165,7 +180,30 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     # ФИКС #4: make_hybrid_optimizer теперь возвращает (tx, lr_schedule) --
     # lr_schedule прокидывается наружу для W&B-логирования в train.py
     # (train/lr_scale), не только для внутреннего использования optax'ом.
-    tx, lr_schedule = make_hybrid_optimizer(total_steps=total_steps)
+    #
+    # ФИКС #5 (этот пасс, AttributeError: 'function' object has no attribute
+    # 'init'): optax.GradientTransformation САМ является NamedTuple из двух
+    # полей (init, update) -- то есть тоже обычный 2-tuple. Если
+    # optimizer.py ещё не обновлён и make_hybrid_optimizer по-прежнему
+    # возвращает ГОЛЫЙ tx (а не (tx, lr_schedule)), то безусловная
+    # распаковка `tx, lr_schedule = make_hybrid_optimizer(...)` НЕ падает
+    # с ошибкой -- она молча распаковывает сам GradientTransformation:
+    # tx становится функцией tx.init, а lr_schedule -- функцией tx.update.
+    # Дальше `tx.init(...)` закономерно падает с
+    # "'function' object has no attribute 'init'" (именно эта ошибка и
+    # наблюдалась -- трейсбек указывал на СЛЕДУЮЩУЮ строку,
+    # jax.eval_shape(lambda: tx.init(...)), что маскировало реальную
+    # причину). Явно проверяем тип результата вместо слепой распаковки.
+    _opt_result = make_hybrid_optimizer(total_steps=total_steps)
+    if isinstance(_opt_result, (optax.GradientTransformation, optax.GradientTransformationExtraArgs)):
+        # optimizer.py ещё не обновлён -- вернул голый tx, lr_schedule нет.
+        tx = _opt_result
+        lr_schedule = None
+        print("[OPTIMIZER] ⚠️ make_hybrid_optimizer вернул голый tx (без lr_schedule) -- "
+              "train/lr_scale логироваться в W&B не будет, пока optimizer.py не обновлён "
+              "на возврат (tx, lr_schedule).")
+    else:
+        tx, lr_schedule = _opt_result
     model = FullHybridMoEModel(cfg=config)
 
     init_rng = jax.random.PRNGKey(0)
