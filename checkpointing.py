@@ -36,7 +36,11 @@ try:
 except ImportError:
     _HAS_HF = False
     print("[WARN] pip install -q huggingface_hub")
-
+except Exception as e:
+    _HAS_HF = False
+    print(f"[WARN] HF-интеграция недоступна ({type(e).__name__}: {e}) -- "
+          f"проверьте, что секреты HF_TOKEN/HF_REPO_ID добавлены в Kaggle notebook "
+          f"и подключены к этому ноутбуку (Add-ons → Secrets). Продолжаю без HF.")
 # ФИКС: раз в 25 минут. ВАЖНО: с синхронным чекпоинтингом (см. ниже) реальная
 # длительность записи будет видна в логах как время выполнения save_all_slots() --
 # следите за первыми 2-3 циклами и увеличьте интервал, если запись занимает
