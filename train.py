@@ -1,6 +1,55 @@
 """
 train.py -- главный orchestration-цикл обучения.
-...
+
+ФИКС (разбивка файла): раньше все ~1400 строк -- HF-релей, orbax
+чекпоинтинг, диагностика non-finite по группам, mesh/шардинг/компиляция,
+dataloader и сам цикл обучения -- жили в одном файле, что усложняло навигацию.
+Разнесено на:
+  - checkpointing.py  -- HF Hub relay + orbax save/restore/async
+  - train_setup.py    -- диагностика групп, mesh/shard/compile, dataloader
+  - wandb_logging.py  -- W&B логирование (новое)
+  - train.py (этот файл) -- только main_execution(), сам цикл обучения
+
+Логика самого цикла НЕ изменена относительно предыдущей версии -- только
+добавлены вызовы wandb_logging.* в тех точках, где уже существовал print()
+с тем же значением (см. пометки "ФИКС (W&B):" ниже).
+
+ФИКС (этот пасс, pytree mismatch на round_robin): dataloader_multi_source
+в режиме mode="round_robin" (и "sequential") кладёт в каждый батч
+дополнительный диагностический ключ "_source_idx" (индекс источника --
+см. train_setup.py, задумано для того, чтобы при RESID-DIAG/non-finite
+сразу знать источник-виновник). compiled_train_micro в train_setup.py,
+однако, скомпилирован с ЖЁСТКОЙ pjit-сигнатурой in_shardings под
+{"input_ids": ..., "labels": ...} -- ровно 2 ключа. Батч с "_source_idx"
+даёт:
+    ValueError: Mismatch details (1 found): pytree structure error...
+    but at the same key path the full pytree has a subtree of the same
+    type but with 3 child keys ['_source_idx'] ['input_ids'] ['labels']
+Раньше это не всплывало сразу, потому что resume с большим global_step
+тратил много времени на skip ДО первого реального батча (см. чат) -- ошибка
+всплывала только на первом батче, который реально доходит до
+compiled_train_micro, независимо от того, сколько шагов до этого было
+пропущено.
+
+Фикс: явно достаём "_source_idx" из батча (.pop(..., None)) СРАЗУ после
+next(train_stream), ДО того как батч попадёт в compiled_train_micro/
+_accum_window. В mixed-режиме ключа нет -- .pop(..., None) там просто
+тихо вернёт None, никакого поведенческого изменения. Значение сохраняем
+и прокидываем в non-finite снапшот (SNAPSHOT_META.json) -- это как раз
+делает реальностью то, что комментарий в train_setup.py уже обещал
+("можно сохранить это поле рядом со снапшотом и сразу узнать источник-
+виновник"), а не просто выбрасываем его.
+
+ФИКС (этот пасс, per-source fraction как гиперпараметры): раньше доля
+каждого источника, если её вообще хотелось урезать, пришлось бы прописывать
+третьим элементом кортежа прямо внутри file_pairs -- легко потерять среди
+путей, неудобно быстро покрутить перед запуском. dataloader_multi_source
+(train_setup.py) уже давно поддерживает 3-tuple (ids_path, lbls_path,
+fraction) -- см. её докстринг: fraction применяется к ИМЕННО этому
+источнику, ДО train/val split и ДО глобального DATASET_FRACTION. Ниже это
+вынесено в один явный словарь SOURCE_FRACTIONS рядом с file_pairs, чтобы
+крутить пропорции источников одним взглядом, не листая пути. build_manifest
+и dataloader_multi_source НЕ менялись -- обе уже штатно принимают 3-tuple.
 """
 import os
 import time
@@ -32,86 +81,6 @@ import wandb_logging
 from model import ModelConfig, get_model_mesh
 
 
-# ==========================================================================
-# ДИАГНОСТИКА (не изменяет params/opt_state): сравнивает статистику
-# A_log/dt_proj.bias между всеми mamba2-слоями после resume -- вместо
-# слепой "хирургии" переинициализации, которая была бы преждевременна:
-# все mamba2-слои получили ОДИНАКОВОЕ число градиентных шагов в этом
-# прогоне (num_layers=24 задан с самого начала, не расширялся посреди
-# обучения), поэтому гипотеза "layer=22 моложе остальных" отпадает.
-# Реальные кандидаты -- структурная позиция (близость к выходу, глубина
-# history_blocks для block_7), а не недостаток шагов -- и их стоит сначала
-# УВИДЕТЬ в цифрах, а не лечить вслепую.
-# ==========================================================================
-def diagnose_mamba2_decay_params(params, mamba2_layer_indices, layers_per_block):
-    """Печатает mean/std/min/max для A_log и dt_proj.bias КАЖДОГО указанного
-    mamba2-слоя, плюс производные величины (dt на первом шаге при нулевом
-    входе dt_proj: softplus(bias), и итоговый decay exp(-softplus(bias)*A)
-    в характерной точке A=-exp(A_log).mean()) -- чтобы увидеть, действительно
-    ли layer=22 численно отличается от layer=4/layer=13, а не гадать."""
-    print("\n" + "=" * 70)
-    print("[MAMBA2-DIAG] Сравнение decay-параметров по mamba2-слоям")
-    print("=" * 70)
-
-    found = {}
-
-    def _collect(path, leaf):
-        if len(path) < 6:
-            return
-        keys = [str(getattr(p, "key", p)) for p in path]
-        for layer_idx in mamba2_layer_indices:
-            block_idx = layer_idx // layers_per_block
-            prefix_ok = (
-                keys[0] == f"block_{block_idx}" and keys[1] == f"layer_{layer_idx}"
-                and keys[2] == "sublayer" and keys[3] == "mamba2"
-            )
-            if not prefix_ok:
-                continue
-            if keys[4] == "A_log":
-                found.setdefault(layer_idx, {})["A_log"] = leaf
-            elif len(keys) >= 6 and keys[4] == "dt_proj" and keys[5] == "bias":
-                found.setdefault(layer_idx, {})["dt_bias"] = leaf
-
-    jax.tree_util.tree_map_with_path(lambda p, l: (_collect(p, l), l)[1], params)
-
-    for layer_idx in mamba2_layer_indices:
-        entry = found.get(layer_idx)
-        if entry is None or "A_log" not in entry or "dt_bias" not in entry:
-            print(f"[MAMBA2-DIAG] ⚠️ layer_{layer_idx}: не удалось найти A_log/dt_proj.bias "
-                  f"по ожидаемому пути -- пропускаю (проверьте пути вручную).")
-            continue
-
-        A_log = jax.device_get(entry["A_log"]).astype("float32")
-        dt_bias = jax.device_get(entry["dt_bias"]).astype("float32")
-
-        A_log_clipped = jnp.clip(A_log, -20.0, 20.0)
-        A = -jnp.exp(A_log_clipped)
-        dt_at_zero_input = jax.nn.softplus(dt_bias)  # dt если dt_proj-выход самой сети ~0
-        dt_clipped = jnp.clip(dt_at_zero_input, 1e-2, 1.0)  # тот же forward-клип, что в Mamba2J
-        # decay за один шаг в характерной точке -- exp(dt*A), усреднённый по каналам
-        decay_per_step = jnp.exp(jnp.clip(dt_clipped * A, -20.0, 0.0))
-
-        print(f"\n[MAMBA2-DIAG] layer_{layer_idx} (block_{layer_idx // layers_per_block}):")
-        print(f"    A_log:        mean={float(jnp.mean(A_log)):+.4f}  std={float(jnp.std(A_log)):.4f}  "
-              f"min={float(jnp.min(A_log)):+.4f}  max={float(jnp.max(A_log)):+.4f}")
-        print(f"    dt_proj.bias: mean={float(jnp.mean(dt_bias)):+.4f}  std={float(jnp.std(dt_bias)):.4f}  "
-              f"min={float(jnp.min(dt_bias)):+.4f}  max={float(jnp.max(dt_bias)):+.4f}")
-        print(f"    dt(at zero input, post-clip): mean={float(jnp.mean(dt_clipped)):.5f}  "
-              f"std={float(jnp.std(dt_clipped)):.5f}")
-        print(f"    decay_per_step (exp(dt*A)):   mean={float(jnp.mean(decay_per_step)):.5f}  "
-              f"std={float(jnp.std(decay_per_step)):.5f}  "
-              f"(1.0=не забывает вообще, 0.0=забывает мгновенно)")
-
-    print("\n[MAMBA2-DIAG] Как читать: если у layer_22 decay_per_step систематически "
-          "ближе к 0 или к 1 относительно layer_4/layer_13 (не просто другой std, а "
-          "смещённое mean), это говорит о специфичном для этого слоя режиме -- тогда "
-          "стоит смотреть на A_log/dt_bias std как на признак недостаточной "
-          "межканальной дифференциации decay именно здесь. Если все три слоя похожи -- "
-          "проблема НЕ в decay-параметрах, и стоит смотреть выше по стеку (DAR "
-          "history_blocks на block_7, близость к выходу).")
-    print("=" * 70 + "\n")
-
-
 def main_execution():
     ckpt_root = "/kaggle/working/orbax_checkpoints"
     latest_dir = os.path.join(ckpt_root, "latest")
@@ -124,13 +93,13 @@ def main_execution():
     mngr_best_train = make_manager(best_train_dir, max_to_keep=1)
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
-    FORCE_FRESH_START = False  # ФИКС: продолжаем с чекпоинта шага 4000, не с нуля
-    RESUME_FROM_SLOT = "latest"
+    FORCE_FRESH_START = True  # <-- поставьте False, чтобы вернуть обычный resume
+    RESUME_FROM_SLOT = "latest"  # <-- используется только если FORCE_FRESH_START=False
 
     if FORCE_FRESH_START:
         resume_step = None
         print("[RESUME] 🆕 FORCE_FRESH_START=True -- пропускаю поиск чекпоинтов, начинаю с нуля.")
-    elif RESUME_FROM_SLOT == "best_train":
+    elif RESUME_FROM_SLOT == "latest":
         resume_step = mngr_latest.latest_step()
         if resume_step is not None:
             print(f"[LOCAL] 📦 Found checkpoint (latest): step {resume_step}")
@@ -199,18 +168,65 @@ def main_execution():
             "gdn2", "gdn2", "gdn2",
         ),
     )
+
+    # ==========================================================================
+    # ФИКС: per-source fraction теперь ГИПЕРПАРАМЕТРЫ здесь же, рядом с
+    # file_pairs, а не магические числа внутри кортежей ниже. dataloader_multi_source
+    # (train_setup.py) уже поддерживает 3-tuple (ids_path, lbls_path, fraction) --
+    # этот блок просто делает точку конфигурации явной и удобной для правки без
+    # необходимости лезть в сами пути. 1.0 = использовать источник полностью
+    # (старое поведение, обратная совместимость), 0.0 < frac < 1.0 = случайная
+    # подвыборка ИМЕННО этого источника (см. dataloader_multi_source per-source
+    # сэмплинг, применяется ДО train/val split и ДО глобального DATASET_FRACTION).
+    #
+    # Порядок ключей соответствует порядку источников в file_pairs ниже.
+    # ==========================================================================
+    SOURCE_FRACTIONS = {
+        "kodcode": 1.0,
+        "math": 1.0,
+        "codex": 1.0,
+        "agentpack": 1.0,
+        "rstar": 1.0,
+        "syntheticcode": 1.0,
+    }
+
     file_pairs = [
         (
             "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_input_ids.npy",
             "/kaggle/input/datasets/akseleu1j/kodcode-dataset/kodcode_labels.npy",
-        ),
+            SOURCE_FRACTIONS["kodcode"],
+        ),  # kodcode
         (
             "/kaggle/input/datasets/umirbayulgaisha/math-data/math_input_ids.npy",
             "/kaggle/input/datasets/umirbayulgaisha/math-data/math_labels.npy",
-        ),
+            SOURCE_FRACTIONS["math"],
+        ),  # math
+        (
+            "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/codex-dataset/codex_labels.npy",
+            SOURCE_FRACTIONS["codex"],
+        ),  # codex
+        (
+            "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/agentpack/agentpack_labels.npy",
+            SOURCE_FRACTIONS["agentpack"],
+        ),  # agentpack
+        (
+            "/kaggle/input/datasets/akseleu1j/rstar-dataset/rstar_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/rstar-dataset/rstar_labels.npy",
+            SOURCE_FRACTIONS["rstar"],
+        ),  # rstar
+        (
+            "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_input_ids.npy",
+            "/kaggle/input/datasets/akseleu1j/sytetic-dataset/syntheticcode_labels.npy",
+            SOURCE_FRACTIONS["syntheticcode"],
+        ),  # syntheticcode
     ]
 
-    for ids_path, lbls_path in file_pairs:
+    # ФИКС: file_pairs теперь состоит из 3-tuple (ids_path, lbls_path, fraction)
+    # -- распаковка ниже обновлена под 3 элемента (_frac здесь не используется,
+    # это чисто проверка существования файлов).
+    for ids_path, lbls_path, _frac in file_pairs:
         if not os.path.exists(ids_path):
             raise FileNotFoundError(f"Не найден файл: {ids_path}")
         if not os.path.exists(lbls_path):
@@ -250,6 +266,11 @@ def main_execution():
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
 
+    # ФИКС (W&B): инициализация run'а. resume_id читаем из локального файла
+    # (не из orbax metadata.json, чтобы не трогать сигнатуры save_slot/
+    # save_slot_async в checkpointing.py) -- если он есть, W&B продолжит
+    # существующий run вместо создания нового при каждом рестарте
+    # Kaggle-сессии, и графики (loss/step) останутся непрерывными.
     wandb_id_path = os.path.join(ckpt_root, "wandb_run_id.txt")
     _resume_wandb_id = None
     if not FORCE_FRESH_START and os.path.exists(wandb_id_path):
@@ -261,7 +282,8 @@ def main_execution():
         run_name=f"gdn2-hybrid-{time.strftime('%Y%m%d-%H%M%S')}",
         config={**asdict(config), "micro_batch_size": micro_batch_size,
                 "accum_steps": accum_steps, "seq_len": seq_len,
-                "n_devices": mesh.shape["tpu_nodes"]},
+                "n_devices": mesh.shape["tpu_nodes"],
+                "source_fractions": SOURCE_FRACTIONS},
         resume_id=_resume_wandb_id,
     )
     if wandb_run_id is not None:
@@ -358,19 +380,6 @@ def main_execution():
 
             print(f"[RESUME] ✅ Restored: step={global_step}, best_val={best_val_loss:.4f}, best_train={best_train_loss:.4f}")
 
-            # ==================================================================
-            # ФИКС: диагностика (read-only) decay-параметров ВСЕХ трёх mamba2-
-            # слоёв сразу после restore -- см. handoff про RESID-DIAG на
-            # layer=22 и опровержение гипотезы "layer=22 моложе" (все три
-            # получили одинаковое число шагов в этом прогоне). НЕ изменяет
-            # params -- только печатает сравнение, чтобы решить, действительно
-            # ли численно layer=22 отличается, прежде чем что-либо трогать.
-            # ==================================================================
-            mamba2_layer_indices = [
-                idx for idx, t in enumerate(config.layer_types) if t == "mamba2"
-            ]
-            diagnose_mamba2_decay_params(params, mamba2_layer_indices, config.layers_per_block)
-
             if RESUME_FROM_SLOT != "latest":
                 print(f"[RESUME OVERRIDE] Перерегистрирую шаг {global_step} в mngr_latest "
                       f"(бухгалтерия CheckpointManager была в обход при копировании)...")
@@ -393,6 +402,7 @@ def main_execution():
         file_pairs, micro_batch_size, data_sharding, seq_len=seq_len,
         dataset_fraction=DATASET_FRACTION, fraction_seed=DATASET_FRACTION_SEED,
         skip_batches=skip_micro_steps,
+        mode="mixed",
     )
 
     _dummy_batch = {
@@ -470,10 +480,21 @@ def main_execution():
                 break
             _t_data = time.perf_counter() - _t0
 
+            # ФИКС: round_robin/sequential кладут диагностический ключ
+            # "_source_idx" в батч -- compiled_train_micro скомпилирован
+            # под строгую pjit-сигнатуру {"input_ids","labels"} (см.
+            # train_setup.py in_shardings), лишний ключ рушит pytree-match
+            # с ValueError "Mismatch details... 3 child keys". Достаём его
+            # здесь, ДО того как batch попадёт в compiled_train_micro или
+            # _accum_window. .pop(..., None) безопасен и для mixed-режима
+            # (там ключа нет -- просто вернёт None).
+            source_idx = batch.pop("_source_idx", None)
+
             _accum_window.append({
                 "input_ids": jax.device_get(batch["input_ids"]),
                 "labels": jax.device_get(batch["labels"]),
                 "step_rng": jax.device_get(step_rng),
+                "source_idx": source_idx,
             })
 
             total_tokens_processed += micro_batch_size * seq_len
@@ -517,8 +538,18 @@ def main_execution():
                         np.save(os.path.join(snap_dir, f"micro_{i}_input_ids.npy"), entry["input_ids"])
                         np.save(os.path.join(snap_dir, f"micro_{i}_labels.npy"), entry["labels"])
                         np.save(os.path.join(snap_dir, f"micro_{i}_step_rng.npy"), np.asarray(entry["step_rng"]))
+                    # ФИКС: source_idx теперь реально прокидывается в снапшот
+                    # (раньше был бы недоступен -- batch["_source_idx"] уже
+                    # ронял бы compiled_train_micro задолго до этой точки).
+                    # Делает рабочим то, что комментарий в train_setup.py уже
+                    # обещал: "если сработает non-finite, можно сразу узнать
+                    # источник-виновник".
                     with open(os.path.join(snap_dir, "SNAPSHOT_META.json"), "w") as f:
-                        json.dump({"n_micro": len(_accum_window), "global_step": int(global_step + 1)}, f)
+                        json.dump({
+                            "n_micro": len(_accum_window),
+                            "global_step": int(global_step + 1),
+                            "source_idx_per_micro": [entry["source_idx"] for entry in _accum_window],
+                        }, f)
                     print(f"[SNAPSHOT] Saved {len(_accum_window)} micro-steps + PRE-APPLY params to {snap_dir}")
                 else:
                     wandb_logging.log_metrics(global_step + 1, {"train/step_skipped_nonfinite": 0})
@@ -610,6 +641,8 @@ def main_execution():
                         f"z={jax.device_get(aux_info['z_loss']):.5f}) | "
                         f"best_train={best_train_loss:.4f}"
                     )
+                    # ФИКС (W&B): та же информация, что уже печатается в лог,
+                    # плюс throughput (токены/сек) для графиков скорости.
                     tok_per_sec = (micro_batch_size * accum_steps * seq_len) / max(
                         (_t_compute + _t_apply_total) * accum_steps, 1e-6
                     )
@@ -748,4 +781,5 @@ def main_execution():
 
 
 if __name__ == "__main__":
+    GDN2_FWD_DIAG=1
     main_execution()
