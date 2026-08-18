@@ -50,7 +50,8 @@ from atomic_ops.moe_gmm import GmmMoEJ
 # напрямую; полностью честный fused-Pallas backward, B6-эквивалент для
 # Mamba2 -- отдельный будущий milestone, не блокирует переход на это).
 # ==========================================================================
-from atomic_ops.kernel_mamba2_trainable import mamba2_pallas_forward_trainable
+
+from atomic_ops.kernel_mamba2_trainable_B6 import mamba2_pallas_forward_trainable_B6 as mamba2_pallas_forward_trainable
 
 print("[MODEL] ⚙️ GDN-2: используется честный fused-Pallas forward+backward "
       "(kernel_d_pipeline.py + kernel_bwd_b1..b5, склеены в "
