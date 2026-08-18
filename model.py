@@ -30,11 +30,41 @@ from jax.sharding import PartitionSpec as P
 from atomic_ops.kernel_trainable_B6 import gdn2_pallas_forward_trainable
 from atomic_ops.kernel_a_scores import BT as GDN2_PALLAS_BT
 from atomic_ops.moe_gmm import GmmMoEJ
+
+# ==========================================================================
+# ФИКС (M6 -- интеграция Mamba2 SSD Pallas-пайплайна, atomic_ops/
+# MAMBA2_PALLAS_PLAN.md): раньше Mamba2J вызывал напрямую
+# mamba2_ssd_reference (чистый JAX, M1) -- временная "cheat forward"
+# заглушка на время, пока сам Pallas-пайплайн (M2 cumdecay -> M3
+# intra-chunk -> M4 inter-chunk scan) ещё разрабатывался и валидировался
+# независимо (все три milestone'а подтверждены: rel_err на реальном TPU
+# <1e-6 против mamba2_ssd_reference на multi-chunk/multi-batch кейсах).
+# M5 обернул этот Pallas-пайплайн в custom_vjp (forward идёт через
+# Pallas-кернели M2/M3/M4, backward -- через jax.vjp на mamba2_ssd_reference,
+# тот же "честный forward + cheat backward первым" порядок, что уже был
+# пройден для GDN-2 в kernel_trainable.py до появления B6) -- градиенты
+# провалидированы против jax.vjp-на-референсе (rel_err ~1e-8 на fp32,
+# все finite и корректного dtype на bfloat16). Переключаем импорт на этот
+# обёрнутый Pallas-путь -- это теперь единственный путь, которым обучается
+# Mamba2 (раньше был associative_scan, потом временно mamba2_ssd_reference
+# напрямую; полностью честный fused-Pallas backward, B6-эквивалент для
+# Mamba2 -- отдельный будущий milestone, не блокирует переход на это).
+# ==========================================================================
+from atomic_ops.kernel_mamba2_trainable import mamba2_pallas_forward_trainable
+
 print("[MODEL] ⚙️ GDN-2: используется честный fused-Pallas forward+backward "
       "(kernel_d_pipeline.py + kernel_bwd_b1..b5, склеены в "
       "kernel_trainable_B6.py). jax.vjp-на-референсе backward "
       "(kernel_trainable.py) больше не используется в горячем пути "
       "обучения.")
+print("[MODEL] ⚙️ Mamba2: используется Pallas forward (M2 cumdecay -> M3 "
+      "intra-chunk -> M4 inter-chunk scan, kernel_mamba2_c_interchunk.py) + "
+      "jax.vjp-на-референсе backward (kernel_mamba2_trainable.py, M5 -- "
+      "тот же 'честный forward / cheat backward первым' порядок, что был "
+      "пройден для GDN-2 до kernel_trainable_B6.py). Прямой вызов "
+      "mamba2_ssd_reference из Mamba2J.__call__ больше не используется в "
+      "горячем пути обучения (сам файл остаётся как cross-check/reference "
+      "-- backward всё ещё дифференцирует через него).")
 
 try:
     from jax.experimental.pallas.ops.tpu.flash_attention import (
@@ -357,8 +387,6 @@ class MLAJ(nn.Module):
 # ==========================================
 # Mamba-2 (SSM)
 # ==========================================
-from atomic_ops.mamba2_ssd_reference import mamba2_ssd_reference
-
 class Mamba2J(nn.Module):
     cfg: ModelConfig
 
@@ -391,7 +419,7 @@ class Mamba2J(nn.Module):
         # matches atomic_ops/mamba2_ssd_reference.py's assumption.
         A_log = self.param("A_log", nn.initializers.uniform(scale=1.0), (n_heads_ssm,))
         A_log_safe = jnp.clip(A_log, -20.0, 20.0).astype(jnp.float32)
-        A = -jnp.exp(A_log_safe)  # (n_heads_ssm,), float32 -- ssd_reference wants this dtype
+        A = -jnp.exp(A_log_safe)  # (n_heads_ssm,), float32 -- ssd kernels want this dtype
 
         B = nn.Dense(d_state, use_bias=False, name="B_proj", dtype=jnp.bfloat16)(x_bc)
         C = nn.Dense(d_state, use_bias=False, name="C_proj", dtype=jnp.bfloat16)(x_bc)
@@ -408,15 +436,42 @@ class Mamba2J(nn.Module):
         if l % chunk_size != 0:
             raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
 
-        # reshape (b,l,d_inner) -> (b,l,n_heads_ssm,headdim) for dt/x_conv;
-        # B/C stay (b,l,d_state) -- shared across heads, per SSD convention.
-        dt_h = dt.astype(jnp.float32).reshape(b, l, n_heads_ssm, headdim)
-        x_h = x_conv.astype(jnp.float32).reshape(b, l, n_heads_ssm, headdim)
-        B_f = B.astype(jnp.float32)
-        C_f = C.astype(jnp.float32)
+        # ==================================================================
+        # M6 (интеграция M2->M3->M4->M5 Pallas-пайплайна): reshape (b,l,d_inner)
+        # -> (b,l,n_heads_ssm,headdim) для dt/x_conv; B/C остаются
+        # (b,l,d_state) -- общие на все головы, как и в SSD-конвенции.
+        #
+        # ФИКС (главное отличие от временной M0/M1-интеграции): dt_h/x_h/B_f/
+        # C_f раньше принудительно кастовались в float32 ПЕРЕД вызовом
+        # mamba2_ssd_reference -- это было корректно для чистого JAX-пути
+        # (сам mamba2_ssd_reference всё равно делает .astype(f32) внутри), но
+        # теперь, когда вызывается mamba2_pallas_forward_trainable (M5,
+        # custom_vjp обёртка над Pallas M2/M3/M4), она рассчитана и
+        # провалидирована именно на ВХОДНЫЕ dt/x/B/C в bfloat16 (как они и
+        # приходят из nn.Dense(..., dtype=bfloat16) выше) -- см.
+        # kernel_mamba2_trainable.py: обёртка кастует градиенты ОБРАТНО к
+        # dtype каждого форвард-входа на границе custom_vjp, и это
+        # предположение проверено test_mamba2_kernel_trainable.py's
+        # test_gradients_finite_and_dtype_correct_bfloat16 именно на bf16
+        # входах. Преждевременный .astype(float32) здесь бы (а) свёл на нет
+        # экономию памяти bf16, которую использует остальная модель, и (b)
+        # означал бы, что реальный тренировочный путь никогда не проходит
+        # тот самый bf16-режим, который был явно провалидирован в M5 --
+        # вместо этого он тихо всегда шёл бы через fp32-путь, для которого
+        # dtype-cast-at-boundary логика обёртки формально не нужна (и
+        # поэтому её баги в bf16-режиме остались бы незамеченными).
+        #
+        # A остаётся float32 (как и раньше) -- это уже его натуральный dtype
+        # (a_param/A_log -- self.param без dtype=, т.е. float32 по
+        # умолчанию), обёртка ожидает A именно в float32.
+        # ==================================================================
+        dt_h = dt.reshape(b, l, n_heads_ssm, headdim)
+        x_h = x_conv.reshape(b, l, n_heads_ssm, headdim)
+        B_f = B
+        C_f = C
 
-        y_h, _state_final = mamba2_ssd_reference(
-            dt_h, A, B_f, C_f, x_h, chunk_size=chunk_size
+        y_h, _state_final = mamba2_pallas_forward_trainable(
+            dt_h, x_h, B_f, C_f, A, chunk_size
         )
         y = y_h.reshape(b, l, d_inner).astype(x_bc.dtype)
 
