@@ -1,140 +1,164 @@
-"""MB1+MB3 orchestrator integration test.
+"""
+Milestone MB1+MB3 -- orchestrator combining the state-recurrence backward
+(mamba2_bwd_state_reference.py, pure JAX, reverse lax.scan) with the
+intra-chunk Pallas backward (kernel_mamba2_bwd_b2_intra.py, MB2, already
+TPU-validated) into a single per-chunk backward pass over the whole
+sequence.
 
-Cross-checks kernel_mamba2_bwd_b1_state.mamba2_bwd_scan (two-pass:
-state-only reverse scan + MB2 Pallas call, combined) against
-mamba2_bwd_reference.chunk_ssd_bwd_scan (MB0, full single-pass reference)
--- same "hand derivation -> jax.vjp cross-check -> Pallas port -> TPU
-test" discipline, at the INTEGRATION level this time (individual pieces
-already passed their own cross-checks in test_mamba2_bwd_state_reference.py
-and test_kernel_mamba2_bwd_b2_intra.py).
+This REPLACES the previous version of this file, which pointed its
+`chunk_bwd_fn` seam at the full MB0 `_chunk_ssd_bwd` (mamba2_bwd_reference)
+by default -- see that version's own docstring, which already announced
+this as the intended next step ("Once MB2-4 exist, THIS file's
+`_chunk_bwd_fn` seam ... is what gets swapped for the Pallas-backed
+version").
 
-dx, dB, dC, dstate0 are expected to match MB0 EXACTLY (same math, only
-reorganized into two passes -- no MB4-dependent partiality for these four).
+WHY THIS IS ONE FILE, NOT TWO SEPARATE MB1/MB3 FILES
+-----------------------------------------------------------------------
+mamba2_bwd_state_reference.py's own docstring commits the state-recurrence
+half to staying plain JAX inside the reverse-scan carry (it is O(BT) per
+chunk, not O(BT^2) -- no Pallas kernel was ever planned for it, unlike
+MB2). That means MB1's "reverse-scan skeleton" and MB3's "combine MB1+MB2
+outputs" are the SAME function in practice: the scan produces the
+state-only partial results AND the exact per-chunk `dstate_end_grad` array
+MB2 needs (see below), and the combination happens the moment both are in
+hand -- there is no intermediate artifact worth a separate module.
 
-ddt and dcumdecay are only PARTIAL/internal at this milestone (see
-kernel_mamba2_bwd_b1_state.py's own docstring's "ownership" section) --
-MB0's public chunk_ssd_bwd_scan never exposes dcumdecay at all, and its
-ddt is the FULL ddt (ddt_c_1 + ddt_c_2, the latter requiring MB4). To
-still get a real cross-check on these two (not just "trust the pieces"),
-`_chunk_ssd_bwd_with_partials` below is a byte-for-byte copy of MB0's own
-`_chunk_ssd_bwd` with two extra return values spliced in (ddt_c_1 alone,
-and d_cumdecay_total before it's consumed by the reverse-cumsum/dA chain)
--- test-only, not a new derivation, just exposing internals MB0's public
-function intentionally keeps private.
+TWO-PASS STRUCTURE
+-----------------------------------------------------------------------
+Unlike MB0's `chunk_ssd_bwd_scan` (which calls the ENTIRE per-chunk
+backward, both halves, inside one `jax.lax.scan` step), this orchestrator
+cannot do that: MB2 is a single Pallas kernel call spanning ALL chunks at
+once (its own `grid=(bsz, n_heads_ssm, n_chunks)` -- see
+kernel_mamba2_bwd_b2_intra.py), not something callable once per scan step.
+So the two halves run in two passes, exactly mirroring how GDN-2 already
+splits this same problem (see kernel_bwd_b1_dhu.py's `gdn2_dhu_backward`
+producing `dh_all` for every chunk via one reverse-scan, which
+kernel_bwd_b3_wy_dqkg.py's Pallas kernel then consumes ACROSS all chunks
+in one call, via `_build_dh_next_all`'s shift):
+
+  PASS 1 (this file's reverse scan, pure JAX, state-only half):
+    For every chunk (reverse order), consume the incoming state cotangent
+    `dstate_carry` (the recurrence's own carry) to compute:
+      - dC_state_c, dstate_prev_c, dcumdecay_state_c  (via
+        mamba2_bwd_state_reference._state_only_bwd)
+    AND record `dstate_carry` itself (the value used as INPUT this step --
+    exactly the "dstate_end_grad" MB2 needs for this same chunk) as a
+    SCANNED OUTPUT, not just an internal carry -- same "carry doubles as a
+    recorded scan output" trick `gdn2_dhu_backward` already uses for
+    `dh_pre_c`.
+
+  PASS 2 (one Pallas call spanning every chunk, MB2):
+    `intra_chunk_ssd_bwd_pallas(dt, x, B, C, cumdecay, dy=do,
+    dstate_end_grad=<PASS 1's recorded array>, chunk_size)` -> ddt_intra,
+    dx (full), dB_intra (full), dC_intra (partial), dcumdecay_intra
+    (partial).
+
+  COMBINE (this is MB3 proper): dC and dcumdecay each have contributions
+  from BOTH passes (state-only via C_c/cumdecay_c's role in y_off, intra
+  via C_c/cumdecay_c's role in BC_inner/L) -- summed with the SAME
+  clip-after-every-accumulation-write discipline
+  kernel_bwd_b4_intra.py's own docstring documents ("an inf from one
+  contribution can meet an opposite-sign inf from another and produce an
+  unrecoverable NaN" -- here the two contributions come from two different
+  backward passes instead of two loop iterations, same risk).
+
+OWNERSHIP OF EACH RETURNED GRADIENT AT THIS MILESTONE (MB1+MB2+MB3 done,
+MB4 NOT done yet)
+-----------------------------------------------------------------------
+  ddt        -- PARTIAL. Only the dBx=dt*x contribution (MB2-owned). The
+                second contribution (through dA_exponent=dt*A, via the
+                reverse tril-cumsum of dcumdecay) is MB4's job -- NOT
+                computed here. Do not treat this ddt as final.
+  dx         -- FULL. x only ever appears inside dBx=dt*x (MB2-owned);
+                state-only half never touches x.
+  dB         -- FULL. B only ever appears inside BC_inner (MB2-owned);
+                state-only half never touches B (see
+                mamba2_bwd_state_reference.py's own docstring / the
+                `test_zero_state_prev_gives_zero_grads` cross-check that
+                pins this down).
+  dC         -- FULL for this milestone's scope, i.e. sum of BOTH halves'
+                contributions (state-only's dC_c_1-equivalent + MB2's
+                dC_c_2-equivalent) -- C has no further MB4-owned
+                contribution in MB0's accounting (see
+                mamba2_bwd_reference._chunk_ssd_bwd: dC_c = dC_c_1 + dC_c_2,
+                nothing else touches dC downstream of that).
+  dA         -- NOT computed here. MB4-only (depends on the full ddt
+                dA_exponent chain).
+  dstate0    -- FULL. Purely state-only-owned (state_prev never appears in
+                MB2's forward at all).
+  dcumdecay  -- Returned (NOT part of MB0's public return signature, but
+                needed downstream by MB4) as the SUM of both halves'
+                per-chunk contributions, in the same per-chunk
+                `(bsz, n_heads_ssm, n_chunks, chunk_size, headdim)` Pallas
+                layout `build_chunk_cumdecay_pallas` (M2) itself produces
+                -- MB4 consumes it directly in this layout to run the
+                reverse-cumsum/dA_exponent/dA chain and to complete `ddt`.
 """
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 
-from atomic_ops.mamba2_ssd_reference import _chunk_ssd, _sanitize
-from atomic_ops.mamba2_bwd_reference import chunk_ssd_bwd_scan, _clip_mask
-from atomic_ops.kernel_mamba2_bwd_b1_state import mamba2_bwd_scan
+from .kernel_mamba2_a_decay import build_chunk_cumdecay_pallas
+from .kernel_mamba2_bwd_b2_intra import intra_chunk_ssd_bwd_pallas
+from .mamba2_bwd_state_reference import _state_only_bwd
+from .mamba2_ssd_reference import _chunk_ssd, _sanitize
 
 _HIGHEST = jax.lax.Precision.HIGHEST
+_ACC_CLIP = 1e4
 
 
-def _rel_err(a, b):
-    a = jnp.asarray(a, dtype=jnp.float32)
-    b = jnp.asarray(b, dtype=jnp.float32)
-    return float(jnp.linalg.norm((a - b).ravel()) / (jnp.linalg.norm(b.ravel()) + 1e-8))
+def _sanitize_state(x):
+    return jnp.nan_to_num(jnp.clip(x, -_ACC_CLIP, _ACC_CLIP), nan=0.0, posinf=_ACC_CLIP, neginf=-_ACC_CLIP)
 
 
-def _chunk_ssd_bwd_with_partials(dt_c, A, B_c, C_c, x_c, state_prev, dy_c, dstate_new):
-    """Test-only: identical to mamba2_bwd_reference._chunk_ssd_bwd, plus
-    returns ddt_c_1 (dBx-only contribution -- what the orchestrator's
-    partial ddt should match) and d_cumdecay_total (pre-reverse-cumsum --
-    what the orchestrator's combined dcumdecay should match)."""
-    f32 = jnp.float32
-    dt_c = dt_c.astype(f32)
-    B_c = B_c.astype(f32)
-    C_c = C_c.astype(f32)
-    x_c = x_c.astype(f32)
-    state_prev = state_prev.astype(f32)
-    Cs = dt_c.shape[1]
-
-    dA_exponent_raw = jnp.einsum("bchd,h->bchd", dt_c, A.astype(f32))
-    dA_exponent = _sanitize(dA_exponent_raw, clip=20.0)
-
-    idx = jnp.arange(Cs)
-    tril_ones = (idx[:, None] >= idx[None, :]).astype(f32)
-    cumdecay_raw = jnp.einsum("ij,bjhd->bihd", tril_ones, dA_exponent, precision=_HIGHEST)
-    cumdecay = _sanitize(cumdecay_raw, clip=1e4)
-
-    decay_diff_raw = cumdecay[:, :, None, :, :] - cumdecay[:, None, :, :, :]
-    causal = (idx[:, None] >= idx[None, :]).astype(f32)[None, :, :, None, None]
-    L = _sanitize(jnp.exp(jnp.clip(decay_diff_raw, -20.0, 20.0)) * causal, clip=1e6)
-
-    BC_inner = _sanitize(jnp.einsum("bis,bjs->bij", C_c, B_c, precision=_HIGHEST))
-    dBx = _sanitize(dt_c * x_c)
-    weight = L * BC_inner[:, :, :, None, None]
-
-    decay_to_end_raw = cumdecay[:, -1:, :, :] - cumdecay
-    decay_to_end = _sanitize(jnp.exp(jnp.clip(decay_to_end_raw, -20.0, 20.0)), clip=1e6)
-    write = _sanitize(dBx * decay_to_end)
-
-    decay_h_raw = jnp.clip(cumdecay, -20.0, 0.0)
-    decay_h = jnp.exp(decay_h_raw)
-    y_off_raw = jnp.einsum("bis,bhds->bihd", C_c, state_prev, precision=_HIGHEST)
-    decay_chunk_end_raw = jnp.clip(cumdecay[:, -1], -20.0, 0.0)
-    decay_chunk_end = jnp.exp(decay_chunk_end_raw)
-
-    dy_diag = dy_c
-    dy_off = dy_c
-
-    dstate_prev = dstate_new * decay_chunk_end[..., None]
-    d_decay_chunk_end = jnp.sum(dstate_new * state_prev, axis=-1)
-    dstate_end = dstate_new
-    d_cumdecay_last_a = d_decay_chunk_end * decay_chunk_end * _clip_mask(cumdecay[:, -1], -20.0, 0.0)
-
-    dy_off_raw = dy_off * decay_h
-    d_decay_h = dy_off * y_off_raw
-    dC_c_1 = jnp.einsum("bihd,bhds->bis", dy_off_raw, state_prev, precision=_HIGHEST)
-    dstate_prev = dstate_prev + jnp.einsum("bihd,bis->bhds", dy_off_raw, C_c, precision=_HIGHEST)
-    d_cumdecay_from_yoff = d_decay_h * decay_h * _clip_mask(cumdecay, -20.0, 0.0)
-
-    dwrite = jnp.einsum("bhds,bcs->bchd", dstate_end, B_c, precision=_HIGHEST)
-    dB_c_1 = jnp.einsum("bhds,bchd->bcs", dstate_end, write, precision=_HIGHEST)
-    d_dBx_1 = dwrite * decay_to_end
-    d_decay_to_end = dwrite * dBx
-    d_decay_to_end_diff = d_decay_to_end * decay_to_end * _clip_mask(decay_to_end_raw, -20.0, 20.0)
-    d_cumdecay_last_b = jnp.sum(d_decay_to_end_diff, axis=1)
-    d_cumdecay_from_decay_to_end = -d_decay_to_end_diff
-
-    dweight = jnp.einsum("bihd,bjhd->bijhd", dy_diag, dBx, precision=_HIGHEST)
-    d_dBx_2 = jnp.einsum("bijhd,bihd->bjhd", weight, dy_diag, precision=_HIGHEST)
-    dL = dweight * BC_inner[:, :, :, None, None]
-    dBC_inner = jnp.sum(dweight * L, axis=(-2, -1))
-    dC_c_2 = jnp.einsum("bij,bjs->bis", dBC_inner, B_c, precision=_HIGHEST)
-    dB_c_2 = jnp.einsum("bij,bis->bjs", dBC_inner, C_c, precision=_HIGHEST)
-
-    d_decay_diff = dL * L * _clip_mask(decay_diff_raw, -20.0, 20.0)
-    d_cumdecay_i = jnp.sum(d_decay_diff, axis=2)
-    d_cumdecay_j = -jnp.sum(d_decay_diff, axis=1)
-
-    d_dBx_total = _sanitize(d_dBx_1 + d_dBx_2)
-    ddt_c_1 = d_dBx_total * x_c   # <-- TEST-ONLY EXTRA RETURN #1
-    dx_c = d_dBx_total * dt_c
-
-    d_cumdecay_total = _sanitize(
-        d_cumdecay_i + d_cumdecay_j + d_cumdecay_from_yoff + d_cumdecay_from_decay_to_end
-    )
-    row_mask = (idx == (Cs - 1)).astype(jnp.float32)[None, :, None, None]
-    d_cumdecay_total = d_cumdecay_total + row_mask * (d_cumdecay_last_a + d_cumdecay_last_b)[:, None, :, :]
-    # <-- TEST-ONLY EXTRA RETURN #2 (d_cumdecay_total, pre-clip-mask/pre-reverse-cumsum)
-
-    dB_c = _sanitize(dB_c_1 + dB_c_2)
-    dC_c = _sanitize(dC_c_1 + dC_c_2)
-
-    return ddt_c_1, dB_c, dC_c, dx_c, d_cumdecay_total, dstate_prev
+def _cumdecay_pallas_to_natural(cumdecay):
+    """(bsz, n_heads_ssm, n_chunks, C, d) -> (n_chunks, bsz, C, n_heads_ssm, d)
+    -- puts n_chunks first (scan axis, matching to_chunks' own convention
+    for dt/B/C/x elsewhere in this project) and restores the (b,C,h,d)
+    layout mamba2_bwd_state_reference._state_only_bwd expects (same
+    convention mamba2_ssd_reference._chunk_ssd's own cumdecay uses)."""
+    return jnp.moveaxis(cumdecay, (1, 2), (3, 0))
 
 
-def _reference_partial_ddt_and_dcumdecay(dt, A, B, C, x, chunk_size, do, dstate_final, state0):
-    """Assembles the full-sequence ddt_c_1 / d_cumdecay_total reference by
-    running the same reverse scan structure MB0 uses, but with
-    _chunk_ssd_bwd_with_partials instead of the public _chunk_ssd_bwd."""
+def _cumdecay_natural_to_pallas(cumdecay_natural_stacked):
+    """Inverse of _cumdecay_pallas_to_natural: (n_chunks, bsz, C, h, d) ->
+    (bsz, h, n_chunks, C, d) -- the layout kernel_mamba2_bwd_b2_intra.py's
+    `dcum` output already uses, so the two contributions can be summed
+    directly without a further reshape."""
+    return jnp.moveaxis(cumdecay_natural_stacked, (0, 3), (2, 1))
+
+
+def mamba2_bwd_scan(dt, A, B, C, x, chunk_size, do, dstate_final, state0=None,
+                     interpret=False):
+    """Drop-in-shaped (but NOT identical -- see module docstring's
+    "ownership" section) replacement for the previous version's
+    `chunk_bwd_fn`-parametrized reverse scan. Returns
+    (ddt_partial, dB, dC, dx, dstate0, dcumdecay_combined) -- NOTE the
+    changed return signature vs the old file (no `dA`, extra
+    `dcumdecay_combined`): dA cannot be produced until MB4 exists, and
+    dcumdecay_combined is a NEW artifact MB4 needs that MB0's public
+    signature never exposed (MB0 keeps cumdecay/dA_exponent entirely
+    internal to `_chunk_ssd_bwd`). Callers wanting MB0's exact old
+    signature should keep using `mamba2_bwd_reference.chunk_ssd_bwd_scan`
+    directly (still the cross-check target -- see the module docstring's
+    validation discipline note) until MB4 lands and a final orchestrator
+    can restore that exact signature.
+
+    dt,x: (b,l,h,d). A: (h,). B,C: (b,l,s). do: (b,l,h,d) cotangent for y.
+    dstate_final: (b,h,d,s) cotangent for the final carried state.
+    `interpret`: forwarded to MB2's Pallas call (True for CPU/dev-time
+    cross-checking, same convention as every other Pallas kernel in this
+    project -- False, the default, for real TPU training).
+    """
     b, l, h, d = dt.shape
+    s = B.shape[-1]
+    assert l % chunk_size == 0, f"seq_len={l} must be divisible by chunk_size={chunk_size}."
     n_chunks = l // chunk_size
+
+    if state0 is None:
+        state0 = jnp.zeros((b, h, d, s), dtype=jnp.float32)
+    state0 = _sanitize_state(state0)
 
     def to_chunks(t):
         shp = t.shape
@@ -143,6 +167,16 @@ def _reference_partial_ddt_and_dcumdecay(dt, A, B, C, x, chunk_size, do, dstate_
 
     dt_ch, B_ch, C_ch, x_ch, do_ch = map(to_chunks, (dt, B, C, x, do))
 
+    # ---- M2: cumdecay, computed ONCE, reused by both PASS 1 (state-only
+    # scan, needs the natural (b,C,h,d)-per-chunk layout) and PASS 2 (MB2
+    # Pallas call, needs the (b,h,n_chunks,C,d) layout it was already
+    # produced in). ----
+    cumdecay_pallas_layout = build_chunk_cumdecay_pallas(dt, A, chunk_size, interpret=interpret)
+    cumdecay_natural_ch = _cumdecay_pallas_to_natural(cumdecay_pallas_layout)
+
+    # ---- forward re-run for per-chunk state_prev residuals -- same
+    # "recompute, don't stash" tradeoff every other backward in this
+    # project makes (kernel_c's w_pseudo/u, MB0's own state_prev_all). ----
     def fwd_step(state_prev, inputs):
         dt_c, B_c, C_c, x_c = inputs
         _, state_new = _chunk_ssd(dt_c, A, B_c, C_c, x_c, state_prev)
@@ -150,104 +184,66 @@ def _reference_partial_ddt_and_dcumdecay(dt, A, B, C, x, chunk_size, do, dstate_
 
     _, state_prev_all = jax.lax.scan(fwd_step, state0, (dt_ch, B_ch, C_ch, x_ch))
 
-    def bwd_step(dstate_carry, inputs):
-        dt_c, B_c, C_c, x_c, do_c, state_prev_c = inputs
-        ddt_c1, dB_c, dC_c, dx_c, dcum_c, dstate_prev_c = _chunk_ssd_bwd_with_partials(
-            dt_c, A, B_c, C_c, x_c, state_prev_c, do_c, dstate_carry
+    # ======================================================================
+    # PASS 1 -- state-only reverse scan. Produces, per chunk:
+    #   dC_state_c, dcumdecay_state_c  (to be summed with MB2's own halves)
+    #   dstate_carry_used_c            (= the array MB2 needs as
+    #                                     dstate_end_grad -- see module
+    #                                     docstring's "carry doubles as a
+    #                                     recorded output" note)
+    # and, as the final carry: dstate0.
+    # ======================================================================
+    def bwd_step_state_only(dstate_carry, inputs):
+        C_c, cumdecay_c, do_c, state_prev_c = inputs
+        dstate_carry = _sanitize_state(dstate_carry)
+        dC_c, dstate_prev_c, dcumdecay_c = _state_only_bwd(
+            state_prev_c, C_c, cumdecay_c, dy_off=do_c, dstate_carry=dstate_carry
         )
-        return dstate_prev_c, (ddt_c1, dcum_c)
+        dstate_prev_c = _sanitize_state(dstate_prev_c)
+        # record the carry VALUE USED THIS STEP (not the updated one) --
+        # this is exactly dstate_end_grad for MB2, for this same chunk.
+        return dstate_prev_c, (dC_c, dcumdecay_c, dstate_carry)
 
-    _, (ddt1_rev, dcum_rev) = jax.lax.scan(
-        bwd_step, dstate_final, (dt_ch, B_ch, C_ch, x_ch, do_ch, state_prev_all), reverse=True
+    dstate0, (dC_state_rev, dcumdecay_state_rev, dstate_carry_all_rev) = jax.lax.scan(
+        bwd_step_state_only, dstate_final,
+        (C_ch, cumdecay_natural_ch, do_ch, state_prev_all),
+        reverse=True,
     )
+    dstate0 = _sanitize_state(dstate0)
 
     def from_chunks(t):
         t = jnp.moveaxis(t, 0, 1)
         return t.reshape(b, l, *t.shape[3:])
 
-    ddt1_full = from_chunks(ddt1_rev)          # (b, l, h, d)
-    # dcum_rev: (n_chunks, b, C, h, d) -- move to Pallas layout (b,h,n_chunks,C,d)
-    # for direct comparison with the orchestrator's own dcumdecay output.
-    dcum_pallas_layout = jnp.moveaxis(dcum_rev, (0, 3), (2, 1))
-    return ddt1_full, dcum_pallas_layout
+    dC_state = from_chunks(dC_state_rev)                       # (b, l, s)
 
+    # dstate_carry_all_rev: (n_chunks, b, h, d, s) -- move n_chunks to the
+    # position MB2 expects it (axis 2, matching cumdecay's own
+    # (b,h,n_chunks,...) convention).
+    dstate_end_grad = jnp.moveaxis(dstate_carry_all_rev, 0, 2)  # (b, h, n_chunks, d, s)
+    dstate_end_grad = _sanitize_state(dstate_end_grad)
 
-def _make_problem(seed=0, b=2, l=128, h=4, d=32, s=16, chunk_size=64):
-    keys = jax.random.split(jax.random.PRNGKey(seed), 8)
-    dt = jax.nn.softplus(jax.random.normal(keys[0], (b, l, h, d))) * 0.1 + 1e-2
-    A = -jnp.exp(jax.random.uniform(keys[1], (h,), minval=-1.0, maxval=1.0))
-    B = jax.random.normal(keys[2], (b, l, s)) * 0.1
-    C = jax.random.normal(keys[3], (b, l, s)) * 0.1
-    x = jax.random.normal(keys[4], (b, l, h, d)) * 0.1
-    do = jax.random.normal(keys[5], (b, l, h, d)) * 0.1
-    dstate_final = jax.random.normal(keys[6], (b, h, d, s)) * 0.1
-    state0 = jax.random.normal(keys[7], (b, h, d, s)) * 0.1
-    return dt, A, B, C, x, chunk_size, do, dstate_final, state0
+    # dcumdecay_state_rev: (n_chunks, b, C, h, d) -- back to Pallas layout
+    # to combine with MB2's own dcumdecay output.
+    dcumdecay_state = _cumdecay_natural_to_pallas(dcumdecay_state_rev)
 
-
-def test_orchestrator_matches_mb0_full_outputs():
-    dt, A, B, C, x, chunk_size, do, dstate_final, state0 = _make_problem()
-
-    ddt_ref, dB_ref, dC_ref, dx_ref, dA_ref, dstate0_ref = chunk_ssd_bwd_scan(
-        dt, A, B, C, x, chunk_size, do, dstate_final, state0=state0
+    # ======================================================================
+    # PASS 2 -- MB2, one Pallas call spanning every chunk at once.
+    # ======================================================================
+    ddt_intra, dx_full, dB_full, dC_intra, dcumdecay_intra = intra_chunk_ssd_bwd_pallas(
+        dt, x, B, C, cumdecay_pallas_layout, dy=do, dstate_end_grad=dstate_end_grad,
+        chunk_size=chunk_size, interpret=interpret,
     )
 
-    ddt_orch, dB_orch, dC_orch, dx_orch, dstate0_orch, dcum_orch = mamba2_bwd_scan(
-        dt, A, B, C, x, chunk_size, do, dstate_final, state0=state0
-    )
+    # ======================================================================
+    # COMBINE (MB3) -- clipped sum, same discipline as
+    # kernel_bwd_b4_intra.py's per-accumulation-write clip.
+    # ======================================================================
+    dC = _sanitize(dC_state + dC_intra)
+    dcumdecay = _sanitize(dcumdecay_state + dcumdecay_intra)
 
-    # these four are expected to match MB0 EXACTLY -- see module docstring.
-    for name, orch, ref in [
-        ("dx", dx_orch, dx_ref),
-        ("dB", dB_orch, dB_ref),
-        ("dC", dC_orch, dC_ref),
-        ("dstate0", dstate0_orch, dstate0_ref),
-    ]:
-        err = _rel_err(orch, ref)
-        print(f"[MB1+MB3][orch vs MB0-full] {name:10s} rel_err={err:.3e}  {'OK' if err < 1e-4 else 'FAIL'}")
-        assert err < 1e-4 and bool(jnp.all(jnp.isfinite(orch)))
+    ddt = _sanitize(ddt_intra)   # PARTIAL -- see module docstring
+    dx = _sanitize(dx_full)
+    dB = _sanitize(dB_full)
 
-    # ddt is only PARTIAL here (no MB4 yet) -- cross-check against the
-    # test-only reference's ddt_c_1, not MB0's full ddt.
-    ddt1_ref, dcum_ref = _reference_partial_ddt_and_dcumdecay(
-        dt, A, B, C, x, chunk_size, do, dstate_final, state0
-    )
-    for name, orch, ref in [
-        ("ddt_partial", ddt_orch, ddt1_ref),
-        ("dcumdecay", dcum_orch, dcum_ref),
-    ]:
-        err = _rel_err(orch, ref)
-        print(f"[MB1+MB3][orch vs MB0-internals] {name:12s} rel_err={err:.3e}  {'OK' if err < 1e-4 else 'FAIL'}")
-        assert err < 1e-4 and bool(jnp.all(jnp.isfinite(orch)))
-
-
-def test_multi_chunk_and_batch_shapes():
-    """Same check on a different (b, l, h, d, s, chunk_size) combination --
-    guards against shape/layout bugs that a single fixed size could hide
-    (e.g. an accidental axis swap that happens to be a no-op when two
-    dimensions are equal)."""
-    dt, A, B, C, x, chunk_size, do, dstate_final, state0 = _make_problem(
-        seed=7, b=3, l=192, h=5, d=24, s=12, chunk_size=64
-    )
-    ddt_ref, dB_ref, dC_ref, dx_ref, dA_ref, dstate0_ref = chunk_ssd_bwd_scan(
-        dt, A, B, C, x, chunk_size, do, dstate_final, state0=state0
-    )
-    ddt_orch, dB_orch, dC_orch, dx_orch, dstate0_orch, dcum_orch = mamba2_bwd_scan(
-        dt, A, B, C, x, chunk_size, do, dstate_final, state0=state0
-    )
-    for name, orch, ref in [
-        ("dx", dx_orch, dx_ref),
-        ("dB", dB_orch, dB_ref),
-        ("dC", dC_orch, dC_ref),
-        ("dstate0", dstate0_orch, dstate0_ref),
-    ]:
-        err = _rel_err(orch, ref)
-        print(f"[MB1+MB3][multi-shape] {name:10s} rel_err={err:.3e}  {'OK' if err < 1e-4 else 'FAIL'}")
-        assert err < 1e-4 and bool(jnp.all(jnp.isfinite(orch)))
-
-
-if __name__ == "__main__":
-    print(f"[MB1+MB3] backend: {jax.default_backend()}")
-    test_orchestrator_matches_mb0_full_outputs()
-    test_multi_chunk_and_batch_shapes()
-    print("[MB1+MB3] ✅ passed (interpret=True)")
+    return ddt, dB, dC, dx, dstate0, dcumdecay
