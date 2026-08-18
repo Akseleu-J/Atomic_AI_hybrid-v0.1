@@ -465,6 +465,8 @@ class Mamba2J(nn.Module):
         # (a_param/A_log -- self.param без dtype=, т.е. float32 по
         # умолчанию), обёртка ожидает A именно в float32.
         # ==================================================================
+        mesh = get_model_mesh()
+        batch_axis = get_batch_axis()
         dt_h = dt.reshape(b, l, n_heads_ssm, headdim)
         x_h = x_conv.reshape(b, l, n_heads_ssm, headdim)
         B_f = B
