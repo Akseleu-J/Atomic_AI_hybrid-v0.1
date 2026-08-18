@@ -45,7 +45,21 @@ _HIGHEST = jax.lax.Precision.HIGHEST
 _STEP_CLIP = 20.0
 _ACC_CLIP = 1e4
 
-BC = 128  # sub-block size, same as kernel_a_scores.py
+# FIX: BC was a fixed module-level constant (128), matching GDN-2's
+# kernel_a_scores.py -- but GDN-2's BT is ALSO fixed at 256 project-wide, so
+# BC=128 always divided it evenly. Mamba2's chunk_size is a free ModelConfig
+# knob (deltanet_chunk_size) and M1's own test suite explicitly validates
+# chunk_size=64 (test_matches_token_serial_multi_chunk) as well as
+# chunk_size-invariance across 64/128/256 -- a hardcoded BC=128 kernel
+# constant silently assumed chunk_size was always >=128 and a multiple of
+# it, which broke the moment M4's test reused M1's own chunk_size=64 case.
+# BC is now derived from chunk_size itself: use the smaller of (128,
+# chunk_size), so chunk_size>=128 keeps the original multi-sub-block
+# behavior unchanged (already validated by test_larger_chunk_multi_subblock),
+# and chunk_size<128 degrades to a single sub-block (n_sub=1) covering the
+# whole chunk in one causal-masked pass.
+def _resolve_bc(chunk_size):
+    return min(128, chunk_size)
 
 
 def _sanitize(x, clip=_ACC_CLIP):
@@ -53,53 +67,52 @@ def _sanitize(x, clip=_ACC_CLIP):
 
 
 def _kernel_body_b(dt_ref, x_ref, b_ref, c_ref, cumdecay_ref,
-                  ydiag_ref, stateend_ref, *, chunk_size, headdim, d_state):
-    assert chunk_size % BC == 0, f"chunk_size={chunk_size} must be divisible by BC={BC}."
-    n_sub = chunk_size // BC
+                    ydiag_ref, stateend_ref, *, chunk_size, headdim, d_state):
+    bc = _resolve_bc(chunk_size)
+    assert chunk_size % bc == 0, f"chunk_size={chunk_size} must be divisible by BC={bc}."
+    n_sub = chunk_size // bc
 
-    dt_full = dt_ref[0, 0, 0].astype(jnp.float32)         # (BT, D)
-    x_full = x_ref[0, 0, 0].astype(jnp.float32)            # (BT, D)
-    B_full = b_ref[0, 0, 0].astype(jnp.float32)             # (BT, S)
-    C_full = c_ref[0, 0, 0].astype(jnp.float32)             # (BT, S)
-    cumdecay_full = cumdecay_ref[0, 0, 0].astype(jnp.float32)  # (BT, D)
+    dt_full = dt_ref[0, 0, 0].astype(jnp.float32)
+    x_full = x_ref[0, 0, 0].astype(jnp.float32)
+    B_full = b_ref[0, 0, 0].astype(jnp.float32)
+    C_full = c_ref[0, 0, 0].astype(jnp.float32)
+    cumdecay_full = cumdecay_ref[0, 0, 0].astype(jnp.float32)
 
     dBx_full = _sanitize(dt_full * x_full)
 
-    BC_inner = jnp.dot(C_full, B_full.T, precision=_HIGHEST)  # (BT, BT)
+    BC_inner = jnp.dot(C_full, B_full.T, precision=_HIGHEST)
     BC_inner = _sanitize(BC_inner)
 
     ydiag_ref[0, 0, 0] = jnp.zeros((chunk_size, headdim), dtype=jnp.float32)
 
-    # ---- Y_diag: sub-block loop, only ever holds (BC,BC,headdim) ----
     for si in range(n_sub):
         for sj in range(si + 1):
-            i0, i1 = si * BC, (si + 1) * BC
-            j0, j1 = sj * BC, (sj + 1) * BC
+            i0, i1 = si * bc, (si + 1) * bc
+            j0, j1 = sj * bc, (sj + 1) * bc
 
-            cum_i = cumdecay_full[i0:i1]   # (BC, D)
-            cum_j = cumdecay_full[j0:j1]   # (BC, D)
-            decay_diff = cum_i[:, None, :] - cum_j[None, :, :]   # (BC, BC, D)
+            cum_i = cumdecay_full[i0:i1]
+            cum_j = cumdecay_full[j0:j1]
+            decay_diff = cum_i[:, None, :] - cum_j[None, :, :]
             edecay = jnp.exp(jnp.clip(decay_diff, -_STEP_CLIP, _STEP_CLIP))
 
-            bc_blk = BC_inner[i0:i1, j0:j1]   # (BC, BC)
-            weight = edecay * bc_blk[:, :, None]   # (BC, BC, D)
+            bc_blk = BC_inner[i0:i1, j0:j1]
+            weight = edecay * bc_blk[:, :, None]
 
             if si == sj:
-                idx = jnp.arange(BC)
+                idx = jnp.arange(bc)
                 causal = (idx[:, None] >= idx[None, :]).astype(jnp.float32)
                 weight = weight * causal[:, :, None]
 
-            dBx_j = dBx_full[j0:j1]   # (BC, D)
+            dBx_j = dBx_full[j0:j1]
             y_blk = jnp.einsum("ijd,jd->id", weight, dBx_j, precision=_HIGHEST)
 
             ydiag_ref[0, 0, 0, i0:i1] = _sanitize(ydiag_ref[0, 0, 0, i0:i1] + y_blk)
 
-    # ---- state_end: full-chunk, only (BT,D) and (D,S) shaped ----
-    cum_last = cumdecay_full[chunk_size - 1]   # (D,)
+    cum_last = cumdecay_full[chunk_size - 1]
     decay_to_end = jnp.exp(jnp.clip(cum_last[None, :] - cumdecay_full, -_STEP_CLIP, _STEP_CLIP))
-    write = _sanitize(dBx_full * decay_to_end)   # (BT, D)
+    write = _sanitize(dBx_full * decay_to_end)
 
-    state_end = jnp.dot(write.T, B_full, precision=_HIGHEST)   # (D, S)
+    state_end = jnp.dot(write.T, B_full, precision=_HIGHEST)
     stateend_ref[0, 0, 0] = _sanitize(state_end)
 
 
