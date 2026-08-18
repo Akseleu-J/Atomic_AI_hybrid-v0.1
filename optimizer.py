@@ -168,8 +168,8 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay, "adamw_nodecay": tx_adamw_nodecay},
         label_fn,
     )
-    return optax.chain(clip_tx, multi_tx)
-
+    tx = optax.chain(clip_tx, multi_tx)
+    return tx, lr_schedule
 
 # ==========================================
 # Loss
