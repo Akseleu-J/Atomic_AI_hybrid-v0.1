@@ -42,8 +42,10 @@ try:
         raise ImportError("W&B API key пуст")
 except ImportError:
     _HAS_WANDB = False
-    print("[WARN] W&B недоступен (нет kaggle secret WANDB_API_KEY или пакета wandb) "
-          "-- обучение продолжится без логирования в W&B.")
+    print("[WARN] W&B недоступен (не установлен пакет).")
+except Exception as e:
+    _HAS_WANDB = False 
+    print(f"[WARN] W&B недоступен, в Kaggle secters добавь API")
 
 # ФИКС: явная константа entity -- поставьте сюда ваш team/organization
 # entity, если используете его в W&B. None (по умолчанию) означает личный
