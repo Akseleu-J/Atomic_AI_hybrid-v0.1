@@ -470,11 +470,40 @@ class Mamba2J(nn.Module):
         B_f = B
         C_f = C
 
-        y_h, _state_final = mamba2_pallas_forward_trainable(
-            dt_h, x_h, B_f, C_f, A, chunk_size
-        )
-        y = y_h.reshape(b, l, d_inner).astype(x_bc.dtype)
+        # ФИКС (тот же паттерн, что уже используется для GDN-2 в
+        # GatedDeltaNet2J -- см. sharded_gdn2 ниже по файлу): Mosaic/Pallas
+        # кернели НЕ умеют автоматически шардиться по FSDP mesh'у --
+        # "Mosaic kernels cannot be automatically partitioned. Please wrap
+        # the call in a shard_map." Раньше mamba2_pallas_forward_trainable
+        # вызывался напрямую (без shard_map), что было корректно только
+        # для unit-тестов (там mesh=None) -- в реальном train.py mesh
+        # всегда задан (make_tpu_mesh() в train_setup.py), и тот же вызов
+        # падает при первом же model.init() под jax.jit с in_shardings.
+        state0_zeros = jnp.zeros((b, n_heads_ssm, headdim, d_state), dtype=jnp.float32)
 
+        _mamba2_fixed = partial(mamba2_pallas_forward_trainable, chunk_size=chunk_size)
+
+        if mesh is not None:
+            in_spec_dx = P(batch_axis, None, None, None)
+            in_spec_bc = P(batch_axis, None, None)
+            in_spec_a = P(None)
+            in_spec_state0 = P(batch_axis, None, None, None)
+            out_spec = (
+                P(batch_axis, None, None, None),
+                P(batch_axis, None, None, None),
+            )
+            sharded_mamba2 = jax.shard_map(
+                _mamba2_fixed,
+                mesh=mesh,
+                in_specs=(in_spec_dx, in_spec_dx, in_spec_bc, in_spec_bc, in_spec_a, in_spec_state0),
+                out_specs=out_spec,
+                check_vma=False,
+            )
+            y_h, _state_final = sharded_mamba2(dt_h, x_h, B_f, C_f, A, state0_zeros)
+        else:
+            y_h, _state_final = _mamba2_fixed(dt_h, x_h, B_f, C_f, A, state0_zeros)
+
+        y = y_h.reshape(b, l, d_inner).astype(x_bc.dtype)
         y = _diag_maxabs("mamba2_ssm_out_pre_norm", y)
         y = nn.RMSNorm(epsilon=1e-6, name="ssm_out_norm")(y).astype(x_bc.dtype)
         y = _diag_maxabs("mamba2_ssm_out_post_norm", y)
