@@ -483,8 +483,17 @@ class Mamba2J(nn.Module):
         # падает при первом же model.init() под jax.jit с in_shardings.
         state0_zeros = jnp.zeros((b, n_heads_ssm, headdim, d_state), dtype=jnp.float32)
 
-        _mamba2_fixed = partial(mamba2_pallas_forward_trainable, chunk_size=chunk_size)
-
+        # ФИКС: partial(fn, chunk_size=chunk_size) не защищает позицию
+        # chunk_size от positional-заполнения — shard_map вызывает обёрнутую
+        # функцию позиционно (dt_h, x_h, B_f, C_f, A, state0_zeros), и 6-й
+        # позиционный аргумент (state0_zeros) занимает слот chunk_size,
+        # который partial уже связал через keyword -> "got multiple values
+        # for argument 'chunk_size'". Явная функция с именованными
+        # параметрами фиксирует порядок.
+        def _mamba2_fixed(dt_, x_, B_, C_, A_, state0_):
+            return mamba2_pallas_forward_trainable(
+                dt_, x_, B_, C_, A_, chunk_size=chunk_size, state0=state0_
+            )
         if mesh is not None:
             in_spec_dx = P(batch_axis, None, None, None)
             in_spec_bc = P(batch_axis, None, None)
