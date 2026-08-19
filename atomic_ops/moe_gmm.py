@@ -350,12 +350,10 @@ class GmmMoEJ(nn.Module):
         router_temp = self.param(
             "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
         )
+        router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
         router_logits = jnp.dot(
             flat_x.astype(jnp.float32), router_kernel_normed, precision=jax.lax.Precision.HIGHEST
-        ) * router_temp
-        # ФИКС: узкий clip ДО _sanitize/noise -- см. module docstring.
-        # _sanitize (широкий ±1e3) остаётся ПОСЛЕ как overflow-защита,
-        # применяется к уже узко-клипнутому значению, поэтому не мешает.
+        ) * router_temp_clipped
         router_logits = jnp.clip(router_logits, -_ROUTER_LOGIT_CLIP, _ROUTER_LOGIT_CLIP)
         router_logits = _sanitize(router_logits)
         if not deterministic and self.cfg.router_noise_std > 0:
