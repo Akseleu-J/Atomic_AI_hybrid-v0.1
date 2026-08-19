@@ -272,6 +272,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         # handle that, same as expert_utilization already does) if the
         # model is ever switched back to the dense MoE for cross-checking.
         dropped_ratios = collect_by_leaf_name(sowed_vars["losses"], "moe_dropped_ratio")
+        router_temps = collect_by_leaf_name(sowed_vars["losses"], "router_temp")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
         if expert_utils:
