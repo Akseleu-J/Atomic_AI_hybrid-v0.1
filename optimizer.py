@@ -303,7 +303,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "aux_loss": aux_loss,
             "z_loss": z_loss,
             "expert_utilization": expert_util_stacked,
-            "moe_dropped_ratio": dropped_ratio_stacked,   # NEW
+            "moe_dropped_ratio": dropped_ratio_stacked,
+            "router_temp": jnp.stack(router_temps) if router_temps else None,
         }
-        return total_loss, aux_info
-    return total_loss
+        return total_loss, aux_infox_info
