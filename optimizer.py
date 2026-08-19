@@ -260,6 +260,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
 
     expert_util_stacked = None
     dropped_ratio_stacked = None
+    router_temp_stacked = None     
     if not deterministic:
         final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
@@ -279,6 +280,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             expert_util_stacked = jnp.stack(expert_utils)
         if dropped_ratios:
             dropped_ratio_stacked = jnp.stack(dropped_ratios)
+       if router_temps:                # добавлено
+            router_temp_stacked = jnp.stack(router_temps)
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
@@ -304,6 +307,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "z_loss": z_loss,
             "expert_utilization": expert_util_stacked,
             "moe_dropped_ratio": dropped_ratio_stacked,
-            "router_temp": jnp.stack(router_temps) if router_temps else None,
+            "router_temp": router_temp_stacked,
         }
         return total_loss, aux_info
