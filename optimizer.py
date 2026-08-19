@@ -280,7 +280,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             expert_util_stacked = jnp.stack(expert_utils)
         if dropped_ratios:
             dropped_ratio_stacked = jnp.stack(dropped_ratios)
-       if router_temps:                # добавлено
+        if router_temps:                # добавлено
             router_temp_stacked = jnp.stack(router_temps)
     else:
         final_hidden = outputs
@@ -310,3 +310,4 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "router_temp": router_temp_stacked,
         }
         return total_loss, aux_info
+    return total_loss
