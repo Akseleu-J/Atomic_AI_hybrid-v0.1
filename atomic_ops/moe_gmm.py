@@ -113,6 +113,52 @@ FIRST, compare against moe_sparse.py's SparseMoEJ (or a plain dense
 JAX-einsum reference) on a few seeds/sizes, and only switch model.py's
 import over once that's finite and rel_diff-small, per this project's own
 "equivalence testing before production use" discipline.
+
+ФИКС (этот пасс -- router collapse, см. чат: expert_utilization_std рос
+монотонно 0.005 -> 0.30+ на протяжении нескольких сотен шагов сразу после
+resume, независимо от router_z_loss_coef/router_noise_std -- z_loss
+штрафует величину логитов через градиент, но ничего структурно не
+ОГРАНИЧИВАЕТ саму величину; под Adam норма router.kernel может свободно
+расти, и с ней растёт разброс логитов, даже если штраф формально
+уменьшает его СКОРОСТЬ роста):
+
+  1. router.kernel теперь используется через L2-НОРМАЛИЗОВАННЫЕ СТОЛБЦЫ
+     (по одному направлению на эксперта) -- величина логита теперь зависит
+     ТОЛЬКО от угла между входом и направлением эксперта (умноженного на
+     ||flat_x||), а не от того, насколько разрослась норма самого
+     router.kernel под оптимизатором. Это СТРУКТУРНЫЙ потолок, а не
+     штраф -- в отличие от z_loss, коллапс логитов через рост весов
+     физически невозможен независимо от того, что накопил Adam-momentum
+     ДО этого шага.
+  2. Добавлен обучаемый router_temp (скаляр, init=10.0) -- после
+     нормализации величина "сырого" логита ~ ||x||*cos(angle), что
+     заметно меньше произвольного диапазона до фикса; без температуры
+     softmax/top_k стал бы слишком плоским (все эксперты почти
+     равновероятны) и МЕДЛЕННЕЕ обучался бы отличать токены. Temperature
+     обучается тем же градиентным путём, что и остальная модель -- НЕ
+     добавляет новую multi_transform-группу в optimizer.py (попадает в
+     "other"/default-группу _label_leaf, тот же LR, что у большинства
+     параметров).
+  3. Узкий clip(-8, 8) на router_logits ДО softmax/noise -- exp(8)/exp(-8)
+     ~ 3000x разницы между самым и наименее вероятным экспертом при
+     top_gate softmax -- этого более чем достаточно для уверенной
+     маршрутизации, но структурно не даёт уйти в экстремальный
+     почти-one-hot коллапс, даже если temperature сама по себе окажется
+     плохо откалиброванной на первых шагах. Старый широкий _sanitize
+     (clip ±1e3) сохранён КАК ЕСТЬ для остальных величин в файле (h_pre,
+     out, dW1/dW2/dx/dh) -- он защищает от overflow, не от router
+     collapse, и трогать его не нужно.
+
+Обратная совместимость с чекпоинтами: router.kernel остаётся тем же
+self.param с той же формой (d_model, E_routed) -- ТОЛЬКО способ его
+использования внутри forward меняется (нормализация -- чистая функция
+существующего параметра, не новый параметр). router_temp -- НОВЫЙ
+параметр, которого не было в старых чекпоинтах; restore существующего
+чекпоинта БЕЗ router_temp потребует либо FORCE_FRESH_START, либо (что
+дешевле и правильнее здесь) переинициализации ТОЛЬКО router-группы после
+restore -- см. train.py's router-reset patch, который в любом случае
+рекомендован отдельно для лечения уже накопленного router collapse на
+чекпоинте до этого фикса.
 """
 from __future__ import annotations
 
@@ -126,46 +172,53 @@ from jax.sharding import PartitionSpec as P
 from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm, tgmm
 
 
-
-
-
 _DEFAULT_TILING = (128, 128, 128)
 _SANITIZE_CLIP = 1e3
- 
- 
+
+# ФИКС: узкий clip специально для router_logits -- отдельная константа от
+# _SANITIZE_CLIP (которая остаётся широкой ±1e3 overflow-защитой для
+# остальных величин в файле). exp(8) ~ 2981, exp(-8) ~ 0.000335 -- диапазон
+# ~9e6 между самым уверенным и самым неуверенным логитом даже ДО softmax,
+# более чем достаточно для полной уверенности маршрутизации без риска
+# экстремального one-hot коллапса, устойчивого к любому текущему
+# router_z_loss_coef/router_noise_std.
+_ROUTER_LOGIT_CLIP = 8.0
+_ROUTER_TEMP_INIT = 10.0
+
+
 def _sanitize(x, clip=_SANITIZE_CLIP):
     return jnp.nan_to_num(jnp.clip(x, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
- 
- 
+
+
 def _auto_tile(m, k, n, m_pref=128, k_pref=128, n_pref=128):
     def _pick(d, pref):
         return pref if d % pref == 0 else d
     return (_pick(m, m_pref), _pick(k, k_pref), _pick(n, n_pref))
- 
- 
+
+
 def _make_grouped_ffn_core(interpret=False):
- 
+
     def _fwd_math(x_sorted, W1, W2, group_sizes):
         x_f = x_sorted.astype(jnp.float32)
         W1_f = W1.astype(jnp.float32)
         W2_f = W2.astype(jnp.float32)
- 
+
         T, d_model = x_f.shape
         _, _, d_ff = W1_f.shape
- 
+
         h_pre = gmm(x_f, W1_f, group_sizes,
                     tiling=_auto_tile(T, d_model, d_ff),
                     interpret=interpret, preferred_element_type=jnp.float32)
         h_pre = _sanitize(h_pre)
- 
+
         h, gelu_vjp = jax.vjp(jax.nn.gelu, h_pre)
- 
+
         out = gmm(h, W2_f, group_sizes,
                   tiling=_auto_tile(T, d_ff, d_model),
                   interpret=interpret, preferred_element_type=jnp.float32)
         out = _sanitize(out)
         return out, h, gelu_vjp
- 
+
     # NOTE: no more nondiff_argnums -- group_sizes is now an ordinary
     # (traced-safe) positional argument. custom_vjp is fine with an
     # integer-dtype argument as long as bwd returns a float0 cotangent
@@ -174,65 +227,64 @@ def _make_grouped_ffn_core(interpret=False):
     def _core(x_sorted, W1, W2, group_sizes):
         out, _, _ = _fwd_math(x_sorted, W1, W2, group_sizes)
         return out.astype(x_sorted.dtype)
- 
+
     def _core_fwd(x_sorted, W1, W2, group_sizes):
         out, h, gelu_vjp = _fwd_math(x_sorted, W1, W2, group_sizes)
         # group_sizes carried through residuals now (it used to be closed
         # over via nondiff_argnums and handed to _core_bwd separately).
         residuals = (x_sorted, W1, W2, group_sizes, h, gelu_vjp)
         return out.astype(x_sorted.dtype), residuals
- 
+
     def _core_bwd(residuals, dout):
         x_sorted, W1, W2, group_sizes, h, gelu_vjp = residuals
         x_f = x_sorted.astype(jnp.float32)
         W1_f = W1.astype(jnp.float32)
         W2_f = W2.astype(jnp.float32)
         dout_f = _sanitize(dout.astype(jnp.float32))
- 
+
         T, d_model = x_f.shape
         _, d_ff = h.shape
- 
+
         dW2 = tgmm(h.T, dout_f, group_sizes,
                    tiling=_auto_tile(d_ff, T, d_model),
                    interpret=interpret, preferred_element_type=jnp.float32)
         dW2 = _sanitize(dW2)
- 
+
         W2_T = jnp.swapaxes(W2_f, 1, 2)
         dh = gmm(dout_f, W2_T, group_sizes,
                  tiling=_auto_tile(T, d_model, d_ff),
                  interpret=interpret, preferred_element_type=jnp.float32)
         dh = _sanitize(dh)
- 
+
         (dh_pre,) = gelu_vjp(dh)
         dh_pre = _sanitize(dh_pre.astype(jnp.float32))
- 
+
         dW1 = tgmm(x_f.T, dh_pre, group_sizes,
                    tiling=_auto_tile(d_model, T, d_ff),
                    interpret=interpret, preferred_element_type=jnp.float32)
         dW1 = _sanitize(dW1)
- 
+
         W1_T = jnp.swapaxes(W1_f, 1, 2)
         dx = gmm(dh_pre, W1_T, group_sizes,
                  tiling=_auto_tile(T, d_ff, d_model),
                  interpret=interpret, preferred_element_type=jnp.float32)
         dx = _sanitize(dx)
- 
+
         # group_sizes is integer-dtyped and carries no gradient -- JAX's
         # tangent type for an integer leaf is float0, and custom_vjp bwd
         # must return a value of that dtype/shape for it (not None, not an
         # int32 zeros array -- both are rejected).
         dgroup_sizes = jnp.zeros(group_sizes.shape, dtype=jax.dtypes.float0)
- 
+
         return (
             dx.astype(x_sorted.dtype),
             dW1.astype(W1.dtype),
             dW2.astype(W2.dtype),
             dgroup_sizes,
         )
- 
+
     _core.defvjp(_core_fwd, _core_bwd)
     return _core
- 
 
 
 class GmmMoEJ(nn.Module):
@@ -251,6 +303,10 @@ class GmmMoEJ(nn.Module):
     combine: для каждого исходного токена суммируются его ДВЕ выходные
     строки (первая и вторая копия), взвешенные перенормированными
     top-2 гейтами.
+
+    ФИКС (router collapse): router теперь использует L2-нормализованные
+    столбцы + обучаемую температуру -- см. module docstring "ФИКС (этот
+    пасс...)" выше для полного обоснования.
     """
     cfg: object
     interpret: bool = False
@@ -275,8 +331,32 @@ class GmmMoEJ(nn.Module):
         shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
 
         # ---- routing: top-k среди E_routed ----
-        router_logits = nn.Dense(E_routed, use_bias=False, name="router", dtype=jnp.bfloat16)(flat_x)
-        router_logits = router_logits.astype(jnp.float32)
+        # ФИКС (router collapse): router.kernel -- явный self.param (не
+        # nn.Dense), т.к. нужен прямой доступ к сырой матрице ДЛЯ
+        # нормализации столбцов ПЕРЕД матмулом. Форма (d_model, E_routed)
+        # -- та же, что раньше выдавал nn.Dense(E_routed, use_bias=False),
+        # так что чекпоинт-совместимость по ЭТОМУ параметру сохранена
+        # (веса можно даже restore'ить напрямую, если имя/форма совпадают
+        # -- restore обычно матчит по имени пути, "router"/"kernel").
+        router_kernel = self.param(
+            "router", nn.initializers.lecun_normal(), (d, E_routed), jnp.float32
+        )
+        # L2-нормализация СТОЛБЦОВ (одно направление на эксперта) --
+        # структурный потолок на величину логита, не зависящий от того,
+        # насколько разрослась норма router_kernel под оптимизатором.
+        router_kernel_normed = router_kernel * jax.lax.rsqrt(
+            jnp.sum(router_kernel ** 2, axis=0, keepdims=True) + 1e-6
+        )
+        router_temp = self.param(
+            "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
+        )
+        router_logits = jnp.dot(
+            flat_x.astype(jnp.float32), router_kernel_normed, precision=jax.lax.Precision.HIGHEST
+        ) * router_temp
+        # ФИКС: узкий clip ДО _sanitize/noise -- см. module docstring.
+        # _sanitize (широкий ±1e3) остаётся ПОСЛЕ как overflow-защита,
+        # применяется к уже узко-клипнутому значению, поэтому не мешает.
+        router_logits = jnp.clip(router_logits, -_ROUTER_LOGIT_CLIP, _ROUTER_LOGIT_CLIP)
         router_logits = _sanitize(router_logits)
         if not deterministic and self.cfg.router_noise_std > 0:
             noise_rng = self.make_rng("dropout") if rngs is None else rngs.get("dropout")
@@ -301,6 +381,13 @@ class GmmMoEJ(nn.Module):
         self.sow("losses", "z_loss", jnp.mean(jnp.square(
             jax.scipy.special.logsumexp(router_logits, axis=-1))))
         self.sow("losses", "expert_utilization", mean_probs)
+        # ФИКС (диагностика): router_temp сам по себе -- полезный
+        # индикатор ("растёт ли температура сама по себе, компенсируя
+        # узкий clip"). Сожено сюда же, тем же collect_by_leaf_name-путём,
+        # что и остальные MoE-метрики -- optimizer.py уже собирает
+        # aux_loss/z_loss/expert_utilization по имени листа, router_temp
+        # добавлен по аналогии для W&B-видимости.
+        self.sow("losses", "router_temp", router_temp)
 
         d_model, d_ff = self.cfg.d_model, self.cfg.d_ff
         W1 = self.param("routed_w1", nn.initializers.lecun_normal(),
@@ -389,10 +476,9 @@ class GmmMoEJ(nn.Module):
         # каждый (тот же порядок конкатенации, что при dispatch), взвесить
         # top_gate[:, j] и просуммировать.
         # ==================================================================
-        
+
         combined = shared_out.astype(jnp.float32) + routed_out
         combined = _sanitize(combined)
 
         self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
         return combined.reshape(b, l, d).astype(x.dtype)
-        
