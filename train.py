@@ -62,6 +62,32 @@ outputs (global_norm, clip_factor, group_nonfinite_flags, was_clipped),
 group_nonfinite_flags) и логирование в W&B на каждом эффективном шаге.
 Печать в консоль сохранена, но теперь она условная (только если реально
 что-то не так), а не безусловный debug.print на каждом шаге.
+
+ФИКС (этот пасс -- router collapse на чекпоинте шага 2000, см. чат):
+expert_utilization_std рос монотонно (0.005 -> 0.30+) на протяжении
+нескольких сотен шагов сразу ПОСЛЕ resume, в ДВУХ независимых прогонах
+подряд с сильно разными router_z_loss_coef/router_noise_std
+(0.0001/0.1 и 0.001/0.2) -- деградация стартовала с практически одинаковой
+скоростью в обоих случаях, что указывает на причину, НЕ зависящую от этих
+loss-гиперпараметров: Adam-моменты (mu/nu) для router, накопленные ДО
+момента, когда чекпоинт был сохранён, продолжают толкать router в уже
+намеченном направлении после restore -- новый (пусть и сильнее
+штрафуемый) градиент на fresh-шагах слишком слаб, чтобы перебороть уже
+накопленный momentum за разумное число шагов.
+
+Патч: RESET_ROUTER_ON_RESUME -- переинициализирует ТОЛЬКО router.kernel
+(nn.Dense-параметр внутри каждого GmmMoEJ-блока) и обнуляет ТОЛЬКО его
+Adam mu/nu внутри opt_state сразу после restore. Остальная модель
+(GDN-2/Mamba2/MLA/эксперты/embed) и остальной opt_state НЕ трогаются --
+прогресс основной модели не теряется, router получает честный свежий
+старт под текущими router_z_loss_coef/router_noise_std. Структура
+router.kernel НЕ меняется (остаётся тем же nn.Dense(E_routed,
+use_bias=False) -- НЕ архитектурный L2-нормализованный вариант, который
+обсуждался в чате и сознательно отложен отдельным шагом, т.к. он меняет
+форму/состав параметра и НЕ совместим с прямым restore).
+Поставьте RESET_ROUTER_ON_RESUME=False после одного успешного прогона с
+этим флагом -- сброс нужен ОДИН РАЗ, чтобы вылечить уже накопленный до
+чекпоинта 2000 router momentum, не на каждый resume впредь.
 """
 import os
 import time
@@ -69,8 +95,11 @@ import json
 import signal
 import shutil
 import sys
+
 from collections import deque
 from dataclasses import asdict
+
+import wandb
 
 import jax
 import jax.numpy as jnp
@@ -92,6 +121,58 @@ from train_setup import (
 import wandb_logging
 
 from model import ModelConfig, get_model_mesh
+from utils import path_to_str  # ФИКС (router-reset): нужно для поиска router-листьев в params/opt_state
+
+
+# ==========================================================================
+# ФИКС (router collapse, см. докстринг модуля выше): переинициализация
+# router.kernel + обнуление его Adam mu/nu внутри opt_state сразу после
+# restore. Обе функции -- ЧИСТЫЕ (params/opt_state -> новый params/
+# opt_state), без побочных эффектов, работают через tree_map_with_path
+# ровно тем же способом, что и _get_shard_spec/_decay_scale_leaf в
+# train_setup.py -- ищут "router" в строковом представлении пути к листу.
+# ==========================================================================
+def _reset_router_params(params, seed=1234, stddev=0.02):
+    """Переинициализирует ТОЛЬКО 2D-листья, чей путь содержит 'router'
+    (т.е. router.kernel внутри каждого GmmMoEJ-блока) небольшим случайным
+    init -- лечит уже накопленный router collapse на восстановленном
+    чекпоинте без потери прогресса остальной модели. Не трогает
+    opt_state сам по себе (см. _reset_router_opt_state ниже для этого) --
+    Adam-моменты для router без сброса будут "устаревшими" на первые
+    несколько шагов, что и есть корень проблемы, которую этот патч решает."""
+    rng = jax.random.PRNGKey(seed)
+
+    def _reset_leaf(path, leaf):
+        nonlocal rng
+        path_str = path_to_str(path)
+        if "router" in path_str and hasattr(leaf, "shape") and leaf.ndim == 2:
+            rng, sub = jax.random.split(rng)
+            new_leaf = jax.random.normal(sub, leaf.shape, dtype=leaf.dtype) * stddev
+            print(f"[ROUTER-RESET] Переинициализирован params: {path_str}, shape={leaf.shape}")
+            return new_leaf
+        return leaf
+
+    return jax.tree_util.tree_map_with_path(_reset_leaf, params)
+
+
+def _reset_router_opt_state(opt_state):
+    """Обнуляет Adam-моменты (mu/nu, и любые другие числовые буферы той
+    же формы, что параметры) ТОЛЬКО для router-параметров внутри
+    opt_state -- лечит momentum, накопленный ДО чекпоинта, который
+    продолжает толкать router к уже намеченным нескольким экспертам
+    независимо от текущих router_z_loss_coef/router_noise_std (см.
+    докстринг модуля: два прогона с сильно разными коэффициентами
+    деградировали синхронно -- явный признак, что решает не текущий
+    градиент, а унаследованный momentum). НЕ трогает остальные группы
+    (muon/lion/adamw для GDN-2/Mamba2/MLA/embed/experts)."""
+    def _reset_leaf(path, leaf):
+        path_str = path_to_str(path)
+        if "router" in path_str and hasattr(leaf, "shape") and leaf.ndim >= 1:
+            print(f"[ROUTER-RESET] Обнулён opt_state момент: {path_str}, shape={leaf.shape}")
+            return jnp.zeros_like(leaf)
+        return leaf
+
+    return jax.tree_util.tree_map_with_path(_reset_leaf, opt_state)
 
 
 def main_execution():
@@ -108,6 +189,12 @@ def main_execution():
 
     FORCE_FRESH_START = False  # <-- поставьте False, чтобы вернуть обычный resume
     RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
+
+    # ФИКС (router collapse): см. докстринг модуля выше. True -- один раз,
+    # чтобы вылечить уже накопленный до чекпоинта 2000 router momentum.
+    # Поставьте False после первого успешного прогона с этим флагом --
+    # НЕ нужно сбрасывать router на каждый resume впредь.
+    RESET_ROUTER_ON_RESUME = True
 
     if FORCE_FRESH_START:
         resume_step = None
@@ -161,7 +248,7 @@ def main_execution():
         top_k=2,
         moe_capacity_factor=1.25,
         router_aux_loss_coef=0.03,
-        router_z_loss_coef=0.0001,
+        router_z_loss_coef=0.0003,
         num_layers=24,
         layers_per_block=3,
         vocab_size=128256,
@@ -299,7 +386,8 @@ def main_execution():
         config={**asdict(config), "micro_batch_size": micro_batch_size,
                 "accum_steps": accum_steps, "seq_len": seq_len,
                 "n_devices": mesh.shape["tpu_nodes"],
-                "source_fractions": SOURCE_FRACTIONS},
+                "source_fractions": SOURCE_FRACTIONS,
+                "router_reset_on_resume": RESET_ROUTER_ON_RESUME},
         resume_id=_resume_wandb_id,
     )
     if wandb_run_id is not None:
@@ -395,6 +483,23 @@ def main_execution():
                 raise ValueError("Восстановленные params содержат NaN -- чекпоинт повреждён.")
 
             print(f"[RESUME] ✅ Restored: step={global_step}, best_val={best_val_loss:.4f}, best_train={best_train_loss:.4f}")
+
+            # ФИКС (router collapse): см. докстринг модуля выше -- лечит
+            # router momentum, накопленный ДО этого чекпоинта, применяется
+            # ПОСЛЕ успешного restore, ДО того как params/opt_state пойдут
+            # в основной цикл обучения (в частности, до
+            # RESUME_OVERRIDE-пере-регистрации ниже, чтобы новый
+            # зарегистрированный шаг УЖЕ нёс сброшенный router).
+            if RESET_ROUTER_ON_RESUME:
+                params = _reset_router_params(params)
+                opt_state = _reset_router_opt_state(opt_state)
+                print("[ROUTER-RESET] ⚠️ Router-веса и router Adam-momentum "
+                      "переинициализированы -- ожидайте кратковременный рост "
+                      "aux_loss/z_loss/expert_util_std в первые ~100-300 шагов, "
+                      "пока router заново калибруется с нуля под текущими "
+                      "router_z_loss_coef/router_noise_std. Не забудьте выставить "
+                      "RESET_ROUTER_ON_RESUME=False после этого прогона.")
+                wandb_logging.log_metrics(global_step, {"router/reset_applied": 1})
 
             if RESUME_FROM_SLOT != "latest":
                 print(f"[RESUME OVERRIDE] Перерегистрирую шаг {global_step} в mngr_latest "
@@ -501,7 +606,7 @@ def main_execution():
             # под строгую pjit-сигнатуру {"input_ids","labels"} (см.
             # train_setup.py in_shardings), лишний ключ рушит pytree-match
             # с ValueError "Mismatch details... 3 child keys". Достаём его
-            # здесь, ДО того как batch попадёт в compiled_train_micro или
+            # здесь, ДО того как батч попадёт в compiled_train_micro или
             # _accum_window. .pop(..., None) безопасен и для mixed-режима
             # (там ключа нет -- просто вернёт None).
             source_idx = batch.pop("_source_idx", None)
