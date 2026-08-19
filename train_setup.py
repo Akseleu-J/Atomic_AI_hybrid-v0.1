@@ -63,6 +63,45 @@ GradientTransformation: tx становится функцией tx.init, а lr_
 реальную причину. make_shard_and_compile теперь явно проверяет тип
 результата make_hybrid_optimizer вместо слепой распаковки -- см.
 make_shard_and_compile ниже.
+
+ФИКС #6 (этот пасс -- router_temp runaway, см. test_synthetic_router_temp*.py
+в чате): GmmMoEJ's router_temp (atomic_ops/moe_gmm.py, _ROUTER_TEMP_INIT=
+10.0, hard-clipped to [1,15] только НА ЧТЕНИЕ через router_temp_clipped)
+не имеет структурного сопротивления росту САМОГО параметра к потолку
+клипа. Подтверждено на полностью изолированном синтетическом тесте (один
+слой GmmMoEJ, случайный шум на входе, loss=mean(out**2), без реальных
+данных, без GDN-2/Mamba2): router_temp детерминированно упирается в 15.0
+за ~9000 шагов чисто из-за task-loss давления, независимо от датасета.
+
+L2-штраф-в-loss (router_temp - init)**2 был опробован ПЕРВЫМ и отклонён:
+под Adam адаптивная пер-параметрная нормализация шага (sqrt(v)/m) делает
+ЭФФЕКТИВНЫЙ размер шага почти независимым от величины L2-коэффициента --
+100-кратное изменение coef (1e-4 -> 1e-2) дало почти ИДЕНТИЧНЫЕ траектории
+отката в синтетическом resume-shock тесте (старт=15.0, все три coef сошлись
+к ~13.6 за 1500 шагов). Тот же класс проблемы, что уже встречался в этом
+проекте с Muon weight decay (см. optimizer.py's _muon_step докстринг) --
+там решено применением decay ВНЕ градиентного пути (после ортогонализации),
+а не через loss.
+
+Фикс здесь следует тому же паттерну "decoupled decay, не через градиент
+loss": применяется прямо в пост-обработке параметров после
+optax.apply_updates (distributed_apply_step, сразу после существующего
+клипа параметров ±1e2), не через compute_loss/optimizer.py's tx.update().
+Синтетический перебор (test_synthetic_router_temp_decoupled.py) подтвердил
+decay_rate=0.02 как хороший баланс:
+  - Сценарий A (рост от init под task-loss давлением, 3000 шагов):
+    final=10.03, max=10.03 -- рост к потолку полностью подавлен.
+  - Сценарий B (откат от уже упёршегося 15.0, симулирует чекпоинт ДО
+    фикса, 1500 шагов): стабилизируется в [9,11] к шагу 81, БЕЗ overshoot
+    ниже init (min=10.01) -- в отличие от decay_rate=0.001/0.005, которые
+    либо не стабилизируются за 1500 шагов вовсе, либо стабилизируются
+    слишком медленно (шаг 339), чтобы быть практически полезными сразу
+    после реального resume.
+decay_rate=0.05 был чуть быстрее (шаг 31) без видимого overshoot, но 0.02
+оставляет больше запаса против более высокой дисперсии градиентов
+реальных данных по сравнению с безшумным синтетическим тестом --
+пересмотреть только если 0.02 окажется слишком медленным для удержания
+роста на реальных TPU-прогонах.
 """
 from __future__ import annotations
 
@@ -93,6 +132,39 @@ DATASET_FRACTION_SEED = 777
 NONFINITE_CONSECUTIVE_LIMIT = 4
 NONFINITE_WINDOW_SIZE = 15
 NONFINITE_WINDOW_RATIO = 0.25
+
+# ==========================================================================
+# ФИКС #6 (router_temp runaway) -- см. докстринг модуля выше для полного
+# обоснования (isolated synthetic test + отклонённый L2-в-loss вариант +
+# принятый decoupled-decay вариант, decay_rate=0.02).
+# ==========================================================================
+ROUTER_TEMP_DECAY_RATE = 0.02
+ROUTER_TEMP_INIT = 10.0  # должно совпадать с atomic_ops/moe_gmm.py's _ROUTER_TEMP_INIT
+
+
+def _router_temp_decay_leaf(path, param):
+    """tree_map_with_path leaf fn -- тот же паттерн, что _decay_scale_leaf
+    ниже: определяет router_temp-листья по подстроке в пути, возвращает
+    СТАВКУ decay для этого листа (0.0 для всех остальных -- т.е. no-op)."""
+    path_str = path_to_str(path)
+    return ROUTER_TEMP_DECAY_RATE if "router_temp" in path_str else 0.0
+
+
+def apply_router_temp_decay(new_params, decay_map):
+    """Decoupled decay-to-init ТОЛЬКО для router_temp-листьев, применяется
+    ПОСЛЕ optax.apply_updates (т.е. после собственного шага Adam) -- см.
+    докстринг модуля выше про то, почему это НЕ должно идти через
+    градиент/loss. decay_map -- pytree той же формы, что new_params, со
+    ROUTER_TEMP_DECAY_RATE на router_temp-листьях и 0.0 везде остальном
+    (см. _router_temp_decay_leaf) -- строится один раз в
+    make_shard_and_compile, тот же паттерн, что _decay_grad_scale, так что
+    здесь остаётся чистый jax.tree_map внутри jitted distributed_apply_step
+    (никакого Python-side string matching внутри jit-трейса)."""
+    return jax.tree_util.tree_map(
+        lambda p, rate: p - rate * (p - ROUTER_TEMP_INIT),
+        new_params, decay_map,
+    )
+
 
 SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 5 * 60  # 9 часов минус запас на graceful stop
 
@@ -243,6 +315,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
     _decay_grad_scale = jax.tree_util.tree_map_with_path(_decay_scale_leaf, abstract_params)
 
+    # ФИКС #6 (router_temp runaway): decay-карта строится один раз здесь,
+    # тем же паттерном, что _decay_grad_scale выше -- чистая pytree-структура
+    # (0.0/ROUTER_TEMP_DECAY_RATE на листьях), без строковых операций
+    # внутри jitted distributed_apply_step.
+    _router_temp_decay_map = jax.tree_util.tree_map_with_path(
+        _router_temp_decay_leaf, abstract_params
+    )
+
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
     opt_state_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, opt_state_abstract)
 
@@ -293,6 +373,20 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             lambda pp: jnp.nan_to_num(jnp.clip(pp, -1e2, 1e2), nan=0.0, posinf=1e2, neginf=-1e2),
             new_p,
         )
+
+        # ФИКС #6 (router_temp runaway): decoupled decay-to-init для
+        # router_temp-листьев, вне градиентного пути -- см. докстринг
+        # модуля / ROUTER_TEMP_DECAY_RATE выше. Применяется ПОСЛЕ клипа
+        # параметров: клип держит |w|<=1e2 общим правилом на случай взрыва,
+        # decay здесь решает узкую задачу -- удержать router_temp у
+        # разумной рабочей точки (~init=10.0), а не только в пределах
+        # overflow-safe диапазона. Никакого конфликта между ними: клип
+        # применяется первым и почти никогда не заденет router_temp (его
+        # диапазон [1,15] << 1e2), decay применяется вторым и трогает
+        # ТОЛЬКО router_temp-листья (везде остальном decay_map=0.0, т.е.
+        # no-op).
+        new_p = apply_router_temp_decay(new_p, _router_temp_decay_map)
+
         # ФИКС #3: was_clipped тоже больше не печатается через
         # jax.lax.cond(...jax.debug.print...) -- просто bool-скаляр,
         # возвращаемый как обычный выход, ровно как is_finite уже был.
