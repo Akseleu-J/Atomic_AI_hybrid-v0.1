@@ -317,6 +317,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "z_loss": NamedSharding(mesh, P()),
         "expert_utilization": NamedSharding(mesh, P(None)),
         "moe_dropped_ratio": NamedSharding(mesh, P(None)),
+        "router_temp": NamedSharding(mesh, P(None)),   # добавлено
     }
 
     compiled_train_micro = jax.jit(
