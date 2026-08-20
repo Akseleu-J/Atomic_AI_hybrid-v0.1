@@ -354,16 +354,16 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         group_nonfinite_flags = _group_nonfinite_flags(avg_grads)
 
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
-
         is_finite = jnp.isfinite(global_norm)
+        # clip_factor теперь только для логов/диагностики
         safe_norm = jnp.where(is_finite, global_norm, 1.0)
         clip_factor = jnp.where(is_finite, jnp.minimum(1.0, 1.0 / (safe_norm + 1e-6)), 0.0)
 
+        # only sanitize non-finite, без дополнительного ручного clip (optax clip уже есть в tx)
         avg_grads = jax.tree_util.tree_map(
-            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) * clip_factor,
+            lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
             avg_grads,
         )
-
         avg_grads = jax.tree_util.tree_map(lambda g, s: g * s, avg_grads, _decay_grad_scale)
 
         updates, new_s = tx.update(avg_grads, s, p)
