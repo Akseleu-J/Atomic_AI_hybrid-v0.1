@@ -263,6 +263,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     router_temp_stacked = None  
     min_col_norm_stacked = None               # NEW
     max_abs_logit_preclip_stacked = None      # NEW
+    norm_x_mean_stacked = None    # NEW
+    norm_x_max_stacked = None     # NEW
+    norm_x_min_stacked = None     # NEW
     if not deterministic:
         final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
@@ -278,6 +281,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         router_temps = collect_by_leaf_name(sowed_vars["losses"], "router_temp")
         min_col_norms = collect_by_leaf_name(sowed_vars["losses"], "min_col_norm")
         max_abs_logits_preclip = collect_by_leaf_name(sowed_vars["losses"], "max_abs_logit_preclip")
+        norm_x_mean = collect_by_leaf_name(sowed_vars["losses"], "norm_x_mean")
+        norm_x_max = collect_by_leaf_name(sowed_vars["losses"], "norm_x_max")
+        norm_x_min = collect_by_leaf_name(sowed_vars["losses"], "norm_x_min")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
         if expert_utils:
@@ -288,6 +294,12 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             router_temp_stacked = jnp.stack(router_temps)
         min_col_norm_stacked = jnp.stack(min_col_norms) if min_col_norms else None
         max_abs_logit_preclip_stacked = jnp.stack(max_abs_logits_preclip) if max_abs_logits_preclip else None
+        if norm_x_mean:
+            norm_x_mean_stacked = jnp.stack(norm_x_mean)
+        if norm_x_max:
+            norm_x_max_stacked = jnp.stack(norm_x_max)
+        if norm_x_min:
+            norm_x_min_stacked = jnp.stack(norm_x_min)
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
@@ -316,6 +328,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "router_temp": router_temp_stacked,
             "min_col_norm": min_col_norm_stacked,                     # NEW
             "max_abs_logit_preclip": max_abs_logit_preclip_stacked,   # NEW
+            "norm_x_mean": norm_x_mean_stacked,   # NEW
+            "norm_x_max": norm_x_max_stacked,     # NEW
+            "norm_x_min": norm_x_min_stacked,     # NEW
         }
         return total_loss, aux_info
     return total_loss
