@@ -650,6 +650,7 @@ def main_execution():
     signal.signal(signal.SIGTERM, emergency_save)
     signal.signal(signal.SIGINT, emergency_save)
 
+    burst_streak = 0
     total_tokens_processed = 0
     epoch_start_time = time.perf_counter()
     last_ckpt_time = time.perf_counter()
@@ -715,6 +716,20 @@ def main_execution():
                 # host-side разбор, ноль host-callback каналов, полное
                 # покрытие W&B.
                 _global_norm_val = float(jax.device_get(global_norm))
+                if _global_norm_val > 20.0:
+                    burst_streak += 1
+                else:
+                    burst_streak = 0
+
+                if burst_streak >= 3:
+                    print(f"[BURST-GUARD] ⚠️ global_grad_norm>20 три эффективных шага подряд "
+                          f"(global_step={global_step + 1}). Вероятен runaway-режим.")
+                    wandb_logging.log_alert(
+                        "Burst guard triggered",
+                        f"global_grad_norm > 20 три шага подряд на step={global_step + 1}",
+                        level="WARN",
+                    )
+                    burst_streak = 0
                 _clip_factor_val = float(jax.device_get(clip_factor))
                 _group_flags_np = jax.device_get(group_nonfinite_flags)
                 _was_clipped_val = bool(jax.device_get(was_clipped))
