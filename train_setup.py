@@ -414,6 +414,9 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "router_temp": NamedSharding(mesh, P(None)),
         "min_col_norm": NamedSharding(mesh, P(None)),          # NEW
         "max_abs_logit_preclip": NamedSharding(mesh, P(None)), # NEW
+        "norm_x_mean": NamedSharding(mesh, P(None)),
+        "norm_x_max": NamedSharding(mesh, P(None)),
+        "norm_x_min": NamedSharding(mesh, P(None)),
     }
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
