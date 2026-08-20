@@ -260,7 +260,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
 
     expert_util_stacked = None
     dropped_ratio_stacked = None
-    router_temp_stacked = None     
+    router_temp_stacked = None  
+    min_col_norm_stacked = None               # NEW
+    max_abs_logit_preclip_stacked = None      # NEW
     if not deterministic:
         final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
@@ -274,6 +276,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         # model is ever switched back to the dense MoE for cross-checking.
         dropped_ratios = collect_by_leaf_name(sowed_vars["losses"], "moe_dropped_ratio")
         router_temps = collect_by_leaf_name(sowed_vars["losses"], "router_temp")
+        min_col_norms = collect_by_leaf_name(sowed_vars["losses"], "min_col_norm")
+        max_abs_logits_preclip = collect_by_leaf_name(sowed_vars["losses"], "max_abs_logit_preclip")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
         if expert_utils:
@@ -282,6 +286,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             dropped_ratio_stacked = jnp.stack(dropped_ratios)
         if router_temps:                # добавлено
             router_temp_stacked = jnp.stack(router_temps)
+        min_col_norm_stacked = jnp.stack(min_col_norms) if min_col_norms else None
+        max_abs_logit_preclip_stacked = jnp.stack(max_abs_logits_preclip) if max_abs_logits_preclip else None
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
@@ -302,12 +308,15 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
     if return_aux:
         aux_info = {
+        aux_info = {
             "ce_loss": ce_loss,
             "aux_loss": aux_loss,
             "z_loss": z_loss,
             "expert_utilization": expert_util_stacked,
             "moe_dropped_ratio": dropped_ratio_stacked,
             "router_temp": router_temp_stacked,
+            "min_col_norm": min_col_norm_stacked,                     # NEW
+            "max_abs_logit_preclip": max_abs_logit_preclip_stacked,   # NEW
         }
         return total_loss, aux_info
     return total_loss
