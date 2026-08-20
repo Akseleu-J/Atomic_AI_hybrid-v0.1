@@ -312,6 +312,11 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     def _decay_scale_leaf(path, param):
         path_str = path_to_str(path)
         return 0.2 if ("decay_a" in path_str or "a_log" in path_str) else 1.0
+    def _router_scale_leaf(path, param):
+        path_str = path_to_str(path)
+        return 0.3 if "router" in path_str else 1.0
+
+    _router_grad_scale = jax.tree_util.tree_map_with_path(_router_scale_leaf, abstract_params)
 
     _decay_grad_scale = jax.tree_util.tree_map_with_path(_decay_scale_leaf, abstract_params)
 
@@ -365,6 +370,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             avg_grads,
         )
         avg_grads = jax.tree_util.tree_map(lambda g, s: g * s, avg_grads, _decay_grad_scale)
+        avg_grads = jax.tree_util.tree_map(lambda g, s: g * s, avg_grads, _router_grad_scale)
 
         updates, new_s = tx.update(avg_grads, s, p)
         new_p = optax.apply_updates(p, updates)
