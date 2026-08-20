@@ -83,9 +83,14 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         boundaries=[warmup_steps],
     )
 
-    lion_lr = lambda step: 3e-4 * lr_schedule(step)
-    adamw_lr = lambda step: 1e-3 * lr_schedule(step)
-    tx_lion = optax.lion(learning_rate=lion_lr, weight_decay=0.1)
+    RESUME_BACKOFF_STEPS = 5000
+    RESUME_LR_SCALE = 0.7  # -30% на раннем участке после resume
+
+    def resume_backoff(step):
+        return jnp.where(step < RESUME_BACKOFF_STEPS, RESUME_LR_SCALE, 1.0)
+
+    lion_lr = lambda step: 3e-4 * lr_schedule(step) * resume_backoff(step)
+    adamw_lr = lambda step: 1e-3 * lr_schedule(step) * resume_backoff(step)    tx_lion = optax.lion(learning_rate=lion_lr, weight_decay=0.1)
     tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
     tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
 
