@@ -375,6 +375,12 @@ class GmmMoEJ(nn.Module):
         # per real MoE block, not a single shared one.
         _moe_tag = "/".join(str(p) for p in self.scope.path) if self.scope is not None else "moe"
         flat_x_for_router = _moe_grad_sanitizer(f"moe_router_input_grad_{_moe_tag}")(flat_x)
+        # ---- новая диагностика: ||flat_x|| (по строкам) ----
+        _norm_per_token = jnp.linalg.norm(flat_x_for_router, axis=1, keepdims=False)
+        self.sow("losses", "norm_x_mean", jnp.mean(_norm_per_token))
+        self.sow("losses", "norm_x_max", jnp.max(_norm_per_token))
+        self.sow("losses", "norm_x_min", jnp.min(_norm_per_token))
+        # ----------------------------------------------------
         T = flat_x.shape[0]
         E_routed = self.cfg.num_experts - 1
         k = self.top_k
