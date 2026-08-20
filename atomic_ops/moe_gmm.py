@@ -184,7 +184,57 @@ _SANITIZE_CLIP = 1e3
 # router_z_loss_coef/router_noise_std.
 _ROUTER_LOGIT_CLIP = 8.0
 _ROUTER_TEMP_INIT = 10.0
+import os
 
+_MOE_FWD_DIAG = os.environ.get("GDN2_FWD_DIAG", "0") == "1"
+
+
+def _moe_grad_sanitizer(tag: str, clip_val: float = 1e3):
+    """Local copy of model.py's make_grad_sanitizer (same reasoning
+    optimizer.py already gives for its own local copy: avoid a
+    moe_gmm.py -> model.py import for one internal helper).
+
+    Placed ONLY on the flat_x copy that feeds router_logits (see call site
+    in GmmMoEJ.__call__ below) -- NOT on the copy used by the shared
+    expert or dispatch. That isolation means the cotangent this node sees
+    on the real backward pass is EXACTLY the router's own contribution to
+    dflat_x -- i.e. the real, per-step measurement of the exact channel
+    by which a large/non-finite router gradient could contaminate the
+    shared residual stream and poison unrelated sublayers (gdn2/mla/mamba2)
+    reading the same current_x. This replaces the synthetic
+    dL/dflat_x check from the offline diagnostic script -- here it's the
+    ACTUAL gradient from the ACTUAL training step, not a proxy, and it
+    costs nothing extra since it's already being computed by autodiff.
+
+    Also ACTIVELY clips (not just reports) -- same "diagnose AND fix"
+    pattern already used for mla_flash_attn_out/gdn2_q_normalize/
+    gdn2_k_normalize/delta_fanin_* in model.py."""
+    @jax.custom_vjp
+    def _sanitizer(x):
+        return x
+
+    def _fwd(x):
+        return x, None
+
+    def _bwd(_, g):
+        finite = jnp.all(jnp.isfinite(g))
+        max_abs = jnp.max(jnp.abs(jnp.where(jnp.isfinite(g), g, 0.0)))
+        if _MOE_FWD_DIAG:
+            jax.lax.cond(
+                jnp.logical_or(jnp.logical_not(finite), max_abs > clip_val),
+                lambda: jax.debug.print(
+                    "[MOE-BWD-DIAG] ⚠️ " + tag + ": incoming grad finite={f} "
+                    "max_abs={m:.3e} -- sanitized to +-{c}",
+                    f=finite, m=max_abs, c=clip_val,
+                ),
+                lambda: None,
+            )
+        g_safe = jnp.nan_to_num(jnp.clip(g, -clip_val, clip_val),
+                                 nan=0.0, posinf=clip_val, neginf=-clip_val)
+        return (g_safe,)
+
+    _sanitizer.defvjp(_fwd, _bwd)
+    return _sanitizer
 
 def _sanitize(x, clip=_SANITIZE_CLIP):
     return jnp.nan_to_num(jnp.clip(x, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
@@ -316,6 +366,15 @@ class GmmMoEJ(nn.Module):
     def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
+        # ФИКС (live router diagnostics -- replaces offline synthetic
+        # replay, which twice proved the router's forward math is
+        # structurally bounded and can't be the source of a runaway on its
+        # own; see project notes on test_synthetic_router_collapse*.py).
+        # tag is unique per block via the flax scope path (e.g.
+        # "block_3/moe"), evaluated at trace time -- one distinct probe
+        # per real MoE block, not a single shared one.
+        _moe_tag = "/".join(str(p) for p in self.scope.path) if self.scope is not None else "moe"
+        flat_x_for_router = _moe_grad_sanitizer(f"moe_router_input_grad_{_moe_tag}")(flat_x)
         T = flat_x.shape[0]
         E_routed = self.cfg.num_experts - 1
         k = self.top_k
@@ -352,8 +411,31 @@ class GmmMoEJ(nn.Module):
         )
         router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
         router_logits = jnp.dot(
-            flat_x.astype(jnp.float32), router_kernel_normed, precision=jax.lax.Precision.HIGHEST
+            flat_x_for_router.astype(jnp.float32), router_kernel_normed, precision=jax.lax.Precision.HIGHEST
         ) * router_temp_clipped
+
+        # ФИКС (live diagnostics, forward side): capture pre-clip logit
+        # magnitude and pre-normalization column norm BEFORE the existing
+        # narrow clip/sanitize -- these are the two forward-side
+        # early-warning signals the offline snapshot script computed
+        # after-the-fact; sowing them here makes them visible every real
+        # step, not just at the one step a non-finite snapshot happened to
+        # catch.
+        _max_abs_logit_preclip = jnp.max(jnp.abs(router_logits))
+        _min_col_norm = jnp.min(jnp.sqrt(jnp.sum(router_kernel ** 2, axis=0)))
+        self.sow("losses", "max_abs_logit_preclip", _max_abs_logit_preclip)
+        self.sow("losses", "min_col_norm", _min_col_norm)
+
+        if _MOE_FWD_DIAG:
+            jax.lax.cond(
+                jnp.logical_or(_max_abs_logit_preclip > _ROUTER_LOGIT_CLIP * 1.5, _min_col_norm < 1e-3),
+                lambda: jax.debug.print(
+                    "[MOE-FWD-DIAG] ⚠️ " + _moe_tag + ": max|logit|(pre-clip)={m:.3f}  "
+                    "min_col_norm={c:.6f}", m=_max_abs_logit_preclip, c=_min_col_norm,
+                ),
+                lambda: None,
+            )
+
         router_logits = jnp.clip(router_logits, -_ROUTER_LOGIT_CLIP, _ROUTER_LOGIT_CLIP)
         router_logits = _sanitize(router_logits)
         if not deterministic and self.cfg.router_noise_std > 0:
