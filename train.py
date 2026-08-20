@@ -75,19 +75,38 @@ loss-гиперпараметров: Adam-моменты (mu/nu) для router, 
 штрафуемый) градиент на fresh-шагах слишком слаб, чтобы перебороть уже
 накопленный momentum за разумное число шагов.
 
-Патч: RESET_ROUTER_ON_RESUME -- переинициализирует ТОЛЬКО router.kernel
-(nn.Dense-параметр внутри каждого GmmMoEJ-блока) и обнуляет ТОЛЬКО его
-Adam mu/nu внутри opt_state сразу после restore. Остальная модель
-(GDN-2/Mamba2/MLA/эксперты/embed) и остальной opt_state НЕ трогаются --
-прогресс основной модели не теряется, router получает честный свежий
-старт под текущими router_z_loss_coef/router_noise_std. Структура
-router.kernel НЕ меняется (остаётся тем же nn.Dense(E_routed,
-use_bias=False) -- НЕ архитектурный L2-нормализованный вариант, который
-обсуждался в чате и сознательно отложен отдельным шагом, т.к. он меняет
-форму/состав параметра и НЕ совместим с прямым restore).
-Поставьте RESET_ROUTER_ON_RESUME=False после одного успешного прогона с
-этим флагом -- сброс нужен ОДИН РАЗ, чтобы вылечить уже накопленный до
-чекпоинта 2000 router momentum, не на каждый resume впредь.
+Патч: RESET_ROUTER_ON_RESUME -- переинициализирует router.kernel и
+router_temp (nn.Dense-подобные параметры внутри каждого GmmMoEJ-блока) и
+обнуляет их Adam mu/nu внутри opt_state сразу после restore. Остальная
+модель (GDN-2/Mamba2/MLA/эксперты/embed) и остальной opt_state НЕ
+трогаются -- прогресс основной модели не теряется, router получает
+честный свежий старт.
+
+ФИКС (этот пасс -- structural router.kernel/router_temp mismatch на
+restore, см. чат): moe_gmm.py's GmmMoEJ заменил router с nn.Dense-стиля
+({"kernel": array}) на голый self.param (просто array), плюс добавил
+совершенно новый лист router_temp -- строгий orbax StandardRestore с
+item=params/opt_state падает с "Source: MaskedNode / Target: dict"
+несовпадением структуры pytree. Заменено на _compatible_restore_params
+(читает сырые данные с диска БЕЗ навязывания текущей структуры target,
+мёрджит по путям в свежие params -- новые/несовпадающие по форме листья
+остаются со свежей инициализацией) + opt_state пересоздаётся с нуля
+целиком (tx.init(params)), т.к. структура multi_transform тоже изменилась.
+RESET_ROUTER_ON_RESUME теперь избыточен после graft-merge (router уже
+свежий), оставлен как no-op предупреждение для совместимости с уже
+существующим переключателем -- см. комментарий в блоке restore ниже.
+
+ФИКС (этот пасс -- router_temp runaway, см. train_setup.py's ФИКС #6):
+GmmMoEJ's router_temp упирается в верхнюю границу клипа [1,15] под
+task-loss давлением независимо от датасета (подтверждено изолированным
+синтетическим тестом) -- train_setup.py's apply_router_temp_decay (decoupled
+decay-to-init, decay_rate=0.02, применяется ВНЕ градиентного пути, сразу
+после optax.apply_updates) уже решает это структурно. Этот пасс добавляет
+ТОЛЬКО наблюдаемость поверх уже работающего фикса: router_temp собирается
+в optimizer.py's compute_loss (aux_info["router_temp"]) и логируется здесь
+в W&B (агрегаты + по-слойно), чтобы подтвердить на реальных данных, что
+decay реально держит router_temp у ROUTER_TEMP_INIT=10.0, а не только
+полагаться на факт отсутствия NaN.
 """
 import os
 import time
@@ -126,30 +145,40 @@ from utils import path_to_str  # ФИКС (router-reset): нужно для по
 
 # ==========================================================================
 # ФИКС (router collapse, см. докстринг модуля выше): переинициализация
-# router.kernel + обнуление его Adam mu/nu внутри opt_state сразу после
-# restore. Обе функции -- ЧИСТЫЕ (params/opt_state -> новый params/
-# opt_state), без побочных эффектов, работают через tree_map_with_path
-# ровно тем же способом, что и _get_shard_spec/_decay_scale_leaf в
-# train_setup.py -- ищут "router" в строковом представлении пути к листу.
+# router-листьев (kernel 2D + router_temp скаляр) + обнуление их Adam
+# mu/nu внутри opt_state сразу после restore. Обе функции -- ЧИСТЫЕ
+# (params/opt_state -> новый params/opt_state), без побочных эффектов,
+# работают через tree_map_with_path ровно тем же способом, что и
+# _get_shard_spec/_decay_scale_leaf в train_setup.py -- ищут "router" в
+# строковом представлении пути к листу.
+#
+# ПРИМЕЧАНИЕ: после появления _compatible_restore_params (graft-merge на
+# restore, см. ниже) router и router_temp УЖЕ приходят со свежей
+# инициализацией автоматически (они новые/несовпадающие по структуре
+# листья -- merge() оставляет для них fresh_params как есть). Эти функции
+# оставлены в коде на случай отката на строгий StandardRestore или для
+# ручного форс-сброса router независимо от графа причин.
 # ==========================================================================
 def _reset_router_params(params, seed=1234, stddev=0.02):
-    """Переинициализирует ТОЛЬКО 2D-листья, чей путь содержит 'router'
-    (т.е. router.kernel внутри каждого GmmMoEJ-блока) небольшим случайным
-    init -- лечит уже накопленный router collapse на восстановленном
-    чекпоинте без потери прогресса остальной модели. Не трогает
-    opt_state сам по себе (см. _reset_router_opt_state ниже для этого) --
-    Adam-моменты для router без сброса будут "устаревшими" на первые
-    несколько шагов, что и есть корень проблемы, которую этот патч решает."""
+    """Переинициализирует ТОЛЬКО router-листья:
+       - 2D (kernel) -- случайным нормальным с stddev
+       - 0D с "temp" в имени (router_temp) -- сбрасывает на _ROUTER_TEMP_INIT (10.0)
+    """
     rng = jax.random.PRNGKey(seed)
+    _ROUTER_TEMP_INIT = 10.0  # должно совпадать с константой в moe_gmm.py
 
     def _reset_leaf(path, leaf):
         nonlocal rng
         path_str = path_to_str(path)
-        if "router" in path_str and hasattr(leaf, "shape") and leaf.ndim == 2:
-            rng, sub = jax.random.split(rng)
-            new_leaf = jax.random.normal(sub, leaf.shape, dtype=leaf.dtype) * stddev
-            print(f"[ROUTER-RESET] Переинициализирован params: {path_str}, shape={leaf.shape}")
-            return new_leaf
+        if "router" in path_str and hasattr(leaf, "shape"):
+            if leaf.ndim == 2:
+                rng, sub = jax.random.split(rng)
+                new_leaf = jax.random.normal(sub, leaf.shape, dtype=leaf.dtype) * stddev
+                print(f"[ROUTER-RESET] Переинициализирован params: {path_str}, shape={leaf.shape}")
+                return new_leaf
+            if leaf.ndim == 0 and "temp" in path_str:
+                print(f"[ROUTER-RESET] Сброшен router_temp: {path_str} -> {_ROUTER_TEMP_INIT}")
+                return jnp.array(_ROUTER_TEMP_INIT, dtype=leaf.dtype)
         return leaf
 
     return jax.tree_util.tree_map_with_path(_reset_leaf, params)
@@ -175,6 +204,40 @@ def _reset_router_opt_state(opt_state):
     return jax.tree_util.tree_map_with_path(_reset_leaf, opt_state)
 
 
+def _compatible_restore_params(mngr, step, fresh_params):
+    """ФИКС: строгий StandardRestore падает из-за структурного изменения
+    router (moe_gmm.py: router перестал быть nn.Dense{"kernel":...} и стал
+    голым self.param, плюс появился новый router_temp). Вместо строгого
+    таргета читаем сырое содержимое чекпоинта (без навязывания текущей
+    структуры) и мёрджим по путям в свежеинициализированные params --
+    несовпавшие/новые листья (router, router_temp, любые будущие
+    структурные изменения) остаются со свежей инициализацией, всё
+    остальное (GDN-2/Mamba2/MLA/эксперты/embed) восстанавливается как
+    было."""
+    raw = mngr.restore(step, args=ocp.args.StandardRestore())  # без item -> без строгого таргета
+    raw_params = raw["params"]
+
+    def merge(fresh, raw_node, path=()):
+        if isinstance(fresh, dict):
+            out = {}
+            for k, v in fresh.items():
+                if isinstance(raw_node, dict) and k in raw_node:
+                    out[k] = merge(v, raw_node[k], path + (k,))
+                else:
+                    print(f"[MERGE] новый/отсутствующий в чекпоинте лист "
+                          f"{'/'.join(map(str, path + (k,)))} -- оставляю свежую инициализацию")
+                    out[k] = v
+            return out
+        # leaf
+        if hasattr(fresh, "shape") and hasattr(raw_node, "shape") and tuple(fresh.shape) == tuple(raw_node.shape):
+            return jnp.asarray(raw_node, dtype=fresh.dtype)
+        print(f"[MERGE] несовпадение формы на {'/'.join(map(str, path))}: "
+              f"fresh={getattr(fresh, 'shape', None)} raw={getattr(raw_node, 'shape', None)} -- оставляю свежую")
+        return fresh
+
+    return merge(fresh_params, raw_params)
+
+
 def main_execution():
     ckpt_root = "/kaggle/working/orbax_checkpoints"
     latest_dir = os.path.join(ckpt_root, "latest")
@@ -190,11 +253,12 @@ def main_execution():
     FORCE_FRESH_START = False  # <-- поставьте False, чтобы вернуть обычный resume
     RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
 
-    # ФИКС (router collapse): см. докстринг модуля выше. True -- один раз,
-    # чтобы вылечить уже накопленный до чекпоинта 2000 router momentum.
-    # Поставьте False после первого успешного прогона с этим флагом --
-    # НЕ нужно сбрасывать router на каждый resume впредь.
-    RESET_ROUTER_ON_RESUME = True
+    # ФИКС (router collapse): см. докстринг модуля выше. После введения
+    # _compatible_restore_params (graft-merge) router/router_temp уже
+    # приходят свежими автоматически -- этот флаг оставлен как
+    # предупреждающий no-op, НЕ выполняет повторного сброса поверх
+    # graft-merge (см. блок restore ниже).
+    RESET_ROUTER_ON_RESUME = False
 
     if FORCE_FRESH_START:
         resume_step = None
@@ -451,19 +515,25 @@ def main_execution():
     accum_grads = zero_accum
 
     if resume and resume_step is not None:
-        print(f"[RESUME] ⬆️ Restoring step {resume_step} из 'latest'...")
+        print(f"[RESUME] ⬆️ Restoring step {resume_step} из 'latest' (совместимый merge)...")
         try:
-            restored = mngr_latest.restore(
-                resume_step,
-                args=ocp.args.StandardRestore({"params": params, "opt_state": opt_state}),
-            )
-            params = restored["params"]
-            opt_state = restored["opt_state"]
+            # 1. Восстанавливаем параметры слиянием со свежей структурой --
+            #    несовпадающие/новые листья (router, router_temp) остаются
+            #    со свежей инициализацией автоматически.
+            params_merged = _compatible_restore_params(mngr_latest, resume_step, params)
+            # 2. Применяем FSDP-шардинг (raw из restore -- хостовые массивы)
+            params = jax.device_put(params_merged, param_sharding)
+            # 3. Пересоздаём opt_state с нуля (моменты не восстанавливаем,
+            #    т.к. структура multi_transform тоже изменилась -- см.
+            #    докстринг модуля).
+            opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
+            # 4. Обнуляем аккумулятор градиентов
             accum_grads = jax.jit(
                 lambda p: jax.tree_util.tree_map(jnp.zeros_like, p),
-                out_shardings=param_sharding,
+                out_shardings=param_sharding
             )(params)
 
+            # 5. Метаданные (если есть) -- читаем из metadata.json
             meta_path = os.path.join(latest_dir, str(resume_step), "metadata.json")
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
@@ -476,6 +546,7 @@ def main_execution():
                 global_step = resume_step
             global_rng = jax.random.PRNGKey(42 + global_step)
 
+            # 6. Валидация восстановленных параметров
             param_norm = float(jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(params))))
             has_nan = any(bool(jnp.any(jnp.isnan(x))) for x in jax.tree_util.tree_leaves(params))
             print(f"[RESUME DEBUG] param_norm={param_norm:.4f}, has_nan={has_nan}")
@@ -484,23 +555,18 @@ def main_execution():
 
             print(f"[RESUME] ✅ Restored: step={global_step}, best_val={best_val_loss:.4f}, best_train={best_train_loss:.4f}")
 
-            # ФИКС (router collapse): см. докстринг модуля выше -- лечит
-            # router momentum, накопленный ДО этого чекпоинта, применяется
-            # ПОСЛЕ успешного restore, ДО того как params/opt_state пойдут
-            # в основной цикл обучения (в частности, до
-            # RESUME_OVERRIDE-пере-регистрации ниже, чтобы новый
-            # зарегистрированный шаг УЖЕ нёс сброшенный router).
+            # 7. ФИКС (router collapse): после graft-merge (_compatible_restore_params)
+            #    router.kernel/router_temp уже приходят свежими автоматически
+            #    (новые/несовпадающие по структуре листья -- merge() их не
+            #    трогает). Повторный явный сброс здесь избыточен -- оставлен
+            #    как предупреждение, а не как действие, для совместимости с
+            #    уже существующим флагом.
             if RESET_ROUTER_ON_RESUME:
-                params = _reset_router_params(params)
-                opt_state = _reset_router_opt_state(opt_state)
-                print("[ROUTER-RESET] ⚠️ Router-веса и router Adam-momentum "
-                      "переинициализированы -- ожидайте кратковременный рост "
-                      "aux_loss/z_loss/expert_util_std в первые ~100-300 шагов, "
-                      "пока router заново калибруется с нуля под текущими "
-                      "router_z_loss_coef/router_noise_std. Не забудьте выставить "
-                      "RESET_ROUTER_ON_RESUME=False после этого прогона.")
-                wandb_logging.log_metrics(global_step, {"router/reset_applied": 1})
+                print("[ROUTER-RESET] ⚠️ RESET_ROUTER_ON_RESUME=True, но после graft-merge "
+                      "router уже свежий -- пропускаю повторный явный сброс.")
+                wandb_logging.log_metrics(global_step, {"router/reset_applied": 0})
 
+            # 8. Если восстанавливали не из "latest" (override) -- перерегистрируем в latest
             if RESUME_FROM_SLOT != "latest":
                 print(f"[RESUME OVERRIDE] Перерегистрирую шаг {global_step} в mngr_latest "
                       f"(бухгалтерия CheckpointManager была в обход при копировании)...")
@@ -512,7 +578,7 @@ def main_execution():
                 print(f"[RESUME OVERRIDE] ✅ Шаг {global_step} перерегистрирован штатно.")
 
         except Exception as e:
-            print(f"[RESUME] ❌ Error: {e}. Starting fresh.")
+            print(f"[RESUME] ❌ Error during compatible restore: {e}. Starting fresh.")
             resume = False
             global_step = 0
     else:
@@ -817,6 +883,81 @@ def main_execution():
                         )
                         wandb_step_metrics["moe/expert_util_std_max"] = float(util_std_per_layer[worst_layer])
                         wandb_step_metrics["moe/expert_util_std_worst_layer"] = worst_layer
+
+                    # ФИКС (router_temp мониторинг, см. train_setup.py's ФИКС #6 --
+                    # decoupled decay защищает от runaway структурно, но нужна
+                    # видимость самого значения в W&B, чтобы подтвердить на
+                    # реальных данных, что decay реально держит router_temp у
+                    # ROUTER_TEMP_INIT=10.0, а не только полагаться на клип
+                    # [1,15]/отсутствие NaN. router_temp -- один скаляр-параметр
+                    # НА КАЖДЫЙ GmmMoEJ-блок (не глобальный), поэтому логируем
+                    # и агрегаты (mean/max/worst_layer), и разбивку по слоям --
+                    # тот же "не upstream-ить ещё одну слепую зону" урок, что
+                    # уже применён для expert_util_std_worst_layer выше (там
+                    # ранее один и тот же слой "застревал" худшим несколько
+                    # сотен шагов подряд, что и было первым признаком router
+                    # collapse -- по слойный router_temp даёт то же самое
+                    # раннее предупреждение для этого конкретного механизма).
+                    if aux_info.get("router_temp") is not None:
+                        rt = jax.device_get(aux_info["router_temp"])
+                        worst_temp_layer = int(rt.argmax())
+                        print(
+                            f"           router_temp: mean={rt.mean():.4f} "
+                            f"min={rt.min():.4f} max={rt.max():.4f} (worst_layer={worst_temp_layer})"
+                        )
+                        wandb_step_metrics["moe/router_temp_mean"] = float(rt.mean())
+                        wandb_step_metrics["moe/router_temp_min"] = float(rt.min())
+                        wandb_step_metrics["moe/router_temp_max"] = float(rt.max())
+                        wandb_step_metrics["moe/router_temp_worst_layer"] = worst_temp_layer
+                        for i, v in enumerate(rt):
+                            wandb_step_metrics[f"moe/router_temp_layer{i}"] = float(v)
+                    if aux_info.get("min_col_norm") is not None:
+                        col_norms = jax.device_get(aux_info["min_col_norm"])
+                        worst_col_layer = int(col_norms.argmin())
+                        print(
+                            f"           min router column norm (min over layers, layer {worst_col_layer}): "
+                            f"{col_norms[worst_col_layer]:.6f}  (watch for drift toward 0)"
+                        )
+                        wandb_step_metrics["moe/min_col_norm_worst"] = float(col_norms[worst_col_layer])
+                        if col_norms[worst_col_layer] < 1e-3:
+                            print(f"[MOE-DIAG] ⚠️ router column near-collapse on layer {worst_col_layer} "
+                                  f"at global_step={global_step}: min_col_norm={col_norms[worst_col_layer]:.6e}")
+                            wandb_logging.log_alert(
+                                "Router column near-collapse",
+                                f"layer={worst_col_layer} min_col_norm={col_norms[worst_col_layer]:.6e} "
+                                f"at global_step={global_step}.", level="WARN",
+                            )
+
+                    if aux_info.get("max_abs_logit_preclip") is not None:
+                        max_logits = jax.device_get(aux_info["max_abs_logit_preclip"])
+                        worst_logit_layer = int(max_logits.argmax())
+                        print(
+                            f"           max|router logit| pre-clip (max over layers, layer {worst_logit_layer}): "
+                            f"{max_logits[worst_logit_layer]:.3f}  (clip is at ±8)"
+                        )
+                        wandb_step_metrics["moe/max_abs_logit_preclip_worst"] = float(max_logits[worst_logit_layer])
+                        if max_logits[worst_logit_layer] > 12.0:
+                            print(f"[MOE-DIAG] ⚠️ router logits far past clip on layer {worst_logit_layer} "
+                                  f"at global_step={global_step}: max|logit|={max_logits[worst_logit_layer]:.3f} "
+                                  f"(clip=±8) -- router is being saturated hard, worth investigating even "
+                                  f"though the clip itself keeps it numerically safe.")
+                    if aux_info.get("norm_x_mean") is not None:
+                        norm_means = jax.device_get(aux_info["norm_x_mean"])
+                        norm_maxes = jax.device_get(aux_info["norm_x_max"])
+                        norm_mins = jax.device_get(aux_info["norm_x_min"])
+                        # агрегаты по слоям (среднее по слоям для каждого показателя)
+                        mean_all = float(norm_means.mean())
+                        max_all = float(norm_maxes.max())
+                        min_all = float(norm_mins.min())
+                        print(
+                            f"           ||x|| (L2 norm per token): mean={mean_all:.3f}, "
+                            f"max={max_all:.3f}, min={min_all:.3f}"
+                        )
+                        wandb_step_metrics["moe/norm_x_mean"] = mean_all
+                        wandb_step_metrics["moe/norm_x_max"] = max_all
+                        wandb_step_metrics["moe/norm_x_min"] = min_all
+                        # дополнительно можно логировать по-слойно, но для начала достаточно агрегатов
+                            
                     if aux_info.get("moe_dropped_ratio") is not None:
                         dropped = jax.device_get(aux_info["moe_dropped_ratio"])
                         worst_drop_layer = int(dropped.argmax())
@@ -945,5 +1086,4 @@ def main_execution():
 
 
 if __name__ == "__main__":
-    GDN2_FWD_DIAG=1
     main_execution()
