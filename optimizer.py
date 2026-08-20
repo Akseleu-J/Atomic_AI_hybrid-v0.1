@@ -308,7 +308,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss)
     if return_aux:
         aux_info = {
-        aux_info = {
             "ce_loss": ce_loss,
             "aux_loss": aux_loss,
             "z_loss": z_loss,
