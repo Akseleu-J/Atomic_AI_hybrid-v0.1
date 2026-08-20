@@ -187,7 +187,9 @@ _ROUTER_TEMP_INIT = 10.0
 import os
 
 _MOE_FWD_DIAG = os.environ.get("GDN2_FWD_DIAG", "0") == "1"
-
+def _safe_normalize(t, eps=1e-6):
+    """L2-нормализация по последней оси (по строкам)."""
+    return t * jax.lax.rsqrt(jnp.sum(t * t, axis=-1, keepdims=True) + eps)
 
 def _moe_grad_sanitizer(tag: str, clip_val: float = 1e3):
     """Local copy of model.py's make_grad_sanitizer (same reasoning
@@ -375,6 +377,7 @@ class GmmMoEJ(nn.Module):
         # per real MoE block, not a single shared one.
         _moe_tag = "/".join(str(p) for p in self.scope.path) if self.scope is not None else "moe"
         flat_x_for_router = _moe_grad_sanitizer(f"moe_router_input_grad_{_moe_tag}")(flat_x)
+        
         # ---- новая диагностика: ||flat_x|| (по строкам) ----
         _norm_per_token = jnp.linalg.norm(flat_x_for_router, axis=1, keepdims=False)
         self.sow("losses", "norm_x_mean", jnp.mean(_norm_per_token))
@@ -416,10 +419,11 @@ class GmmMoEJ(nn.Module):
             "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
         )
         router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
+        # ФИКС (router saturation): нормируем вход по L2, чтобы logit ∈ [-temp, temp]
+        flat_x_normed_for_router = _safe_normalize(flat_x_for_router.astype(jnp.float32))
         router_logits = jnp.dot(
-            flat_x_for_router.astype(jnp.float32), router_kernel_normed, precision=jax.lax.Precision.HIGHEST
+        flat_x_normed_for_router, router_kernel_normed, precision=jax.lax.Precision.HIGHEST
         ) * router_temp_clipped
-
         # ФИКС (live diagnostics, forward side): capture pre-clip logit
         # magnitude and pre-normalization column norm BEFORE the existing
         # narrow clip/sanitize -- these are the two forward-side
