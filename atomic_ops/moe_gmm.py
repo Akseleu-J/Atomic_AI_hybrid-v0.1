@@ -415,9 +415,21 @@ class GmmMoEJ(nn.Module):
         router_kernel_normed = router_kernel * jax.lax.rsqrt(
             jnp.sum(router_kernel ** 2, axis=0, keepdims=True) + 1e-6
         )
-        router_temp = self.param(
-            "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
-        )
+
+        # ДОБАВИТЬ: штраф за схожесть направлений экспертов (router_max_cos=0.96 —
+        # это и есть измеренное этим членом). Считаем только off-diagonal Грам-матрицу.
+        gram = jnp.dot(router_kernel_normed.T, router_kernel_normed,
+                        precision=jax.lax.Precision.HIGHEST)  # (E_routed, E_routed), диагональ ~1.0
+        eye = jnp.eye(E_routed, dtype=gram.dtype)
+        off_diag_sq = jnp.square(gram - eye) * (1.0 - eye)   # обнулить диагональ явно
+        router_collinearity = jnp.sum(off_diag_sq) / (E_routed * (E_routed - 1))
+        self.sow("losses", "router_collinearity", router_collinearity)
+
+        _max_cos_offdiag = jnp.max(jnp.abs(gram - eye))       # тот же max_cos, что вы мерили офлайн
+        self.sow("losses", "router_max_cos", _max_cos_offdiag)
+                router_temp = self.param(
+                    "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
+                )
         router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
         # ФИКС (router saturation): нормируем вход по L2, чтобы logit ∈ [-temp, temp]
         flat_x_normed_for_router = _safe_normalize(flat_x_for_router.astype(jnp.float32))
