@@ -253,22 +253,32 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
         print(f"[HF] ❌ Upload error ({repo_subdir}): {e}")
 
 
-def download_slot(local_dir, repo_subdir):
+def download_slot(local_dir, repo_subdir, repo_id=None, repo_type="model"):
     """Скачивает все шаги указанного слота с HF в local_dir. Возвращает
-    максимальный найденный локально номер шага (или None)."""
+    максимальный найденный локально номер шага (или None).
+
+    ФИКС: repo_id/repo_type теперь параметры, а не жёстко HF_REPO_ID/"model".
+    Нужно для случаев, когда чекпоинт лежит в ДРУГОМ репо или с другим
+    repo_type (например "dataset", если чекпоинт когда-то заливался как
+    Kaggle/HF dataset, а не model repo) -- раньше download_slot молча искал
+    только в HF_REPO_ID/model и ничего не находил, без единого сообщения
+    о том, что искал не там."""
     if not _HAS_HF:
         return None
+    target_repo = repo_id if repo_id is not None else HF_REPO_ID
     try:
-        print(f"[HF] Downloading slot '{repo_subdir}' from {HF_REPO_ID}...")
+        print(f"[HF] Downloading slot '{repo_subdir}' from {target_repo} (repo_type={repo_type})...")
         os.makedirs(local_dir, exist_ok=True)
         snapshot_download(
-            repo_id=HF_REPO_ID,
+            repo_id=target_repo,
             local_dir=local_dir,
-            repo_type="model",
+            repo_type=repo_type,
             allow_patterns=[f"{repo_subdir}/**"],
         )
         src_root = os.path.join(local_dir, repo_subdir)
         if not os.path.isdir(src_root):
+            print(f"[HF] ⚠️ Слот '{repo_subdir}' не найден в {target_repo} (repo_type={repo_type}) -- "
+                  f"проверьте имя репо/тип, или что путь внутри репо действительно называется '{repo_subdir}'.")
             return None
         for step_name in os.listdir(src_root):
             src = os.path.join(src_root, step_name)
@@ -282,5 +292,5 @@ def download_slot(local_dir, repo_subdir):
         print(f"[HF] Slot '{repo_subdir}': найден шаг {latest}")
         return latest
     except Exception as e:
-        print(f"[HF] Download failed для слота '{repo_subdir}': {e}")
+        print(f"[HF] Download failed для слота '{repo_subdir}' в {target_repo} (repo_type={repo_type}): {e}")
         return None
