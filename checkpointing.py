@@ -213,14 +213,14 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
         return
     try:
         api = HfApi(token=HF_TOKEN)
-        create_repo(HF_REPO_ID, repo_type="bucket", exist_ok=True)
+        create_repo(HF_REPO_ID, repo_type="model", exist_ok=True)
         st_path = os.path.join(step_dir, "STATUS.txt")
         with open(st_path, "w") as f:
             f.write(f"IDLE: slot={repo_subdir} last_step={step} | t={time.time()}\n")
         upload_folder(
             folder_path=step_dir,
             repo_id=HF_REPO_ID,
-            repo_type="bucket",
+            repo_type="model",
             path_in_repo=f"{repo_subdir}/{step}",
             commit_message=f"[{repo_subdir}] step {step} {msg}",
         )
@@ -242,7 +242,7 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
                     api.delete_folder(
                         path_in_repo=f"{repo_subdir}/{old_step}",
                         repo_id=HF_REPO_ID,
-                        repo_type="bucket",
+                        repo_type="model",
                     )
                     print(f"[HF] 🗑️ [{repo_subdir}] удалён старый шаг: {old_step}")
                 except Exception as e_del:
@@ -264,7 +264,7 @@ def download_slot(local_dir, repo_subdir):
         snapshot_download(
             repo_id=HF_REPO_ID,
             local_dir=local_dir,
-            repo_type="bucket",
+            repo_type="model",
             allow_patterns=[f"{repo_subdir}/**"],
         )
         src_root = os.path.join(local_dir, repo_subdir)
