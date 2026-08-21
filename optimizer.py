@@ -253,7 +253,7 @@ def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=2
 
 
 def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, deterministic=False, return_aux=False,
-                  ce_chunk_size=256):
+                  ce_chunk_size=256, collinearity_coef=None):
     input_ids = batch["input_ids"]
     labels = batch["labels"]
 
