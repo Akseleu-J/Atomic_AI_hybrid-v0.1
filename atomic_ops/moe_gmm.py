@@ -427,9 +427,9 @@ class GmmMoEJ(nn.Module):
 
         _max_cos_offdiag = jnp.max(jnp.abs(gram - eye))       # тот же max_cos, что вы мерили офлайн
         self.sow("losses", "router_max_cos", _max_cos_offdiag)
-                router_temp = self.param(
-                    "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
-                )
+        router_temp = self.param(
+            "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
+        )
         router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
         # ФИКС (router saturation): нормируем вход по L2, чтобы logit ∈ [-temp, temp]
         flat_x_normed_for_router = _safe_normalize(flat_x_for_router.astype(jnp.float32))
