@@ -307,6 +307,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         collinearity_loss = jnp.sum(jnp.stack(router_collinearities)) if router_collinearities else 0.0
         # Для логирования в W&B: возьмём максимум по слоям, чтобы видеть наихудший случай
         router_max_cos_per_layer = jnp.stack(router_max_cos_list) if router_max_cos_list else None
+        # Вычисляем максимум по слоям для мониторинга в проде
+        router_max_cos = jnp.max(router_max_cos_per_layer) if router_max_cos_per_layer is not None else 0.0
         if norm_x_mean:
             norm_x_mean_stacked = jnp.stack(norm_x_mean)
         if norm_x_max:
@@ -347,6 +349,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "norm_x_max": norm_x_max_stacked,     # NEW
             "norm_x_min": norm_x_min_stacked,     # NEW
             "router_max_cos_per_layer": router_max_cos_per_layer,
+            "router_max_cos": router_max_cos,
             "collinearity_coef_used": _collinearity_coef,
             "collinearity_loss": collinearity_loss,
         }
