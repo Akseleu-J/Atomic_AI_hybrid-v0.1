@@ -350,8 +350,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "norm_x_min": norm_x_min_stacked,     # NEW
             "router_max_cos_per_layer": router_max_cos_per_layer,
             "router_max_cos": router_max_cos,
-            "collinearity_coef_used": _collinearity_coef,
-            "collinearity_loss": collinearity_loss,
         }
         return total_loss, aux_info
     return total_loss
