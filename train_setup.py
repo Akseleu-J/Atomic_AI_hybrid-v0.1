@@ -345,6 +345,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 rngs={"dropout": r},
                 deterministic=False, return_aux=True,
                 ce_chunk_size=2048,
+                collinearity_coef=collinearity_coef,
             )
         (loss, aux_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
         new_accum = jax.tree_util.tree_map(lambda a, g: a + g, accum_grads, grads)
@@ -424,6 +425,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "norm_x_max": NamedSharding(mesh, P(None)),
         "norm_x_min": NamedSharding(mesh, P(None)),
         "router_max_cos_per_layer": NamedSharding(mesh, P()),
+        "collinearity_coef_used": NamedSharding(mesh, P()),
+        "collinearity_loss": NamedSharding(mesh, P()),
     }
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
