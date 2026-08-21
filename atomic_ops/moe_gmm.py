@@ -478,6 +478,7 @@ class GmmMoEJ(nn.Module):
         # load-balancing loss смотрит на распределение по ВСЕМ экспертам,
         # не только выбранным), а не по факту 2T-дисптача.
         full_probs = jax.nn.softmax(router_logits, axis=-1)
+        full_probs = jnp.nan_to_num(full_probs, nan=0.0, posinf=0.0, neginf=0.0)
         mean_probs = jnp.mean(full_probs, axis=0)
         self.sow("losses", "aux_loss", E_routed * jnp.sum(mean_probs * mean_probs))
         self.sow("losses", "z_loss", jnp.mean(jnp.square(
