@@ -7,7 +7,7 @@ import optax
 from model import ModelConfig
 from utils import collect_by_leaf_name, path_to_str
 
-ROUTER_COLLINEARITY_COEF = 0.02  # стартовое значение, требует калибровки — см. ниже
+ROUTER_COLLINEARITY_COEF = 0.08  # стартовое значение, требует калибровки — см. ниже
 
 # ДИАГНОСТИКА (2-й уровень, backward-only): см. аналогичную в model.py.
 # Здесь отдельная копия, чтобы не тянуть зависимость optimizer.py -> model.py
