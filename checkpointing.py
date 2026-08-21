@@ -253,18 +253,42 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
         print(f"[HF] ❌ Upload error ({repo_subdir}): {e}")
 
 
-def download_slot(local_dir, repo_subdir, repo_id=None, repo_type="model"):
-    """Скачивает все шаги указанного слота с HF в local_dir. Возвращает
-    максимальный найденный локально номер шага (или None).
+from huggingface_hub import (
+    HfApi, snapshot_download, upload_folder, create_repo, login,
+    sync_bucket,   # ФИКС: buckets -- отдельное объектное хранилище (hf://buckets/...),
+)                  # НЕ repo (model/dataset/space) -- snapshot_download никогда не найдёт
+                    # то, что лежит в бакете, независимо от repo_type. Нужен отдельный API.
 
-    ФИКС: repo_id/repo_type теперь параметры, а не жёстко HF_REPO_ID/"model".
-    Нужно для случаев, когда чекпоинт лежит в ДРУГОМ репо или с другим
-    repo_type (например "dataset", если чекпоинт когда-то заливался как
-    Kaggle/HF dataset, а не model repo) -- раньше download_slot молча искал
-    только в HF_REPO_ID/model и ничего не находил, без единого сообщения
-    о том, что искал не там."""
+
+def download_slot(local_dir, repo_subdir, repo_id=None, repo_type="model", bucket_id=None):
+    """Скачивает слот. Если bucket_id задан -- игнорирует repo_id/repo_type
+    полностью и качает из HF Bucket (hf://buckets/{bucket_id}/{repo_subdir})
+    через sync_bucket, а не snapshot_download (buckets -- НЕ git-репо, у них
+    нет repo_type=model/dataset/space -- это была причина, по которой
+    любой repo_type молча ничего не находил для бакета)."""
     if not _HAS_HF:
         return None
+
+    if bucket_id is not None:
+        try:
+            bucket_path = f"hf://buckets/{bucket_id}/{repo_subdir}"
+            print(f"[HF] Downloading slot '{repo_subdir}' from BUCKET {bucket_path}...")
+            os.makedirs(local_dir, exist_ok=True)
+            sync_bucket(bucket_path, local_dir)
+            items = [d for d in os.listdir(local_dir) if d.isdigit()]
+            if not items:
+                print(f"[HF] ⚠️ Слот '{repo_subdir}' не найден в bucket {bucket_id} -- "
+                      f"проверьте, что путь внутри бакета действительно называется "
+                      f"'{repo_subdir}/<step>/...'.")
+                return None
+            latest = max(int(d) for d in items)
+            print(f"[HF] Bucket slot '{repo_subdir}': найден шаг {latest}")
+            return latest
+        except Exception as e:
+            print(f"[HF] Bucket download failed для слота '{repo_subdir}' (bucket={bucket_id}): {e}")
+            return None
+
+    # ---- старый путь: обычный git-репо (model/dataset/space) ----
     target_repo = repo_id if repo_id is not None else HF_REPO_ID
     try:
         print(f"[HF] Downloading slot '{repo_subdir}' from {target_repo} (repo_type={repo_type})...")
@@ -277,8 +301,7 @@ def download_slot(local_dir, repo_subdir, repo_id=None, repo_type="model"):
         )
         src_root = os.path.join(local_dir, repo_subdir)
         if not os.path.isdir(src_root):
-            print(f"[HF] ⚠️ Слот '{repo_subdir}' не найден в {target_repo} (repo_type={repo_type}) -- "
-                  f"проверьте имя репо/тип, или что путь внутри репо действительно называется '{repo_subdir}'.")
+            print(f"[HF] ⚠️ Слот '{repo_subdir}' не найден в {target_repo} (repo_type={repo_type}).")
             return None
         for step_name in os.listdir(src_root):
             src = os.path.join(src_root, step_name)
