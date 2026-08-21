@@ -437,6 +437,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             {"input_ids": data_sharding, "labels": data_sharding},
             NamedSharding(mesh, P(None)),
             param_sharding,
+            NamedSharding(mesh, P()),   # <-- для collinearity_coef (скаляр)
         ),
         out_shardings=(
             param_sharding,
@@ -471,7 +472,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     compiled_val = jax.jit(
         distributed_val_step,
         in_shardings=(param_sharding, {"input_ids": data_sharding, "labels": data_sharding}),
-        out_shardings=NamedSharding(mesh, P()),
+        out_shardings=NamedSharding(mesh, P()), 
     )
 
     return (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
