@@ -220,7 +220,7 @@ def upload_slot(local_dir, repo_subdir, step, msg="", keep_last_n=1):
         upload_folder(
             folder_path=step_dir,
             repo_id=HF_REPO_ID,
-            repo_type="model",
+            repo_type="bucket",
             path_in_repo=f"{repo_subdir}/{step}",
             commit_message=f"[{repo_subdir}] step {step} {msg}",
         )
