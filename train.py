@@ -589,7 +589,7 @@ def main_execution():
         file_pairs, micro_batch_size, data_sharding, seq_len=seq_len,
         dataset_fraction=DATASET_FRACTION, fraction_seed=DATASET_FRACTION_SEED,
         skip_batches=skip_micro_steps,
-        mode="mixed",
+        mode="round_robin",
     )
 
     _dummy_batch = {
@@ -941,6 +941,17 @@ def main_execution():
                                 "Router column near-collapse",
                                 f"layer={worst_col_layer} min_col_norm={col_norms[worst_col_layer]:.6e} "
                                 f"at global_step={global_step}.", level="WARN",
+                            )
+                    if aux_info.get("router_max_cos") is not None:
+                        max_cos = jax.device_get(aux_info["router_max_cos"])
+                        worst_cos_layer = int(max_cos.argmax())
+                        print(f"           router_max_cos (max over layers, layer {worst_cos_layer}): {max_cos[worst_cos_layer]:.4f}")
+                        wandb_step_metrics["moe/router_max_cos_worst"] = float(max_cos[worst_cos_layer])
+                        if max_cos[worst_cos_layer] > 0.85:
+                            wandb_logging.log_alert(
+                                "Router collinearity high",
+                                f"layer={worst_cos_layer} max_cos={max_cos[worst_cos_layer]:.4f} at step={global_step}",
+                                level="WARN",
                             )
 
                     if aux_info.get("max_abs_logit_preclip") is not None:
