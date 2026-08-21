@@ -330,9 +330,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     # opt_state. Обучение продолжится с плохим loss — это сигнал смотреть
     # предыдущие шаги, но не убивает процесс.
     ce_loss = jnp.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=0.0)
-
+    _collinearity_coef = collinearity_coef if collinearity_coef is not None else ROUTER_COLLINEARITY_COEF
     total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss) \
-                 + (ROUTER_COLLINEARITY_COEF * collinearity_loss)
+                 + (_collinearity_coef * collinearity_loss)
     if return_aux:
         aux_info = {
             "ce_loss": ce_loss,
@@ -347,6 +347,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "norm_x_max": norm_x_max_stacked,     # NEW
             "norm_x_min": norm_x_min_stacked,     # NEW
             "router_max_cos_per_layer": router_max_cos_per_layer,
+            "collinearity_coef_used": _collinearity_coef,
+            "collinearity_loss": collinearity_loss,
         }
         return total_loss, aux_info
     return total_loss
