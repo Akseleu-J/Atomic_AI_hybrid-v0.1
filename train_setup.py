@@ -338,7 +338,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             **kwargs
         )
 
-    def distributed_train_step_micro(p, s, b, r, accum_grads):
+    def distributed_train_step_micro(p, s, b, r, accum_grads, collinearity_coef=None):
         def loss_fn(param):
             return compute_loss(
                 param, model_apply_wrapped, b, config,
