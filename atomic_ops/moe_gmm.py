@@ -510,6 +510,12 @@ class GmmMoEJ(nn.Module):
         # перенормированным гейтом). Порядок по оси-k сохраняется через
         # concatenate -- используется для обратного split на combine.
         # ==================================================================
+        
+        _assign_counts = jnp.zeros((E_routed,), dtype=jnp.float32)
+        for j in range(k):
+            _assign_counts = _assign_counts + jnp.sum(jax.nn.one_hot(top_idx[:, j], E_routed), axis=0)
+        _assignment_frac = _assign_counts / (T * k)
+        self.sow("losses", "assignment_frac", _assignment_frac)
         def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
             T_rep = flat_x_local.shape[0]  # = k * T_local_device
             group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
