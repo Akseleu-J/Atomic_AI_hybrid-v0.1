@@ -184,7 +184,7 @@ from optimizer import ROUTER_COLLINEARITY_COEF
 #     (repo_id из Kaggle secret HF_REPO_ID) — upload_slot() это уже делает,
 #     трогать не нужно.
 # ==========================================================================
-RESUME_SOURCE = "bucket"     # "bucket" | "hf_model" | "local_only"
+RESUME_SOURCE = "hf_model"     # "bucket" | "hf_model" | "local_only"
 RESUME_BUCKET_ID = "atomic-ai-labs/atomic-light-v0.5-bucket"   # <-- ваш реальный bucket id
 RESUME_BUCKET_SUBDIR = "best_train"# <-- какой слот внутри бакета
 
@@ -309,7 +309,7 @@ def main_execution():
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
     FORCE_FRESH_START = False  # <-- поставьте False, чтобы вернуть обычный resume
-    RESUME_FROM_SLOT = "best_train"  # <-- используется только если FORCE_FRESH_START=False
+    RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
 
     # ФИКС (router collapse): см. докстринг модуля выше. После введения
     # _compatible_restore_params (graft-merge) router/router_temp уже
@@ -658,7 +658,11 @@ def main_execution():
         file_pairs, micro_batch_size, data_sharding, seq_len=seq_len,
         dataset_fraction=DATASET_FRACTION, fraction_seed=DATASET_FRACTION_SEED,
         skip_batches=skip_micro_steps,
-        mode="round_robin",
+        mode="mixed",  # ФИКС: было "round_robin" -- переход на пропорциональный
+                         # размеру источника сэмплинг, устраняет ~6x переупотребление
+                         # kodcode относительно его естественной доли (2.7% пула).
+                         # round_robin давал каждому источнику равную частоту (16.7%)
+                         # независимо от размера -- см. чат/train_setup.py докстринг.
     )
 
     _dummy_batch = {
