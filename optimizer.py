@@ -31,7 +31,14 @@ def make_grad_probe(tag: str):
 
     _probe.defvjp(_fwd, _bwd)
     return _probe
+def _frozen_step():
+    def init_fn(params):
+        return optax.EmptyState()
+    def update_fn(updates, state, params=None):
+        return jax.tree_util.tree_map(jnp.zeros_like, updates), state
+    return optax.GradientTransformation(init_fn, update_fn)
 
+tx_frozen = _frozen_step()
 
 # ==========================================
 # Muon (Newton-Schulz orthogonalization)
@@ -84,11 +91,19 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         boundaries=[warmup_steps],
     )
 
-    RESUME_BACKOFF_STEPS = 5000
-    RESUME_LR_SCALE = 0.7  # -30% на раннем участке после resume
-
     def resume_backoff(step):
-        return jnp.where(step < RESUME_BACKOFF_STEPS, RESUME_LR_SCALE, 1.0)
+        # ФИКС: было jnp.where(step < RESUME_BACKOFF_STEPS, RESUME_LR_SCALE, 1.0) --
+        # мгновенный скачок LR в 1/0.7≈1.43x РОВНО на step=RESUME_BACKOFF_STEPS.
+        # opt_state пересоздаётся с нуля при КАЖДОМ resume (train.py), т.е. этот
+        # скачок происходит не один раз за всё обучение, а при каждой достаточно
+        # долгой сессии после resume -- вероятный источник наблюдаемых burst-
+        # эпизодов на router-группе параметров (router в adamw_nodecay, единственной
+        # группе с resume_backoff). Линейная рампа на последних 1000 шагов убирает
+        # разрыв, сохраняя тот же итоговый диапазон [0.7, 1.0].
+        RAMP_STEPS = 1000.0
+        ramp_start = RESUME_BACKOFF_STEPS - RAMP_STEPS
+        frac = jnp.clip((step - ramp_start) / RAMP_STEPS, 0.0, 1.0)
+        return RESUME_LR_SCALE + (1.0 - RESUME_LR_SCALE) * frac
 
     lion_lr = lambda step: 3e-4 * lr_schedule(step) * resume_backoff(step)
     adamw_lr = lambda step: 1e-3 * lr_schedule(step) * resume_backoff(step)    
@@ -151,6 +166,8 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         # сбалансирован), где ошибка маршрутизации дороже всего. AdamW без
         # decay -- мягче и предсказуемее для этого конкретного слоя, тот же
         # выбор, что уже сделан для norm/bias.
+        if "expert_bias" in path_str:
+            return "frozen"
         if "router" in path_str:
             return "adamw_nodecay"
         if param.ndim >= 2:
@@ -172,7 +189,8 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     # чекпоинтов.
     clip_tx = optax.clip_by_global_norm(0.35)
     multi_tx = optax.multi_transform(
-        {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay, "adamw_nodecay": tx_adamw_nodecay},
+        {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay,
+         "adamw_nodecay": tx_adamw_nodecay, "frozen": tx_frozen},
         label_fn,
     )
     tx = optax.chain(clip_tx, multi_tx)
