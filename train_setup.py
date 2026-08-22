@@ -102,6 +102,62 @@ decay_rate=0.05 был чуть быстрее (шаг 31) без видимог
 реальных данных по сравнению с безшумным синтетическим тестом --
 пересмотреть только если 0.02 окажется слишком медленным для удержания
 роста на реальных TPU-прогонах.
+
+ФИКС #7 (этот пасс -- bias-балансировка экспертов, DeepSeek-V3 style, см.
+test_synthetic_router_bias_balancing.py v2 в чате): GmmMoEJ's expert_bias
+(atomic_ops/moe_gmm.py) добавлен для влияния ТОЛЬКО на top-k ОТБОР
+(router_logits_biased = router_logits + stop_gradient(expert_bias)), но
+до этого фикса он был помечен "frozen" в optimizer.py's _label_leaf и
+никем не обновлялся -- застревал на нуле навсегда, механизм был вайрен,
+но никогда не срабатывал.
+
+Синтетический тест (v2, исправленный после первого провала -- см. чат:
+v1 мерил std(mean_probs), полный softmax, который bias по дизайну не
+затрагивает, поэтому улучшение было гарантированно 1.00x независимо от
+реализации; правильная метрика -- std ФАКТИЧЕСКОЙ частоты top-k-назначений,
+то, что реально становится gmm's group_sizes) подтвердил 11.24x улучшение
+std(assignment_frac) при реалистичном коллапсе (общее направление в
+данных, коррелирующее с направлением одного эксперта -- имитация
+"схлопнутого" residual stream на раннем шаге/слое, аналог вашей
+block_0/layer_0 гипотезы).
+
+Механизм здесь -- ТОТ ЖЕ decoupled-паттерн, что уже отработан для
+router_temp (apply_router_temp_decay) и Muon weight decay: обновление
+ПОСЛЕ optax.apply_updates, НЕ через градиент/loss (у DeepSeek-V3 это
+принципиально -- при уже насыщенных логитах градиент через softmax
+затухает, а bias-обновление по фактическим частотам работает независимо
+от насыщения). "expert_bias" остаётся "frozen" в optimizer.py -- нулевой
+градиентный вклад гарантирован там, здесь применяется отдельный
+знаковый шаг по РЕАЛЬНОЙ частоте назначений (assignment_frac,
+optimizer.py's compute_loss/aux_info), не по мягкому softmax.
+
+ВАЖНОЕ ДОПУЩЕНИЕ (порядок листьев): _build_expert_bias_index_map ниже
+присваивает каждому expert_bias-параметру статический индекс СТРОГО в
+порядке обхода params-pytree (tree_map_with_path). assignment_frac_stacked
+(из optimizer.py's compute_loss, собран через collect_by_leaf_name над
+sowed_vars["losses"]) идёт в порядке обхода ДЕРЕВА МОДУЛЕЙ flax (то есть
+порядка объявления block_0, block_1, ... в FullHybridMoEModel). Оба обхода
+идут по одному и тому же дереву блоков в одном и том же порядке
+объявления -- см. model.py: BlockDAR блоки создаются циклом
+`for block_idx in range(num_blocks)` строго по возрастанию, и
+GmmMoEJ -- единственный источник И expert_bias-параметра, И
+assignment_frac-sow внутри каждого блока, так что тождественность порядка
+гарантирована структурой самого model.py, а не совпадением. Если в
+будущем появится более одного MoE-блока на BlockDAR или порядок
+объявления субмодулей изменится -- эту гарантию нужно перепроверить.
+
+ВАЖНО (интеграция в train.py): apply_expert_bias_update требует
+`assignment_frac_stacked` -- агрегат (обычно среднее) по всем микрошагам
+ОДНОГО эффективного шага, той же формы, что compute_loss's
+aux_info["assignment_frac"] (n_moe_layers, E_routed). Простейший вариант
+интеграции в train.py -- усреднить `aux_info["assignment_frac"]` по
+accum_steps микрошагам (host-side, как и остальная диагностика в
+train.py) и передать усреднённый jnp-массив ШЕСТЫМ (новым) позиционным
+аргументом в compiled_apply, ровно тем же способом, каким
+collinearity_coef_arr уже передаётся в compiled_train_micro -- см.
+train.py's докстринг "ФИКС (pjit in_shardings length mismatch...)" для
+образца того же паттерна. compiled_apply's in_shardings/out_shardings
+ниже уже обновлены под этот новый аргумент.
 """
 from __future__ import annotations
 
@@ -164,6 +220,79 @@ def apply_router_temp_decay(new_params, decay_map):
         lambda p, rate: p - rate * (p - ROUTER_TEMP_INIT),
         new_params, decay_map,
     )
+
+
+# ==========================================================================
+# ФИКС #7 (bias-балансировка экспертов, DeepSeek-V3 style) -- см. докстринг
+# модуля выше для полного обоснования (test_synthetic_router_bias_balancing.py
+# v2: 11.24x улучшение std ФАКТИЧЕСКОЙ частоты назначений при реалистичном
+# коллапсе, при том что старая метрика std(mean_probs) корректно остаётся
+# плоской -- это не баг, bias по дизайну не входит в full softmax).
+# ==========================================================================
+EXPERT_BIAS_GAMMA = 0.02  # тот же порядок величины, что ROUTER_TEMP_DECAY_RATE,
+                           # намеренно для сопоставимости; см. синтетический
+                           # тест для калибровки, если 0.02 окажется
+                           # слишком медленным/быстрым на реальных данных.
+
+
+def _build_expert_bias_index_map(abstract_params):
+    """Присваивает каждому expert_bias-листу СТАТИЧЕСКИЙ (Python int, не
+    jnp-массив) индекс, в порядке обхода params-pytree через
+    tree_map_with_path -- см. докстринг модуля, раздел "ВАЖНОЕ ДОПУЩЕНИЕ",
+    почему этот порядок должен совпадать с порядком строк
+    assignment_frac_stacked, собранного в optimizer.py's compute_loss.
+    Всем остальным листьям присваивается -1 (маркер "не трогать").
+    Возвращает pytree ТОЙ ЖЕ ФОРМЫ, что abstract_params, с Python int
+    (не traced) на каждом листе -- безопасно использовать внутри
+    jax.tree_util.tree_map с обычным Python if внутри leaf-функции
+    (тот же паттерн, что _decay_scale_leaf/_router_scale_leaf уже
+    используют для статичных, нетрейсящихся карт)."""
+    counter = {"i": 0}
+
+    def _mark(path, leaf):
+        path_str = path_to_str(path)
+        if "expert_bias" in path_str and hasattr(leaf, "shape"):
+            idx = counter["i"]
+            counter["i"] += 1
+            return idx
+        return -1
+
+    return jax.tree_util.tree_map_with_path(_mark, abstract_params)
+
+
+def apply_expert_bias_update(new_params, bias_index_map, assignment_frac_stacked, gamma=EXPERT_BIAS_GAMMA):
+    """Decoupled, вне градиента (см. докстринг модуля) обновление
+    expert_bias-листьев по правилу DeepSeek-V3: перегруженный (частота
+    назначений выше равномерной 1/E_routed) эксперт получает
+    ОТРИЦАТЕЛЬНУЮ поправку (менее вероятен при следующем top-k отборе),
+    недогруженный -- положительную. Применяется ПОСЛЕ optax.apply_updates
+    и ПОСЛЕ клипа параметров ±1e2 -- тот же порядок, что
+    apply_router_temp_decay, никакого конфликта (expert_bias типично в
+    диапазоне [-N,N] для малых N, далеко от клипа).
+
+    new_params: params ПОСЛЕ apply_updates/clip.
+    bias_index_map: pytree той же формы, что new_params, из
+        _build_expert_bias_index_map (Python int per leaf, -1 = no-op).
+    assignment_frac_stacked: (n_moe_layers, E_routed) jnp-массив -- см.
+        докстринг модуля "ВАЖНО (интеграция в train.py)" про то, как это
+        значение должно быть получено на стороне train.py (агрегат по
+        микрошагам одного эффективного шага).
+    """
+    if assignment_frac_stacked is None:
+        # Нечего обновлять (например, старый чекпоинт/конфиг без MoE-sow) --
+        # no-op, как и остальные decoupled-фиксы при отсутствующих данных.
+        return new_params
+
+    def _update(p, idx):
+        if idx < 0:
+            return p
+        frac = assignment_frac_stacked[idx]
+        e_routed = p.shape[-1]
+        target = 1.0 / e_routed
+        overloaded = frac > target
+        return p + gamma * jnp.where(overloaded, -1.0, 1.0)
+
+    return jax.tree_util.tree_map(_update, new_params, bias_index_map)
 
 
 SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 5 * 60  # 9 часов минус запас на graceful stop
@@ -328,6 +457,13 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         _router_temp_decay_leaf, abstract_params
     )
 
+    # ФИКС #7 (bias-балансировка экспертов): индексная карта строится один
+    # раз здесь -- тот же паттерн, что _router_temp_decay_map выше, только
+    # вместо ставки decay несёт СТАТИЧЕСКИЙ индекс строки в
+    # assignment_frac_stacked (или -1 для не-expert_bias листьев). См.
+    # _build_expert_bias_index_map's докстринг про допущение о порядке.
+    _expert_bias_index_map = _build_expert_bias_index_map(abstract_params)
+
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
     opt_state_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, opt_state_abstract)
 
@@ -351,7 +487,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         new_accum = jax.tree_util.tree_map(lambda a, g: a + g, accum_grads, grads)
         return p, s, new_accum, loss, aux_info
 
-    def distributed_apply_step(p, s, accum_grads, n_accum):
+    def distributed_apply_step(p, s, accum_grads, n_accum, assignment_frac_stacked=None):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
         # ФИКС #3: чистая функция, возвращает jnp-массив -- НЕ печатает
@@ -394,6 +530,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         # no-op).
         new_p = apply_router_temp_decay(new_p, _router_temp_decay_map)
 
+        # ФИКС #7 (bias-балансировка экспертов, DeepSeek-V3 style) --
+        # decoupled, вне градиента, применяется ПОСЛЕ router_temp decay --
+        # см. докстринг модуля/apply_expert_bias_update. Если
+        # assignment_frac_stacked не передан (None -- напр. при вызове
+        # compiled_apply без обновлённого train.py, обратная совместимость
+        # сигнатуры сохранена по умолчанию), это no-op.
+        new_p = apply_expert_bias_update(new_p, _expert_bias_index_map, assignment_frac_stacked)
+
         # ФИКС #3: was_clipped тоже больше не печатается через
         # jax.lax.cond(...jax.debug.print...) -- просто bool-скаляр,
         # возвращаемый как обычный выход, ровно как is_finite уже был.
@@ -426,6 +570,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "norm_x_min": NamedSharding(mesh, P(None)),
         "router_max_cos_per_layer": NamedSharding(mesh, P()),
         "router_max_cos": NamedSharding(mesh, P()),
+        "assignment_frac": NamedSharding(mesh, P(None, None)),  # NEW (bias-балансировка)
     }
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
@@ -447,6 +592,18 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         ),
     )
 
+    # ФИКС #7 (bias-балансировка): compiled_apply теперь принимает ПЯТЫЙ
+    # позиционный аргумент -- assignment_frac_stacked, форма
+    # (n_moe_layers, E_routed). См. докстринг модуля "ВАЖНО (интеграция в
+    # train.py)" про то, как его нужно построить на стороне train.py
+    # (усреднение по микрошагам одного эффективного шага) и передавать в
+    # КАЖДЫЙ вызов compiled_apply -- ровно тем же паттерном, каким
+    # collinearity_coef_arr уже передаётся в compiled_train_micro. in_shardings
+    # ниже уже включает пятый элемент; ЛЮБОЙ существующий вызов
+    # compiled_apply(...) с 4 позиционными аргументами перестанет работать
+    # (pjit потребует ровно 5) -- этот сайт-эффект неизбежен при добавлении
+    # нового jit-аргумента, см. train.py's собственный докстринг про
+    # аналогичный инцидент с collinearity_coef.
     compiled_apply = jax.jit(
         distributed_apply_step,
         donate_argnums=(0, 1, 2),
@@ -455,6 +612,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             opt_state_sharding,
             param_sharding,
             NamedSharding(mesh, P()),
+            NamedSharding(mesh, P(None, None)),   # <-- NEW: assignment_frac_stacked
         ),
         out_shardings=(
             param_sharding,
