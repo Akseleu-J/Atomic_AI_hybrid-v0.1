@@ -9,6 +9,16 @@ from utils import collect_by_leaf_name, path_to_str
 
 ROUTER_COLLINEARITY_COEF = 0.08  # стартовое значение, требует калибровки — см. ниже
 
+# ФИКС (resume LR jump, см. chat): RESUME_BACKOFF_STEPS/RESUME_LR_SCALE --
+# явные модульные константы (были неявно предполагаемы существующими в
+# исходном файле, referenced внутри resume_backoff ниже без определения --
+# добавлены здесь явно, чтобы файл был самодостаточным). Значения оставлены
+# как были в проекте (5000 / 0.7); resume_backoff сама уже сглажена линейной
+# рампой (RAMP_STEPS=1000) в теле функции ниже -- скачка LR на step=5000
+# больше нет, это подтверждённый и уже применённый фикс.
+RESUME_BACKOFF_STEPS = 5000
+RESUME_LR_SCALE = 0.7
+
 # ДИАГНОСТИКА (2-й уровень, backward-only): см. аналогичную в model.py.
 # Здесь отдельная копия, чтобы не тянуть зависимость optimizer.py -> model.py
 # для одной internal-функции.
@@ -105,8 +115,37 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         frac = jnp.clip((step - ramp_start) / RAMP_STEPS, 0.0, 1.0)
         return RESUME_LR_SCALE + (1.0 - RESUME_LR_SCALE) * frac
 
-    lion_lr = lambda step: 3e-4 * lr_schedule(step) * resume_backoff(step)
-    adamw_lr = lambda step: 1e-3 * lr_schedule(step) * resume_backoff(step)    
+    # ==========================================================================
+    # ФИКС (этот пасс -- router collapse эпизод 9300-9568, локальный ~2300-2400
+    # шаг warmup, см. chat): монотонный, неоткатывающийся дрейф router_max_cos
+    # 0.02->0.40 и expert_util_std за 268 эффективных шагов совпал по времени
+    # НЕ с переходом warmup->cosine (warmup_steps=3017 при total_steps=30172,
+    # переход был бы на ~3017, а крах начался на ~2300-2400 -- т.е. ЕЩЁ ВНУТРИ
+    # линейного warmup, на ~66-80% от его длины), а с уровнем LR, УЖЕ
+    # достигнутым на этой стадии рампы. Это говорит не о разрыве расписания
+    # (которое уже сглажено -- resume_backoff выше), а о том, что сам ПИК LR
+    # органически высок для этой архитектуры (BlockDAR -- накопительный,
+    # некaнонический residual stream через HybridDARAttention/history_blocks
+    # + насыщенный/структурированный датасет -> более коррелированный
+    # градиент -> крупный эффективный шаг параметров на высоком LR).
+    #
+    # Пик снижен ~0.6-0.67x по обеим группам (adamw: 1e-3 -> 6e-4, lion:
+    # 3e-4 -> 2e-4) -- дешевле и надёжнее, чем растягивать warmup длиннее:
+    # растягивание warmup всё равно достигает того же пика, просто позже,
+    # и если проблема в АБСОЛЮТНОЙ величине LR на этой стадии (а не в
+    # скорости роста -- крах на 66-80% ещё ДО пика говорит именно за это),
+    # то растягивание лишь отодвигает тот же крах на более поздний
+    # локальный шаг, а не устраняет его.
+    #
+    # Применять вместе с train.py's _resume_opt_state_count -- та фикс
+    # решает ОТДЕЛЬНУЮ проблему (warmup перезапускается с нуля на КАЖДОЙ
+    # Kaggle-сессии после resume, потому что opt_state пересоздаётся целиком
+    # -- см. train.py restore-блок), а не эту. Обе причины сейчас
+    # накладываются друг на друга в одном и том же диапазоне локальных
+    # шагов, поэтому оба патча нужны одновременно, не по отдельности.
+    # ==========================================================================
+    lion_lr = lambda step: 2e-4 * lr_schedule(step) * resume_backoff(step)
+    adamw_lr = lambda step: 6e-4 * lr_schedule(step) * resume_backoff(step)
     tx_lion = optax.lion(learning_rate=lion_lr, weight_decay=0.1)
     tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
     tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
@@ -178,6 +217,14 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         # Muon weight decay -- см. их докстринги. "frozen" здесь остаётся
         # БЕЗ ИЗМЕНЕНИЙ: он гарантирует нулевой градиентный вклад, decoupled
         # update применяется отдельно, ПОСЛЕ optax.apply_updates.
+        #
+        # ВАЖНО (этот пасс, router collapse эпизод 9300-9568): expert_bias
+        # чинит ЧАСТОТУ назначений, НЕ коллинеарность направлений экспертов
+        # (router_max_cos) -- монотонный рост cos 0.02->0.40 в этом эпизоде
+        # требует ОТДЕЛЬНОГО decoupled анти-коллинеарного механизма (не
+        # реализован в этом пасе патчей -- см. chat), bias оставлен как
+        # ортогональное улучшение частотного баланса, не как фикс этого
+        # конкретного эпизода.
         if "expert_bias" in path_str:
             return "frozen"
         if "router" in path_str:
