@@ -166,6 +166,18 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         # сбалансирован), где ошибка маршрутизации дороже всего. AdamW без
         # decay -- мягче и предсказуемее для этого конкретного слоя, тот же
         # выбор, что уже сделан для norm/bias.
+        #
+        # ФИКС (bias-балансировка, DeepSeek-V3 style, см.
+        # test_synthetic_router_bias_balancing.py в чате): expert_bias
+        # остаётся "frozen" для ГРАДИЕНТНОГО пути -- обновляется он теперь
+        # ИСКЛЮЧИТЕЛЬНО decoupled-путём в train_setup.py's
+        # apply_expert_bias_update (см. её докстринг), на основе
+        # ФАКТИЧЕСКОЙ частоты top-k-назначений (assignment_frac), а не
+        # градиента loss. Это тот же "decoupled, вне градиента" паттерн,
+        # что уже применён для router_temp (apply_router_temp_decay) и для
+        # Muon weight decay -- см. их докстринги. "frozen" здесь остаётся
+        # БЕЗ ИЗМЕНЕНИЙ: он гарантирует нулевой градиентный вклад, decoupled
+        # update применяется отдельно, ПОСЛЕ optax.apply_updates.
         if "expert_bias" in path_str:
             return "frozen"
         if "router" in path_str:
@@ -291,6 +303,14 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     norm_x_mean_stacked = None    # NEW
     norm_x_max_stacked = None     # NEW
     norm_x_min_stacked = None     # NEW
+    # ФИКС (bias-балансировка, DeepSeek-V3 style): assignment_frac -- см.
+    # docstring в moe_gmm.py's патче ("assignment_frac", sown сразу после
+    # top_gate). Собирается тем же collect_by_leaf_name-путём, что и
+    # router_temp -- порядок листьев ДОЛЖЕН совпадать с порядком
+    # expert_bias-параметров в params (оба идут по блокам model.py's
+    # BlockDAR в порядке block_0, block_1, ... -- см. предупреждение в
+    # train_setup.py's _build_expert_bias_index_map).
+    assignment_frac_stacked = None  # NEW
     if not deterministic:
         final_hidden, sowed_vars = outputs
         aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
@@ -311,6 +331,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         norm_x_mean = collect_by_leaf_name(sowed_vars["losses"], "norm_x_mean")
         norm_x_max = collect_by_leaf_name(sowed_vars["losses"], "norm_x_max")
         norm_x_min = collect_by_leaf_name(sowed_vars["losses"], "norm_x_min")
+        # NEW: assignment_frac -- список из E_routed-векторов, по одному на
+        # MoE-блок, в порядке обхода дерева (тот же порядок, что router_temp).
+        assignment_fracs = collect_by_leaf_name(sowed_vars["losses"], "assignment_frac")
         aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
         z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
         if expert_utils:
@@ -319,6 +342,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             dropped_ratio_stacked = jnp.stack(dropped_ratios)
         if router_temps:                # добавлено
             router_temp_stacked = jnp.stack(router_temps)
+        if assignment_fracs:            # NEW
+            assignment_frac_stacked = jnp.stack(assignment_fracs)   # (n_moe_layers, E_routed)
         min_col_norm_stacked = jnp.stack(min_col_norms) if min_col_norms else None
         max_abs_logit_preclip_stacked = jnp.stack(max_abs_logits_preclip) if max_abs_logits_preclip else None
         # Анти-коллинеарный штраф
@@ -369,6 +394,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
             "norm_x_min": norm_x_min_stacked,     # NEW
             "router_max_cos_per_layer": router_max_cos_per_layer,
             "router_max_cos": router_max_cos,
+            "assignment_frac": assignment_frac_stacked,   # NEW (bias-балансировка)
         }
         return total_loss, aux_info
     return total_loss
