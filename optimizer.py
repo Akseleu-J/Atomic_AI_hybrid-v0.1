@@ -319,6 +319,7 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
     else:
         final_hidden = outputs
         aux_loss, z_loss = 0.0, 0.0
+        collinearity_loss = 0.0
 
     if cfg.tie_embeddings:
         w = params["embed"]["embedding"].T
