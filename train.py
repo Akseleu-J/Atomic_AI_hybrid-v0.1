@@ -782,11 +782,14 @@ def main_execution():
                 effective_step = (micro_step + 1) // accum_steps
 
                 _params_pre_apply_host = jax.tree_util.tree_map(jax.device_get, params)
-
+                assignment_frac_arr = jnp.mean(
+                    jnp.stack([...]),  # collect aux_info["assignment_frac"] across the accum window
+                    axis=0,
+                )
                 _t_apply = time.perf_counter()
                 (params, opt_state, accum_grads, was_finite,
                  global_norm, clip_factor, group_nonfinite_flags, was_clipped) = compiled_apply(
-                    params, opt_state, accum_grads, accum_steps
+                    params, opt_state, accum_grads, accum_steps, assignment_frac_arr
                 )
                 if micro_step < 30:
                     jax.block_until_ready(params)
@@ -805,13 +808,25 @@ def main_execution():
                     burst_streak = 0
 
                 if burst_streak >= 3:
+                    # ФИКС (диагностика источника burst-всплесков): _accum_window
+                    # хранит source_idx для каждого микро-шага, вошедшего в
+                    # ТЕКУЩИЙ эффективный шаг (deque maxlen=accum_steps) -- это
+                    # именно те source_idx, чьи градиенты просуммированы в только
+                    # что применённом обновлении. В mode="mixed" здесь будут одни
+                    # None -- диагностика актуальна для round_robin/sequential.
+                    _burst_source_idxs = [entry["source_idx"] for entry in _accum_window]
                     print(f"[BURST-GUARD] ⚠️ global_grad_norm>20 три эффективных шага подряд "
-                          f"(global_step={global_step + 1}). Вероятен runaway-режим.")
+                          f"(global_step={global_step + 1}). Вероятен runaway-режим. "
+                          f"source_idx этого эффективного шага: {_burst_source_idxs}")
                     wandb_logging.log_alert(
                         "Burst guard triggered",
-                        f"global_grad_norm > 20 три шага подряд на step={global_step + 1}",
+                        f"global_grad_norm > 20 три шага подряд на step={global_step + 1}. "
+                        f"source_idx: {_burst_source_idxs}",
                         level="WARN",
                     )
+                    wandb_logging.log_metrics(global_step + 1, {
+                        "burst/source_idx_last": _burst_source_idxs[-1] if _burst_source_idxs else -1,
+                    })
                     burst_streak = 0
                 _clip_factor_val = float(jax.device_get(clip_factor))
                 _group_flags_np = jax.device_get(group_nonfinite_flags)
