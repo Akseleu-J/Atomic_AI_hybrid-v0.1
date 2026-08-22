@@ -136,6 +136,53 @@ train-цикле. Если в будущем понадобится варьир
 ходу обучения (например, warmup/decay для anti-collinearity штрафа) --
 это уже готовая точка для замены константы на функцию от global_step,
 никаких дополнительных изменений сигнатуры jit не потребуется.
+
+ФИКС (этот пасс -- ТОТ ЖЕ класс бага, но на compiled_apply, см. chat):
+train_setup.py's distributed_apply_step была расширена ПЯТЫМ позиционным
+параметром `assignment_frac_stacked=None` (для decoupled bias-балансировки
+экспертов, apply_expert_bias_update), и compiled_apply's `in_shardings`
+уже обновлён под 5 позиций. Но здесь, ниже по файлу, compiled_apply
+вызывался только 4 позиционными аргументами (params, opt_state,
+accum_grads, accum_steps) -- ровно тот же класс ошибки, что уже был
+исправлен для compiled_train_micro/collinearity_coef_arr выше, просто на
+другом jit-вызове:
+    ValueError: pjit in_shardings specification must be a tree prefix...
+    got a tuple or list of length 5 for an args tuple of length 4.
+
+Фикс: `aux_info["assignment_frac"]` (форма (n_moe_layers, E_routed),
+возвращается compiled_train_micro НА КАЖДОМ микрошаге) теперь копится в
+`_assignment_frac_window` (тот же принцип, что `_accum_window` уже
+использует для батчей/rng), усредняется по accum_steps микрошагам ОДНОГО
+эффективного шага в момент вызова apply, и передаётся ПЯТЫМ позиционным
+аргументом в compiled_apply. Если по какой-то причине assignment_frac ни
+разу не пришёл за окно (не должно происходить, пока MoE есть в архитектуре
+и deterministic=False -- оставлено только как структурная защита), используется
+нулевой fallback-массив правильной формы (n_moe_layers, E_routed) -- apply_
+expert_bias_update трактует None как no-op, но JIT-ВЫЗОВУ всё равно нужен
+РЕАЛЬНЫЙ 5-й позиционный аргумент независимо от смысловой пустоты значения.
+
+ФИКС (этот пасс -- warmup перезапускается с нуля на каждой Kaggle-сессии
+после resume, см. chat): opt_state (включая внутренние step-счётчики
+adamw/lion/muon "count", по которым optimizer.py's lr_schedule(step)
+вычисляет позицию на кривой warmup/cosine) пересоздаётся ЦЕЛИКОМ через
+tx.init(params) при каждом resume (см. блок restore ниже) -- это нужно
+для совместимости со структурными изменениями multi_transform (router
+graft-merge), но побочный эффект в том, что "count" всегда стартует с 0,
+даже если global_step (наблюдаемый в логах/чекпоинтах) уже далеко за
+warmup. Практический эффект: КАЖДАЯ достаточно долгая Kaggle-сессия после
+resume заново проходит полный локальный warmup (0->peak LR за
+warmup_steps локальных шагов) -- что и объясняет наблюдавшиеся крахи
+router collapse на ПОВТОРЯЮЩИХСЯ локальных шагах (~2300-2400) при разных
+global_step, вместо одного глобального места.
+
+_resume_opt_state_count ниже выставляет все найденные "count"-листья
+opt_state в global_step СРАЗУ после пересоздания opt_state -- lr_schedule
+после этого продолжает СВОЮ РЕАЛЬНУЮ позицию на кривой, а не начинается
+заново. Это НЕ отменяет отдельный вывод (см. optimizer.py's докстринг у
+adamw_lr/lion_lr) о том, что сам ПИК LR, вероятно, органически высок для
+этой архитектуры -- оба патча (пик LR снижен в optimizer.py + этот фикс)
+применены вместе, так как оба фактора накладывались друг на друга в одном
+и том же диапазоне локальных шагов.
 """
 import os
 import time
@@ -247,6 +294,45 @@ def _reset_router_opt_state(opt_state):
         return leaf
 
     return jax.tree_util.tree_map_with_path(_reset_leaf, opt_state)
+
+
+def _resume_opt_state_count(opt_state, global_step):
+    """ФИКС (warmup перезапускается на каждой сессии, см. докстринг модуля
+    выше): opt_state пересоздаётся целиком через tx.init(params) при
+    каждом resume -- все внутренние step-счётчики ("count" NamedTuple-поля
+    внутри optax.adamw/lion state и наш собственный MuonState.count в
+    optimizer.py) стоят на 0 сразу после этого, независимо от того, что
+    global_step продолжает расти от точки restore. optimizer.py's
+    lr_schedule(step) и resume_backoff(step) читают ИМЕННО этот внутренний
+    "count", а не global_step -- поэтому warmup/cosine-рампа фактически
+    начинается заново на каждой достаточно долгой Kaggle-сессии после
+    resume.
+
+    Ищет все листья, чей путь (через path_to_str, тот же паттерн, что
+    _reset_router_opt_state/_get_shard_spec в train_setup.py уже
+    используют) содержит подстроку "count" и которые являются 0-мерными
+    (скаляр count -- как у optax.ScaleByAdamState.count, так и у нашего
+    MuonState.count), и выставляет их в global_step (приведение к dtype
+    исходного листа -- обычно int32/uint32 у optax, jnp.int32 у
+    MuonState). Любые другие листья (mu/nu-моменты, EmptyState и т.п.)
+    остаются нетронутыми -- они и так пересозданы с нуля намеренно (см.
+    докстринг restore-блока про несовместимость структуры multi_transform
+    со старыми чекпоинтами).
+
+    ЧИСТАЯ функция (opt_state -> новый opt_state), без побочных эффектов --
+    тот же контракт, что и у _reset_router_opt_state/_reset_router_params
+    выше."""
+    def _set_count(path, leaf):
+        path_str = path_to_str(path)
+        if "count" in path_str and hasattr(leaf, "shape") and leaf.ndim == 0:
+            print(f"[RESUME-LR-FIX] Выставлен opt_state счётчик: {path_str} -> {global_step} "
+                  f"(было 0 после пересоздания opt_state -- без этого lr_schedule/warmup "
+                  f"начинались бы заново на каждой сессии)")
+            return jnp.asarray(global_step, dtype=leaf.dtype)
+        return leaf
+
+    return jax.tree_util.tree_map_with_path(_set_count, opt_state)
+
 
 def _download_resume_checkpoint(local_dir, repo_subdir):
     """Единственное место, которое решает, ОТКУДА тянуть чекпоинт при
@@ -391,6 +477,16 @@ def main_execution():
         ),
     )
 
+    # ФИКС (assignment_frac fallback shape): сколько MoE-блоков реально в
+    # архитектуре -- GmmMoEJ висит на каждом BlockDAR (см. model.py), т.е.
+    # ровно num_layers // layers_per_block блоков. Нужно для нулевого
+    # fallback-массива assignment_frac_arr в основном цикле ниже, на
+    # случай (структурная защита, не ожидаемый рабочий путь), если
+    # aux_info["assignment_frac"] почему-то не пришёл ни на одном микрошаге
+    # эффективного шага.
+    n_moe_layers = config.num_layers // config.layers_per_block
+    n_experts_routed = config.num_experts - 1
+
     # ==========================================================================
     # ФИКС: per-source fraction теперь ГИПЕРПАРАМЕТРЫ здесь же, рядом с
     # file_pairs, а не магические числа внутри кортежей ниже. dataloader_multi_source
@@ -490,6 +586,10 @@ def main_execution():
         make_shard_and_compile(config, total_train_steps, micro_batch_size, seq_len, accum_steps)
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
+
+    print(f"[LR-DIAG] warmup_steps={max(500, int(total_train_steps * 0.10))}, "
+          f"total_train_steps={total_train_steps} -- если следующий крах повторится в этом же "
+          f"диапазоне ЛОКАЛЬНЫХ (с момента последнего resume) шагов, сверьте с этим значением.")
 
     # ФИКС (pjit in_shardings length mismatch, см. докстринг модуля выше):
     # collinearity_coef теперь ЯВНЫЙ 6-й позиционный jit-аргумент
@@ -615,6 +715,21 @@ def main_execution():
                 global_step = resume_step
             global_rng = jax.random.PRNGKey(42 + global_step)
 
+            # 5.5. ФИКС (warmup перезапускается на каждой сессии, см.
+            #      докстринг модуля / _resume_opt_state_count выше):
+            #      opt_state только что был пересоздан с нуля шагом 3 --
+            #      все "count"-счётчики (adamw/lion/muon) стоят на 0.
+            #      Выставляем их в РЕАЛЬНЫЙ global_step, ТОЛЬКО ЧТО
+            #      определённый шагом 5 выше -- lr_schedule/resume_backoff
+            #      после этого продолжают свою фактическую позицию на
+            #      кривой warmup/cosine вместо повторного прохода 0->peak
+            #      на каждой Kaggle-сессии. Применяется ПОСЛЕ device_put
+            #      params (шаг 2) сознательно -- порядок между params и
+            #      opt_state здесь не важен, важно, что это происходит
+            #      ДО первого вызова compiled_train_micro/compiled_apply.
+            opt_state = _resume_opt_state_count(opt_state, global_step)
+            opt_state = jax.device_put(opt_state, opt_state_sharding)
+
             # 6. Валидация восстановленных параметров
             param_norm = float(jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(params))))
             has_nan = any(bool(jnp.any(jnp.isnan(x))) for x in jax.tree_util.tree_leaves(params))
@@ -694,6 +809,12 @@ def main_execution():
     nonfinite_consecutive_count = 0
     nonfinite_window = deque(maxlen=NONFINITE_WINDOW_SIZE)
     _accum_window = deque(maxlen=accum_steps)
+    # ФИКС (compiled_apply 5-й позиционный аргумент, см. докстринг модуля
+    # выше): копит aux_info["assignment_frac"] (форма (n_moe_layers,
+    # E_routed)) с каждого микрошага ОДНОГО эффективного шага -- обычный
+    # Python-список (не deque с maxlen, т.к. явно сбрасывается сразу после
+    # использования на apply-шаге, а не скользящее окно как _accum_window).
+    _assignment_frac_window = []
 
     def _save_all_needed_slots(step, cur_train_loss_val, force_latest=True, tag="", skip_hf_upload=False):
         nonlocal best_train_loss
@@ -778,14 +899,43 @@ def main_execution():
                 jax.block_until_ready(train_loss)
             _t_compute = time.perf_counter() - _t1
 
+            # ФИКС (compiled_apply 5-й позиционный аргумент, см. докстринг
+            # модуля выше): копим assignment_frac с КАЖДОГО микрошага --
+            # aux_info["assignment_frac"] уже возвращается
+            # compiled_train_micro (собран в optimizer.py's compute_loss
+            # через collect_by_leaf_name), просто раньше нигде не
+            # сохранялся между микрошагами одного эффективного шага.
+            if aux_info.get("assignment_frac") is not None:
+                _assignment_frac_window.append(jax.device_get(aux_info["assignment_frac"]))
+
             if (micro_step + 1) % accum_steps == 0:
                 effective_step = (micro_step + 1) // accum_steps
 
                 _params_pre_apply_host = jax.tree_util.tree_map(jax.device_get, params)
-                assignment_frac_arr = jnp.mean(
-                    jnp.stack([...]),  # collect aux_info["assignment_frac"] across the accum window
-                    axis=0,
-                )
+
+                # ФИКС (compiled_apply 5-й позиционный аргумент, см.
+                # докстринг модуля выше): усредняем по всем микрошагам
+                # ЭТОГО эффективного шага (тот же смысл, что accum_grads
+                # усредняется в distributed_apply_step через n_accum) и
+                # сбрасываем окно для следующего эффективного шага сразу
+                # после использования. Fallback -- нулевой массив нужной
+                # формы (n_moe_layers, n_experts_routed), если по какой-то
+                # причине окно пусто (не ожидается на практике, пока в
+                # архитектуре есть MoE и deterministic=False -- см.
+                # докстринг модуля).
+                if _assignment_frac_window:
+                    assignment_frac_arr = jnp.asarray(
+                        np.mean(np.stack(_assignment_frac_window), axis=0), dtype=jnp.float32
+                    )
+                else:
+                    print(f"[WARN] assignment_frac_window пуст на global_step={global_step + 1} -- "
+                          f"использую нулевой fallback (n_moe_layers={n_moe_layers}, "
+                          f"E_routed={n_experts_routed}). Это НЕ ожидаемый рабочий путь -- "
+                          f"если видите это часто, проверьте, что MoE реально sow'ит "
+                          f"assignment_frac (moe_gmm.py) и deterministic=False в train-forward.")
+                    assignment_frac_arr = jnp.zeros((n_moe_layers, n_experts_routed), dtype=jnp.float32)
+                _assignment_frac_window = []
+
                 _t_apply = time.perf_counter()
                 (params, opt_state, accum_grads, was_finite,
                  global_norm, clip_factor, group_nonfinite_flags, was_clipped) = compiled_apply(
