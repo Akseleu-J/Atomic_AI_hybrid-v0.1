@@ -469,10 +469,16 @@ class GmmMoEJ(nn.Module):
         # M1': top-k выбор + перенормировка гейтов ВНУТРИ выбранной пары
         # (не softmax по всем E_routed -- иначе вес каждого выбранного
         # эксперта занижен относительно "честного" top-k распределения).
-        top_vals, top_idx = jax.lax.top_k(router_logits, k=k)          # (T, k)
-        top_idx = top_idx.astype(jnp.int32)
-        top_gate = jax.nn.softmax(top_vals, axis=-1)                    # (T, k), суммируется в 1 по строке
+        expert_bias = self.param("expert_bias", nn.initializers.zeros, (E_routed,), jnp.float32)
+        self.sow("losses", "expert_bias", expert_bias)  # для W&B, тот же паттерн что router_temp
 
+        router_logits_biased = router_logits + jax.lax.stop_gradient(expert_bias)[None, :]
+        top_vals, top_idx = jax.lax.top_k(router_logits_biased, k=k)
+        top_idx = top_idx.astype(jnp.int32)
+        # ВАЖНО: вес гейта считается по НЕбиасированным логитам выбранных экспертов --
+        # bias влияет только на ВЫБОР top-k, не на итоговый вес (как в DeepSeek-V3).
+        top_vals_unbiased = jnp.take_along_axis(router_logits, top_idx, axis=-1)
+        top_gate = jax.nn.softmax(top_vals_unbiased, axis=-1)
         # aux_loss/z_loss считаются по ПОЛНОМУ softmax(router_logits) --
         # это диагностика балансировки роутера как такового (Switch-style
         # load-balancing loss смотрит на распределение по ВСЕМ экспертам,
