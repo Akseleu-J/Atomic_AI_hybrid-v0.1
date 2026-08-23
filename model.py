@@ -1002,18 +1002,18 @@ class FullHybridMoEModel(nn.Module):
         num_blocks = self.cfg.num_layers // self.cfg.layers_per_block
 
         # было:
-        # RematBlock = BlockDAR
+        RematBlock = BlockDAR
 
         # стало:
-        RematBlock = nn.remat(
-               BlockDAR,
-               static_argnums=(6, 7),   # (deterministic, rngs) -- Python-level control
+        #RematBlock = nn.remat(
+               #BlockDAR,
+               #static_argnums=(6, 7),   # (deterministic, rngs) -- Python-level control
                               # flow (if rngs is not None / dropout branches
                               # внутри MLAJ/GmmMoEJ/BlockDARLayer) не может
                               # трассироваться как обычный traced-аргумент;
                               # remat требует явно пометить такие позиции
                               # static_argnums (см. jax.checkpoint docstring).
-            )
+            #)
 
         for block_idx in range(num_blocks):
             layer_idx_start = block_idx * self.cfg.layers_per_block
