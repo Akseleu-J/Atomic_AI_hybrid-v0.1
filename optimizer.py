@@ -1,27 +1,233 @@
-from typing import NamedTuple
+"""
+atomic_ops/moe_gmm.py -- Sparse MoE FFN via megablox `gmm`/`tgmm` Pallas
+grouped-matmul TPU kernels, replacing moe_sparse.py's sort+gather-into-
+(E,capacity+1,d)+nn.vmap(ExpertPack) dispatch.
+
+Implements the integration plan (M0-M7, see project handoff doc) up through
+M6. Not run on real TPU from this environment -- no TPU hardware here, see
+CAVEAT below. Everything in this file was validated with
+`jax.experimental.pallas.ops.tpu.megablox.gmm`'s own `interpret=True` mode
+on CPU, which runs the SAME kernel logic through a pure-JAX/numpy
+interpreter (not the compiled Mosaic kernel) -- exact-match against a plain
+per-group-einsum reference for both the forward matmul shapes AND the
+hand-written custom_vjp backward (see test_moe_gmm_parity.py in this same
+delivery, run there for the actual numbers). Before switching this into
+model.py's hot path, re-run that same test with `interpret=False` on the
+real v5e-8 to confirm the compiled kernel agrees (same two-stage validation
+discipline already used for kernel_trainable_B6.py vs kernel_trainable.py
+in this project).
+
+M1 -- routing without capacity/scatter
+-----------------------------------------------------------------------
+moe_sparse.py's SparseMoEJ has to invent a `capacity` and a sentinel slot
+because its dispatch target is a *dense* (E, capacity+1, d) buffer sized
+before routing is known -- any token past `capacity` for its expert is
+dropped (see moe_sparse.py's own docstring on the sentinel-slot fix).
+`gmm` needs no such buffer: it consumes a *sorted* (T, d) matrix directly,
+grouped by `group_sizes` (a length-E_routed vector of per-expert token
+counts that is exactly correct, computed fresh every forward pass via
+`jnp.bincount`). Nothing is ever dropped -- `group_sizes.sum() == T`
+identically, by construction, not just "usually true after warmup" the way
+moe_sparse.py's dropped_ratio->0 is an emergent training outcome.
+
+M2 -- forward FFN via gmm instead of nn.vmap(ExpertPack)
+-----------------------------------------------------------------------
+Expert weights are held as consolidated `self.param` tensors
+`W1: (E_routed, d_model, d_ff)` / `W2: (E_routed, d_ff, d_model)` -- NOT a
+flax `nn.vmap`-wrapped submodule with a param axis, matching how
+moe_sparse.py's `routed_experts` axis is already unsharded/replicated (see
+its own `_get_shard_spec` note in train.py) -- gmm needs the raw weight
+array directly, it has no notion of a flax Module.
+
+No bias terms: the plan (M2) specifies exactly `h = gelu(gmm(x,W1,sizes));
+out = gmm(h,W2,sizes)`, and adding a per-expert bias would mean gathering
+`b[expert_id]` per token, an *extra* data-dependent gather outside the gmm
+call -- doable, but out of scope for this delivery; flagged in
+GmmMoEJ's docstring as a follow-up if bias matters empirically.
+
+M3 -- backward: gmm (dx) + tgmm (dW)
+-----------------------------------------------------------------------
+`gmm`/`tgmm` are themselves plain `jax.jit`-wrapped Pallas calls with no
+autodiff rule of their own (confirmed: they are NOT `jax.custom_vjp`
+objects, ordinary functions) -- differentiating through them naively would
+try to trace through the Pallas kernel's dynamic-grid/dynamic-index
+machinery, which is not expected to produce a usable VJP. So, per the plan,
+a hand-written `jax.custom_vjp` wraps the whole two-gmm FFN:
+    dh              = gmm(dout, W2^T-per-group, group_sizes)
+    dW2             = tgmm(h^T, dout, group_sizes)
+    dh_pre          = gelu_vjp(dh)          <- plain JAX autodiff, gelu is elementwise
+    dx              = gmm(dh_pre, W1^T-per-group, group_sizes)
+    dW1             = tgmm(x^T, dh_pre, group_sizes)
+`group_sizes` itself is integer-valued and carries no gradient -- passed
+via `nondiff_argnums`, same convention this project already uses for
+`scale` in kernel_trainable.py/kernel_trainable_B6.py's custom_vjp.
+
+M4 -- sanitization and dtype discipline
+-----------------------------------------------------------------------
+Same `clip(+-1e3)+nan_to_num` convention as moe_sparse.py, applied after
+every gmm/tgmm call (forward AND backward, both are new numerical surfaces
+this project hasn't stress-tested yet) -- not just at the final output.
+`group_sizes`/routing indices are pinned to int32 explicitly (`gmm`'s own
+common.py enforces this; see M0 smoke-test), same "explicit dtype anchor"
+reasoning already applied for A_log/decay_a and B6's cotangent dtype fix.
+
+M5 -- SPMD / sharding
+-----------------------------------------------------------------------
+Follows the *second* fix already landed in moe_sparse.py (`_local_sharded`,
+not the superseded `_with_batch_sharding`/full-replication approach its own
+docstring says was replaced): the whole routing+gmm block runs under an
+explicit `with_sharding_constraint` pinning `flat_x`/`expert_idx`/
+`gate_weight` (and everything derived data-dependently from them: perm,
+group_sizes, x_sorted) to stay SHARDED along the batch axis -- each device
+independently computes routing and calls `gmm`/`tgmm` on ONLY its own local
+shard, no cross-device gather. This is *more* natural for gmm than for the
+old capacity-buffer dispatch: `gmm`'s `group_offset`/`num_actual_groups`
+hooks exist precisely to let each shard operate on a local slice, though
+this delivery does not yet use expert-parallelism (E_routed experts stay
+fully replicated across all devices, same deprioritization already on
+record in userMemories/INTEGRATION_NOTES.md for the old implementation --
+M5's expert-parallel variant is a distinct follow-up, not done here).
+
+M6 -- integration into a SparseMoEJ-shaped module
+-----------------------------------------------------------------------
+`GmmMoEJ` below is a drop-in structural replacement for moe_sparse.py's
+`SparseMoEJ` (same __call__ signature, same sown metrics:
+`aux_loss`/`z_loss`/`moe_dropped_ratio`, same shared+routed combination) --
+`moe_dropped_ratio` is sown as an always-0.0 constant (kept only so
+train.py's existing "[DIAG] moe dropped_ratio" logging line and
+collect_by_leaf_name() plumbing keep working unmodified; structurally
+there is no dropping left to report, gmm's grouping never discards a
+token).
+
+CAVEAT (read before wiring into model.py)
+-----------------------------------------------------------------------
+This file was authored and logic-tested in an environment with **no TPU
+and no real Mosaic compilation** -- `interpret=True` runs the *reference
+interpreter* for the same kernel code, which is a strong but not
+sufficient substitute for compiling on v5e-8 (tiling/(128,128,128)
+assumptions, VMEM budget, and the actual Mosaic lowering are all
+unverified here). Treat this the same way this project already treats
+`kernel_trainable_B6.py` before it was trusted: run
+`test_moe_gmm_parity.py` with `interpret=False` on your Kaggle TPU v5e-8
+FIRST, compare against moe_sparse.py's SparseMoEJ (or a plain dense
+JAX-einsum reference) on a few seeds/sizes, and only switch model.py's
+import over once that's finite and rel_diff-small, per this project's own
+"equivalence testing before production use" discipline.
+
+ФИКС (этот пасс -- router collapse, см. чат: expert_utilization_std рос
+монотонно 0.005 -> 0.30+ на протяжении нескольких сотен шагов сразу после
+resume, независимо от router_z_loss_coef/router_noise_std -- z_loss
+штрафует величину логитов через градиент, но ничего структурно не
+ОГРАНИЧИВАЕТ саму величину; под Adam норма router.kernel может свободно
+расти, и с ней растёт разброс логитов, даже если штраф формально
+уменьшает его СКОРОСТЬ роста):
+
+  1. router.kernel теперь используется через L2-НОРМАЛИЗОВАННЫЕ СТОЛБЦЫ
+     (по одному направлению на эксперта) -- величина логита теперь зависит
+     ТОЛЬКО от угла между входом и направлением эксперта (умноженного на
+     ||flat_x||), а не от того, насколько разрослась норма самого
+     router.kernel под оптимизатором. Это СТРУКТУРНЫЙ потолок, а не
+     штраф -- в отличие от z_loss, коллапс логитов через рост весов
+     физически невозможен независимо от того, что накопил Adam-momentum
+     ДО этого шага.
+  2. Добавлен обучаемый router_temp (скаляр, init=10.0) -- после
+     нормализации величина "сырого" логита ~ ||x||*cos(angle), что
+     заметно меньше произвольного диапазона до фикса; без температуры
+     softmax/top_k стал бы слишком плоским (все эксперты почти
+     равновероятны) и МЕДЛЕННЕЕ обучался бы отличать токены. Temperature
+     обучается тем же градиентным путём, что и остальная модель -- НЕ
+     добавляет новую multi_transform-группу в optimizer.py (попадает в
+     "other"/default-группу _label_leaf, тот же LR, что у большинства
+     параметров).
+  3. Узкий clip(-8, 8) на router_logits ДО softmax/noise -- exp(8)/exp(-8)
+     ~ 3000x разницы между самым и наименее вероятным экспертом при
+     top_gate softmax -- этого более чем достаточно для уверенной
+     маршрутизации, но структурно не даёт уйти в экстремальный
+     почти-one-hot коллапс, даже если temperature сама по себе окажется
+     плохо откалиброванной на первых шагах. Старый широкий _sanitize
+     (clip ±1e3) сохранён КАК ЕСТЬ для остальных величин в файле (h_pre,
+     out, dW1/dW2/dx/dh) -- он защищает от overflow, не от router
+     collapse, и трогать его не нужно.
+
+Обратная совместимость с чекпоинтами: router.kernel остаётся тем же
+self.param с той же формой (d_model, E_routed) -- ТОЛЬКО способ его
+использования внутри forward меняется (нормализация -- чистая функция
+существующего параметра, не новый параметр). router_temp -- НОВЫЙ
+параметр, которого не было в старых чекпоинтах; restore существующего
+чекпоинта БЕЗ router_temp потребует либо FORCE_FRESH_START, либо (что
+дешевле и правильнее здесь) переинициализации ТОЛЬКО router-группы после
+restore -- см. train.py's router-reset patch, который в любом случае
+рекомендован отдельно для лечения уже накопленного router collapse на
+чекпоинте до этого фикса.
+
+ФИКС (этот пасс -- shared expert без градиентной защиты, см. чат: [DIAG]
+стабильно светил non-finite именно в группах moe/embed/other, при этом
+router_max_cos/min_col_norm полностью здоровы (0.02-0.08 / 0.916-0.918) --
+MoE-роутинг исключён как источник. Разобрано по узлам: routed-путь уже
+защищён -- КАЖДЫЙ gmm/tgmm вызов в _core_bwd проходит через _sanitize.
+shared_w1/shared_w2 -- голый nn.Dense БЕЗ какой-либо защиты градиента,
+единственный узел в GmmMoEJ без sanitizer'а. Добавлен _moe_grad_sanitizer
+на shared_out, тот же паттерн/тег-конвенция, что уже применяется к
+flat_x_for_router (moe_router_input_grad_*) -- активно клипует несущийся
+назад градиент (не только детектирует, как make_grad_probe), прежде чем
+он попадёт в residual stream через combined/current_x.
+"""
+from __future__ import annotations
+
+from functools import partial
 
 import jax
 import jax.numpy as jnp
-import optax
+from flax import linen as nn
+from jax.sharding import PartitionSpec as P
 
-from model import ModelConfig
-from utils import collect_by_leaf_name, path_to_str
+from jax.experimental.pallas.ops.tpu.megablox.gmm import gmm, tgmm
 
-ROUTER_COLLINEARITY_COEF = 0.08  # стартовое значение, требует калибровки — см. ниже
 
-# ФИКС (resume LR jump): RESUME_BACKOFF_STEPS/RESUME_LR_SCALE -- явные
-# модульные константы. resume_backoff сглажена линейной рампой
-# (RAMP_STEPS=1000) в теле функции ниже -- скачка LR на step=RESUME_BACKOFF_STEPS
-# больше нет.
-RESUME_BACKOFF_STEPS = 5000
-RESUME_LR_SCALE = 0.7
+_DEFAULT_TILING = (128, 128, 128)
+_SANITIZE_CLIP = 1e3
 
-# ДИАГНОСТИКА (2-й уровень, backward-only): см. аналогичную в model.py.
-# Здесь отдельная копия, чтобы не тянуть зависимость optimizer.py -> model.py
-# для одной internal-функции.
-def make_grad_probe(tag: str):
+# ФИКС: узкий clip специально для router_logits -- отдельная константа от
+# _SANITIZE_CLIP (которая остаётся широкой ±1e3 overflow-защитой для
+# остальных величин в файле). exp(8) ~ 2981, exp(-8) ~ 0.000335 -- диапазон
+# ~9e6 между самым уверенным и самым неуверенным логитом даже ДО softmax,
+# более чем достаточно для полной уверенности маршрутизации без риска
+# экстремального one-hot коллапса, устойчивого к любому текущему
+# router_z_loss_coef/router_noise_std.
+_ROUTER_LOGIT_CLIP = 8.0
+_ROUTER_TEMP_INIT = 10.0
+import os
+
+_MOE_FWD_DIAG = os.environ.get("GDN2_FWD_DIAG", "0") == "1"
+def _safe_normalize(t, eps=1e-6):
+    """L2-нормализация по последней оси (по строкам)."""
+    return t * jax.lax.rsqrt(jnp.sum(t * t, axis=-1, keepdims=True) + eps)
+
+def _moe_grad_sanitizer(tag: str, clip_val: float = 1e3):
+    """Local copy of model.py's make_grad_sanitizer (same reasoning
+    optimizer.py already gives for its own local copy: avoid a
+    moe_gmm.py -> model.py import for one internal helper).
+
+    Placed on the flat_x copy that feeds router_logits (see call site
+    in GmmMoEJ.__call__ below) -- isolation there means the cotangent this
+    node sees on the real backward pass is EXACTLY the router's own
+    contribution to dflat_x. This replaces the synthetic dL/dflat_x check
+    from the offline diagnostic script -- here it's the ACTUAL gradient
+    from the ACTUAL training step, not a proxy, and it costs nothing extra
+    since it's already being computed by autodiff.
+
+    ФИКС (этот пасс): ТАКЖЕ placed on shared_out (see call site below) --
+    previously the shared expert (shared_w1/shared_w2, plain nn.Dense) was
+    the ONLY node in this whole file with no gradient protection at all,
+    while the routed gmm/tgmm path already sanitizes every backward output
+    inside _core_bwd. Same helper, same reasoning, different call site --
+    see module docstring's "ФИКС (этот пасс -- shared expert...)" section.
+
+    Also ACTIVELY clips (not just reports) -- same "diagnose AND fix"
+    pattern already used for mla_flash_attn_out/gdn2_q_normalize/
+    gdn2_k_normalize/delta_fanin_* in model.py."""
     @jax.custom_vjp
-    def _probe(x):
+    def _sanitizer(x):
         return x
 
     def _fwd(x):
@@ -29,477 +235,394 @@ def make_grad_probe(tag: str):
 
     def _bwd(_, g):
         finite = jnp.all(jnp.isfinite(g))
-        jax.lax.cond(
-            jnp.logical_not(finite),
-            lambda: jax.debug.print("[BWD-DIAG] ⚠️ non-finite ВХОДЯЩИЙ градиент в узле: " + tag),
-            lambda: None,
-        )
-        return (g,)
-
-    _probe.defvjp(_fwd, _bwd)
-    return _probe
-def _frozen_step():
-    def init_fn(params):
-        return optax.EmptyState()
-    def update_fn(updates, state, params=None):
-        return jax.tree_util.tree_map(jnp.zeros_like, updates), state
-    return optax.GradientTransformation(init_fn, update_fn)
-
-tx_frozen = _frozen_step()
-
-# ==========================================
-# Muon (Newton-Schulz orthogonalization)
-# ==========================================
-def muon_orthogonalize(w, g, lr, ns_steps: int = 3):
-    """Orthogonalize the gradient via Newton-Schulz iteration, then take a step."""
-    # ФИКС: eps увеличен — bfloat16 не держит 1e-7, норма обнуляется, 
-    # деление на ~0 дает inf, Newton-Schulz взрывается.
-    eps = 1e-4
-    
-    if w.ndim == 3:
-        norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
-        # Если норма слишком мала — считаем градиент нулевым,
-        # иначе деление на ~0 дает inf и заражает все параметры nan.
-        norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
-        X = g / norm
-        for _ in range(ns_steps):
-            X = 1.5 * X - 0.5 * jnp.einsum("eij,ejk,ekl->eil", X, jnp.swapaxes(X, -1, -2), X)
-            # Если итерация разошлась — обнуляем, не даем nan расползтись
-            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    else:
-        norm = jnp.linalg.norm(g)
-        norm = jnp.where(norm < eps, 1.0, norm)
-        X = g / norm
-        for _ in range(ns_steps):
-            X = 1.5 * X - 0.5 * X @ X.T @ X
-            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return w - (X * lr)
-
-
-class MuonState(NamedTuple):
-    count: jnp.ndarray
-
-
-class BurstDamperState(NamedTuple):
-    ema_norm: jnp.ndarray
-
-
-def burst_damper(decay: float = 0.98, threshold_ratio: float = 3.0, min_scale: float = 0.1):
-    """ФИКС (этот пасс -- см. chat: затяжные периоды global_grad_norm>20,
-    держащиеся сотни эффективных шагов ПОДРЯД перед тем, как дойти до
-    настоящего non-finite -- наблюдалось ДВАЖДЫ на РАЗНЫХ позициях
-    warmup-рампы (~66-80% в первый раз, ~50% во второй), т.е. проблема НЕ
-    завязана на конкретную точку кривой LR/на то, восстановлен ли
-    честный momentum или нет -- она завязана на САМ ДИАПАЗОН LR/momentum,
-    в котором архитектура (BlockDAR -- накопительный residual через
-    history_blocks + GDN-2/Mamba2/MoE) периодически заходит в нестабильный
-    режим. BURST-GUARD в train.py уже ВИДИТ этот режим заранее (несколько
-    эффективных шагов подряд с global_norm>20), но раньше только логировал
-    предупреждение -- ничего не предпринимал, чтобы реально затормозить
-    расходящийся шаг.
-
-    Это -- ОТДЕЛЬНАЯ, ДОПОЛНИТЕЛЬНАЯ (не заменяющая) линия обороны против
-    optax.clip_by_global_norm (фиксированный порог 0.25 -- см. ниже):
-    clip_by_global_norm обрезает КАЖДЫЙ шаг до одной и той же абсолютной
-    нормы, независимо от контекста -- он не различает "стабильно большой
-    grad_norm, потому что модель обучается на сложных данных" и "grad_norm
-    внезапно вырос в 5x относительно того, что было последние сотни шагов,
-    похоже на начало runaway". burst_damper -- ВТОРАЯ, more контекстно-
-    зависимая линия: держит экспоненциальное скользящее среднее (EMA)
-    нормы градиента (`ema_norm`, персистентный скаляр в opt_state -- т.е.
-    переживает resume ровно так же, как momentum AdamW/Lion/Muon, начиная
-    с фикса _generic_pytree_merge в train.py) и, если СЫРАЯ (до clip)
-    норма ЭТОГО шага более чем в `threshold_ratio` раз превышает EMA,
-    приглушает обновление коэффициентом `max(min_scale, threshold_ratio /
-    ratio)` -- то есть чем сильнее всплеск относительно недавней "нормы",
-    тем сильнее приглушение (но не более чем до min_scale, чтобы не
-    занулять шаг полностью -- полное занижение уже делает существующий
-    is_finite skip-step в train_setup.py на настоящих non-finite шагах,
-    это разные механизмы).
-
-    ВАЖНО: EMA обновляется УЖЕ ПРИГЛУШЁННОЙ нормой этого шага (`damped_norm
-    = norm * scale`), а НЕ сырой -- иначе сам burst "утягивал" бы EMA
-    вверх и через несколько шагов "легализовывал" бы уже случившийся
-    всплеск как новую норму, вместо того чтобы продолжать сопротивляться
-    ему, пока он реально не затихнет.
-
-    Вставляется ПЕРВЫМ элементом chain (до clip_by_global_norm) -- работает
-    на СЫРОМ (после nan_to_num/scale в distributed_apply_step, но до
-    clip_by_global_norm) градиенте, той же формы, что и остальной chain
-    (весь pytree разом, до multi_transform-разметки по группам -- та же
-    точка, где сейчас уже стоит clip_by_global_norm)."""
-    def init_fn(params):
-        return BurstDamperState(ema_norm=jnp.array(1.0, dtype=jnp.float32))
-
-    def update_fn(updates, state, params=None):
-        norm = optax.global_norm(updates)
-        ratio = norm / (state.ema_norm + 1e-6)
-        scale = jnp.where(
-            ratio > threshold_ratio,
-            jnp.maximum(min_scale, threshold_ratio / ratio),
-            1.0,
-        )
-        new_updates = jax.tree_util.tree_map(lambda g: g * scale, updates)
-        damped_norm = norm * scale
-        new_ema = state.ema_norm * decay + damped_norm * (1.0 - decay)
-        return new_updates, BurstDamperState(ema_norm=new_ema)
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
-    # ФИКС (этот пасс -- см. chat, router collapse эпизод + non-finite взрыв
-    # сразу после resume): warmup-доля увеличена 10% -> 20%. Раньше короткий
-    # warmup (~10%, при total_steps=30172 это warmup_steps=3017) в сочетании
-    # с тем, что opt_state (momentum AdamW/Lion/Muon) ПОЛНОСТЬЮ обнулялся на
-    # каждом resume (см. train.py's докстринг про restore), давал двойной
-    # удар: холодный оптимизатор + быстро растущий LR -- крах стабильно
-    # ловился на ~66-80% локального прогресса по warmup (~2300-2400 при
-    # warmup_steps=3017). Теперь opt_state (train.py's
-    # _compatible_restore_params_and_opt_state) реально ВОССТАНАВЛИВАЕТСЯ из
-    # HF-чекпоинта -- momentum и внутренние step-счётчики ("count") больше
-    # НЕ обнуляются на resume для параметров, чья структура не изменилась
-    # (т.е. почти всё, кроме router/expert_bias, которые и так новые/
-    # несовместимые листья). Поскольку momentum теперь настоящий (не
-    # холодный), оставшийся риск -- уже не "холодный старт", а "слишком
-    # быстрый рост LR относительно того, как архитектура (BlockDAR,
-    # накопительный residual stream) успевает адаптироваться" -- удлинённый
-    # warmup даёт более плавную рампу для этого случая. Комбинируется со
-    # сниженным пиком LR ниже (adamw/lion) -- обе меры решают РАЗНЫЕ грани
-    # одной проблемы (высота пика + скорость его достижения), применяются
-    # вместе.
-    warmup_steps = max(500, int(total_steps * 0.20))
-    cosine = optax.cosine_decay_schedule(
-        init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
-    )
-    lr_schedule = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(init_value=0.0, end_value=1.0, transition_steps=warmup_steps),
-            cosine,
-        ],
-        boundaries=[warmup_steps],
-    )
-
-    def resume_backoff(step):
-        # ФИКС: было jnp.where(step < RESUME_BACKOFF_STEPS, RESUME_LR_SCALE, 1.0) --
-        # мгновенный скачок LR в 1/0.7≈1.43x РОВНО на step=RESUME_BACKOFF_STEPS.
-        # Линейная рампа на последних 1000 шагов убирает разрыв, сохраняя тот
-        # же итоговый диапазон [0.7, 1.0]. Теперь, когда opt_state's count
-        # ЧЕСТНО восстанавливается из чекпоинта (train.py), эта функция
-        # видит РЕАЛЬНУЮ позицию обучения, а не 0 на каждой сессии -- т.е.
-        # этот переход тоже происходит РОВНО ОДИН раз за всё обучение
-        # (на глобальном шаге ~5000), как и было задумано изначально, а не
-        # на каждом resume.
-        RAMP_STEPS = 1000.0
-        ramp_start = RESUME_BACKOFF_STEPS - RAMP_STEPS
-        frac = jnp.clip((step - ramp_start) / RAMP_STEPS, 0.0, 1.0)
-        return RESUME_LR_SCALE + (1.0 - RESUME_LR_SCALE) * frac
-
-    # ==========================================================================
-    # ФИКС (пик LR снижен, см. chat -- router collapse эпизод 9300-9568 и
-    # non-finite взрыв на ~2300-2400 локальных шагах warmup): BlockDAR --
-    # накопительный, некaнонический residual stream (HybridDARAttention +
-    # history_blocks через 7 блоков) в сочетании с насыщенным/
-    # структурированным датасетом (код/математика/агентные траектории,
-    # более коррелированный градиент) органически не терпит такой же пик
-    # LR, как более "обычные" архитектуры. Пик снижен ~0.6-0.67x по обеим
-    # группам (adamw: 1e-3 -> 6e-4, lion: 3e-4 -> 2e-4). Применяется ВМЕСТЕ
-    # с удлинённым warmup (выше) и восстановлением реального opt_state
-    # (train.py) -- три независимые, дополняющие друг друга меры против
-    # одной и той же категории non-finite/router-collapse инцидентов.
-    # ==========================================================================
-    lion_lr = lambda step: 2e-4 * lr_schedule(step) * resume_backoff(step)
-    adamw_lr = lambda step: 6e-4 * lr_schedule(step) * resume_backoff(step)
-    tx_lion = optax.lion(learning_rate=lion_lr, weight_decay=0.1)
-    tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
-    tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
-
-    def _muon_step(base_lr: float, weight_decay: float = 0.01):
-        def init_fn(params):
-            return MuonState(count=jnp.zeros([], jnp.int32))
-
-        def update_fn(updates, state, params=None):
-            if params is None:
-                return updates, state
-            step_lr = base_lr * lr_schedule(state.count)
-            # ФИКС: у Muon-ветки (в отличие от AdamW/Lion) не было НИКАКОГО
-            # weight decay -- ортогонализованное обновление ничего не тянет
-            # к нулю, поэтому норма параметров могла годами (в масштабе шагов
-            # обучения) медленно дрейфовать вверх без противовеса. Это
-            # правдоподобный вклад в наблюдавшийся "взрыв параметров"
-            # (см. диагностику [PARAM-DIAG] в train.py). Добавляем простой
-            # decoupled weight decay: w <- w - step_lr*weight_decay*w,
-            # применяется ПОСЛЕ основного muon-шага, тем же способом, что
-            # AdamW/Lion делают decoupled decay.
-            new_updates = jax.tree_util.tree_map(
-                lambda p, g: (muon_orthogonalize(p, g, step_lr) - p) - step_lr * weight_decay * p,
-                params, updates,
+        max_abs = jnp.max(jnp.abs(jnp.where(jnp.isfinite(g), g, 0.0)))
+        if _MOE_FWD_DIAG:
+            jax.lax.cond(
+                jnp.logical_or(jnp.logical_not(finite), max_abs > clip_val),
+                lambda: jax.debug.print(
+                    "[MOE-BWD-DIAG] ⚠️ " + tag + ": incoming grad finite={f} "
+                    "max_abs={m:.3e} -- sanitized to +-{c}",
+                    f=finite, m=max_abs, c=clip_val,
+                ),
+                lambda: None,
             )
-            return new_updates, MuonState(count=state.count + 1)
+        g_safe = jnp.nan_to_num(jnp.clip(g, -clip_val, clip_val),
+                                 nan=0.0, posinf=clip_val, neginf=-clip_val)
+        return (g_safe,)
 
-        return optax.GradientTransformation(init_fn, update_fn)
+    _sanitizer.defvjp(_fwd, _bwd)
+    return _sanitizer
 
-    # ФИКС (этот пасс -- см. chat: затяжной период global_grad_norm>20 на
-    # протяжении ~800 эффективных шагов ПОСЛЕ того, как честный
-    # opt_state-merge наконец заработал, т.е. Muon больше не получает
-    # случайный "сброс момента" на каждом resume, который РАНЬШЕ,
-    # похоже, непреднамеренно периодически чинил медленный дрейф нормы
-    # параметров вверх): base_lr снижен ещё раз (0.008 -> 0.006),
-    # weight_decay увеличен (0.01 -> 0.02) -- сильнее противовес
-    # ортогонализованным обновлениям, которые сами по себе ничего не
-    # тянут к нулю. Раньше этот дрейф периодически (и случайно) обнулялся
-    # холодным restart'ом оптимизатора при каждом resume -- теперь, когда
-    # momentum реально переживает resume (см. _generic_pytree_merge's
-    # критический фикс в train.py), эта защита должна идти НЕ от
-    # случайных сбросов, а от самого механизма (сильнее decay, ниже LR).
-    tx_muon = _muon_step(base_lr=0.006, weight_decay=0.02)
-
-    # ФИКС: НЕ добавляем отдельную группу multi_transform для decay_a/A_log --
-    # это меняет СТРУКТУРУ opt_state (новый ключ в multi_transform), что
-    # ломает restore со старых чекпоинтов (несовпадение pytree). Тот же эффект
-    # "замедленного LR для decay-параметров" реализован в train.py на уровне
-    # МАСШТАБИРОВАНИЯ ГРАДИЕНТА (avg_grads *= 0.2 для этих leaf) ДО входа в
-    # tx.update() -- функционально эквивалентно, но не трогает состояние
-    # оптимизатора, поэтому совместимо с уже сохранёнными чекпоинтами.
-    def _label_leaf(path, param):
-        path_str = path_to_str(path)
-        if "embed" in path_str or "lm_head" in path_str:
-            return "adamw_decay"
-        if "norm" in path_str or "bias" in path_str:
-            return "adamw_nodecay"
-        # ФИКС (интеграция SparseMoEJ, atomic_ops/moe_sparse.py): router --
-        # маленький, чувствительный к начальной балансировке Dense(d_model,
-        # E_routed). Muon-ортогонализация (агрессивное обновление
-        # направления, без weight decay до фикса выше) на этом конкретном
-        # слое рискует резко раскачать routing-решения до того, как
-        # утилизация экспертов успеет устаканиться -- именно тот режим
-        # (высокий dropped_ratio на первых шагах, пока роутер не
-        # сбалансирован), где ошибка маршрутизации дороже всего. AdamW без
-        # decay -- мягче и предсказуемее для этого конкретного слоя, тот же
-        # выбор, что уже сделан для norm/bias.
-        #
-        # ФИКС (bias-балансировка, DeepSeek-V3 style): expert_bias остаётся
-        # "frozen" для ГРАДИЕНТНОГО пути -- обновляется decoupled-путём в
-        # train_setup.py's apply_expert_bias_update, на основе ФАКТИЧЕСКОЙ
-        # частоты top-k-назначений (assignment_frac), не градиента loss.
-        if "expert_bias" in path_str:
-            return "frozen"
-        if "router" in path_str:
-            return "adamw_nodecay"
-        if param.ndim >= 2:
-            if "mamba" in path_str:
-                return "lion"
-            if muon_diagnostic_disable:
-                return "adamw_nodecay"
-            return "muon"
-        return "lion"
-
-    def label_fn(params):
-        return jax.tree_util.tree_map_with_path(_label_leaf, params)
-
-    # ФИКС (этот пасс -- см. chat: затяжной ~800-шаговый период
-    # global_grad_norm>20 перед non-finite в moe/embed/other, PARAM-DIAG
-    # ни разу не сработал -- т.е. параметры сами по себе не разрослись, но
-    # градиент долго оставался нездоровым): clip ужесточён ещё раз
-    # (0.35 -> 0.25). clip_by_global_norm не имеет состояния (EmptyState),
-    # поэтому это изменение НЕ влияет на совместимость чекпоинтов.
-    clip_tx = optax.clip_by_global_norm(0.25)
-    multi_tx = optax.multi_transform(
-        {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay,
-         "adamw_nodecay": tx_adamw_nodecay, "frozen": tx_frozen},
-        label_fn,
-    )
-    tx = optax.chain(clip_tx, multi_tx)
-    return tx, lr_schedule
-
-# ==========================================
-# Loss
-# ==========================================
-def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size):
-    """One token-chunk of label-smoothed CE."""
-    sum_loss, sum_mask = carry
-    hidden_chunk, label_chunk = chunk  # (chunk_size, d_model), (chunk_size,)
-
-    # Матмул в bf16 для памяти (chunk_size x d_model x vocab — самый большой
-    # single matmul в модели). Bfloat16 дает ~2x меньше памяти и полную
-    # throughput TPU MXU. НО: при больших значениях hidden/w bf16 overflow'ится
-    # в inf. Решение: upcast в fp32 -> nan_to_num (inf->clip) -> clip -> softmax.
-    logits_chunk = (hidden_chunk.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
-
-    # ФИКС: sanitize bfloat16 overflow. Если значение inf или nan —
-    # заменяем на крайние допустимые, чтобы log_softmax не дал nan.
-    logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
-    logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
-    logits_chunk = make_grad_probe("ce_logits_chunk")(logits_chunk)
-
-    log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
-
-    labels_safe = jnp.clip(label_chunk, 0, vocab_size - 1)
-    nll = -jnp.take_along_axis(log_probs, labels_safe[:, None], axis=-1).squeeze(-1)
-
-    if smooth_negative is not None:
-        sum_log_probs = jnp.sum(log_probs, axis=-1)
-        loss_vec = nll * (smooth_positive - smooth_negative) - smooth_negative * sum_log_probs
-    else:
-        loss_vec = nll
-
-    mask = (label_chunk != -100).astype(jnp.float32)
-
-    # ФИКС: jnp.where вместо умножения. Если nll содержит nan (например, от
-    # inf logits до sanitize), то nan * 0.0 = nan, и jnp.sum все равно даст nan.
-    # jnp.where(mask>0, loss_vec, 0.0) берет 0.0 из false-branch и игнорирует
-    # nan в true-branch — pad-токены дают ровно 0 вклада.
-    masked_loss = jnp.where(mask > 0, loss_vec, 0.0)
-
-    new_carry = (sum_loss + jnp.sum(masked_loss), sum_mask + jnp.sum(mask))
-    return new_carry, None
+def _sanitize(x, clip=_SANITIZE_CLIP):
+    return jnp.nan_to_num(jnp.clip(x, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
 
 
-def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=256):
-    b, l, d = final_hidden.shape
-    vocab_size = w.shape[-1]
-
-    flat_hidden = final_hidden.reshape(b * l, d)
-    flat_labels = labels.reshape(b * l)
-
-    n_tokens = flat_hidden.shape[0]
-    pad = (-n_tokens) % chunk_size
-    if pad:
-        flat_hidden = jnp.pad(flat_hidden, ((0, pad), (0, 0)))
-        flat_labels = jnp.pad(flat_labels, (0, pad), constant_values=-100)
-
-    n_chunks = flat_hidden.shape[0] // chunk_size
-    hidden_chunks = flat_hidden.reshape(n_chunks, chunk_size, d)
-    label_chunks = flat_labels.reshape(n_chunks, chunk_size)
-
-    smooth_positive = 1.0 - label_smoothing
-    smooth_negative = (label_smoothing / (vocab_size - 1)) if label_smoothing > 0 else None
-
-    scan_step = jax.checkpoint(
-        lambda carry, chunk: _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size)
-    )
-
-    (sum_loss, sum_mask), _ = jax.lax.scan(scan_step, (0.0, 0.0), (hidden_chunks, label_chunks))
-
-    # ФИКС: защита от пустого батча (все токены -100). jnp.maximum с 1.0
-    # вместо +1e-9 — если sum_mask=0, возвращаем 0.0 (не огромное число).
-    return sum_loss / jnp.maximum(sum_mask, 1.0)
+def _auto_tile(m, k, n, m_pref=128, k_pref=128, n_pref=128):
+    def _pick(d, pref):
+        return pref if d % pref == 0 else d
+    return (_pick(m, m_pref), _pick(k, k_pref), _pick(n, n_pref))
 
 
-def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, deterministic=False, return_aux=False,
-                  ce_chunk_size=256, collinearity_coef=None):
-    input_ids = batch["input_ids"]
-    labels = batch["labels"]
+def _make_grouped_ffn_core(interpret=False):
 
-    kwargs = {"deterministic": deterministic, "return_hidden": True}
-    if rngs is not None:
-        kwargs["rngs"] = rngs
+    def _fwd_math(x_sorted, W1, W2, group_sizes):
+        x_f = x_sorted.astype(jnp.float32)
+        W1_f = W1.astype(jnp.float32)
+        W2_f = W2.astype(jnp.float32)
 
-    outputs = model_fn(
-        {"params": params}, input_ids, **kwargs, mutable=["losses"] if not deterministic else False
-    )
+        T, d_model = x_f.shape
+        _, _, d_ff = W1_f.shape
 
-    expert_util_stacked = None
-    dropped_ratio_stacked = None
-    router_temp_stacked = None  
-    min_col_norm_stacked = None               # NEW
-    max_abs_logit_preclip_stacked = None      # NEW
-    norm_x_mean_stacked = None    # NEW
-    norm_x_max_stacked = None     # NEW
-    norm_x_min_stacked = None     # NEW
-    # ФИКС (bias-балансировка, DeepSeek-V3 style): assignment_frac -- см.
-    # docstring в moe_gmm.py's патче ("assignment_frac", sown сразу после
-    # top_gate). Собирается тем же collect_by_leaf_name-путём, что и
-    # router_temp -- порядок листьев ДОЛЖЕН совпадать с порядком
-    # expert_bias-параметров в params (оба идут по блокам model.py's
-    # BlockDAR в порядке block_0, block_1, ... -- см. предупреждение в
-    # train_setup.py's _build_expert_bias_index_map).
-    assignment_frac_stacked = None  # NEW
-    if not deterministic:
-        final_hidden, sowed_vars = outputs
-        aux_losses = collect_by_leaf_name(sowed_vars["losses"], "aux_loss")
-        z_losses = collect_by_leaf_name(sowed_vars["losses"], "z_loss")
-        expert_utils = collect_by_leaf_name(sowed_vars["losses"], "expert_utilization")
-        # ФИКС (интеграция SparseMoEJ): moe_dropped_ratio sown per-layer by
-        # SparseMoEJ (atomic_ops/moe_sparse.py) -- same collection pattern
-        # as expert_utilization/aux_loss/z_loss above. Absent for the dense
-        # MoEJ path, so this stays None (and downstream consumers must
-        # handle that, same as expert_utilization already does) if the
-        # model is ever switched back to the dense MoE for cross-checking.
-        dropped_ratios = collect_by_leaf_name(sowed_vars["losses"], "moe_dropped_ratio")
-        router_temps = collect_by_leaf_name(sowed_vars["losses"], "router_temp")
-        min_col_norms = collect_by_leaf_name(sowed_vars["losses"], "min_col_norm")
-        max_abs_logits_preclip = collect_by_leaf_name(sowed_vars["losses"], "max_abs_logit_preclip")
-        router_collinearities = collect_by_leaf_name(sowed_vars["losses"], "router_collinearity")
-        router_max_cos_list = collect_by_leaf_name(sowed_vars["losses"], "router_max_cos")
-        norm_x_mean = collect_by_leaf_name(sowed_vars["losses"], "norm_x_mean")
-        norm_x_max = collect_by_leaf_name(sowed_vars["losses"], "norm_x_max")
-        norm_x_min = collect_by_leaf_name(sowed_vars["losses"], "norm_x_min")
-        # NEW: assignment_frac -- список из E_routed-векторов, по одному на
-        # MoE-блок, в порядке обхода дерева (тот же порядок, что router_temp).
-        assignment_fracs = collect_by_leaf_name(sowed_vars["losses"], "assignment_frac")
-        aux_loss = jnp.sum(jnp.stack(aux_losses)) if aux_losses else 0.0
-        z_loss = jnp.sum(jnp.stack(z_losses)) if z_losses else 0.0
-        if expert_utils:
-            expert_util_stacked = jnp.stack(expert_utils)
-        if dropped_ratios:
-            dropped_ratio_stacked = jnp.stack(dropped_ratios)
-        if router_temps:                # добавлено
-            router_temp_stacked = jnp.stack(router_temps)
-        if assignment_fracs:            # NEW
-            assignment_frac_stacked = jnp.stack(assignment_fracs)   # (n_moe_layers, E_routed)
-        min_col_norm_stacked = jnp.stack(min_col_norms) if min_col_norms else None
-        max_abs_logit_preclip_stacked = jnp.stack(max_abs_logits_preclip) if max_abs_logits_preclip else None
-        # Анти-коллинеарный штраф
-        collinearity_loss = jnp.sum(jnp.stack(router_collinearities)) if router_collinearities else 0.0
-        # Для логирования в W&B: возьмём максимум по слоям, чтобы видеть наихудший случай
-        router_max_cos_per_layer = jnp.stack(router_max_cos_list) if router_max_cos_list else None
-        # Вычисляем максимум по слоям для мониторинга в проде
-        router_max_cos = jnp.max(router_max_cos_per_layer) if router_max_cos_per_layer is not None else 0.0
-        if norm_x_mean:
-            norm_x_mean_stacked = jnp.stack(norm_x_mean)
-        if norm_x_max:
-            norm_x_max_stacked = jnp.stack(norm_x_max)
-        if norm_x_min:
-            norm_x_min_stacked = jnp.stack(norm_x_min)
-            
-    else:
-        final_hidden = outputs
-        aux_loss, z_loss = 0.0, 0.0
-        collinearity_loss = 0.0
+        h_pre = gmm(x_f, W1_f, group_sizes,
+                    tiling=_auto_tile(T, d_model, d_ff),
+                    interpret=interpret, preferred_element_type=jnp.float32)
+        h_pre = _sanitize(h_pre)
 
-    if cfg.tie_embeddings:
-        w = params["embed"]["embedding"].T
-    else:
-        w = params["lm_head"]["kernel"]
+        h, gelu_vjp = jax.vjp(jax.nn.gelu, h_pre)
 
-    ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
+        out = gmm(h, W2_f, group_sizes,
+                  tiling=_auto_tile(T, d_ff, d_model),
+                  interpret=interpret, preferred_element_type=jnp.float32)
+        out = _sanitize(out)
+        return out, h, gelu_vjp
 
-    # ФИКС: последняя линия обороны. Если в params уже есть nan (например,
-    # от предыдущего взорвавшегося шага), обнуляем ce_loss чтобы не заразить
-    # opt_state. Обучение продолжится с плохим loss — это сигнал смотреть
-    # предыдущие шаги, но не убивает процесс.
-    ce_loss = jnp.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=0.0)
-    _collinearity_coef = collinearity_coef if collinearity_coef is not None else ROUTER_COLLINEARITY_COEF
-    total_loss = ce_loss + (cfg.router_aux_loss_coef * aux_loss) + (cfg.router_z_loss_coef * z_loss) \
-                 + (_collinearity_coef * collinearity_loss)
-    if return_aux:
-        aux_info = {
-            "ce_loss": ce_loss,
-            "aux_loss": aux_loss,
-            "z_loss": z_loss,
-            "expert_utilization": expert_util_stacked,
-            "moe_dropped_ratio": dropped_ratio_stacked,
-            "router_temp": router_temp_stacked,
-            "min_col_norm": min_col_norm_stacked,                     # NEW
-            "max_abs_logit_preclip": max_abs_logit_preclip_stacked,   # NEW
-            "norm_x_mean": norm_x_mean_stacked,   # NEW
-            "norm_x_max": norm_x_max_stacked,     # NEW
-            "norm_x_min": norm_x_min_stacked,     # NEW
-            "router_max_cos_per_layer": router_max_cos_per_layer,
-            "router_max_cos": router_max_cos,
-            "assignment_frac": assignment_frac_stacked,   # NEW (bias-балансировка)
-        }
-        return total_loss, aux_info
-    return total_loss
+    # NOTE: no more nondiff_argnums -- group_sizes is now an ordinary
+    # (traced-safe) positional argument. custom_vjp is fine with an
+    # integer-dtype argument as long as bwd returns a float0 cotangent
+    # for it (see _core_bwd below).
+    @jax.custom_vjp
+    def _core(x_sorted, W1, W2, group_sizes):
+        out, _, _ = _fwd_math(x_sorted, W1, W2, group_sizes)
+        return out.astype(x_sorted.dtype)
+
+    def _core_fwd(x_sorted, W1, W2, group_sizes):
+        out, h, gelu_vjp = _fwd_math(x_sorted, W1, W2, group_sizes)
+        # group_sizes carried through residuals now (it used to be closed
+        # over via nondiff_argnums and handed to _core_bwd separately).
+        residuals = (x_sorted, W1, W2, group_sizes, h, gelu_vjp)
+        return out.astype(x_sorted.dtype), residuals
+
+    def _core_bwd(residuals, dout):
+        x_sorted, W1, W2, group_sizes, h, gelu_vjp = residuals
+        x_f = x_sorted.astype(jnp.float32)
+        W1_f = W1.astype(jnp.float32)
+        W2_f = W2.astype(jnp.float32)
+        dout_f = _sanitize(dout.astype(jnp.float32))
+
+        T, d_model = x_f.shape
+        _, d_ff = h.shape
+
+        dW2 = tgmm(h.T, dout_f, group_sizes,
+                   tiling=_auto_tile(d_ff, T, d_model),
+                   interpret=interpret, preferred_element_type=jnp.float32)
+        dW2 = _sanitize(dW2)
+
+        W2_T = jnp.swapaxes(W2_f, 1, 2)
+        dh = gmm(dout_f, W2_T, group_sizes,
+                 tiling=_auto_tile(T, d_model, d_ff),
+                 interpret=interpret, preferred_element_type=jnp.float32)
+        dh = _sanitize(dh)
+
+        (dh_pre,) = gelu_vjp(dh)
+        dh_pre = _sanitize(dh_pre.astype(jnp.float32))
+
+        dW1 = tgmm(x_f.T, dh_pre, group_sizes,
+                   tiling=_auto_tile(d_model, T, d_ff),
+                   interpret=interpret, preferred_element_type=jnp.float32)
+        dW1 = _sanitize(dW1)
+
+        W1_T = jnp.swapaxes(W1_f, 1, 2)
+        dx = gmm(dh_pre, W1_T, group_sizes,
+                 tiling=_auto_tile(T, d_ff, d_model),
+                 interpret=interpret, preferred_element_type=jnp.float32)
+        dx = _sanitize(dx)
+
+        # group_sizes is integer-dtyped and carries no gradient -- JAX's
+        # tangent type for an integer leaf is float0, and custom_vjp bwd
+        # must return a value of that dtype/shape for it (not None, not an
+        # int32 zeros array -- both are rejected).
+        dgroup_sizes = jnp.zeros(group_sizes.shape, dtype=jax.dtypes.float0)
+
+        return (
+            dx.astype(x_sorted.dtype),
+            dW1.astype(W1.dtype),
+            dW2.astype(W2.dtype),
+            dgroup_sizes,
+        )
+
+    _core.defvjp(_core_fwd, _core_bwd)
+    return _core
+
+
+class GmmMoEJ(nn.Module):
+    """Top-k=2 версия. Каждый токен маршрутизируется к ДВУМ из E_routed
+    экспертов (top_k=2 через jax.lax.top_k), веса гейта перенормируются
+    внутри выбранной пары (softmax только по 2 значениям, не по всем
+    E_routed) -- тот же приём, что Switch/GShard-стиль top-k MoE.
+
+    Диспетчинг реализован как ОДИН gmm/tgmm-проход над 2T строками:
+    каждый токен дублируется дважды (по одной копии на каждый из двух
+    выбранных экспертов), затем ОБЫЧНАЯ top-1-механика (argsort по
+    expert_idx / bincount / gmm) применяется к этому 2T-массиву без
+    изменений в самом _make_grouped_ffn_core -- gmm/tgmm агностичны к
+    происхождению group_sizes, им всё равно T это или 2T строк.
+
+    combine: для каждого исходного токена суммируются его ДВЕ выходные
+    строки (первая и вторая копия), взвешенные перенормированными
+    top-2 гейтами.
+
+    ФИКС (router collapse): router теперь использует L2-нормализованные
+    столбцы + обучаемую температуру -- см. module docstring "ФИКС (этот
+    пасс...)" выше для полного обоснования.
+
+    ФИКС (shared expert grad protection): см. module docstring's
+    "ФИКС (этот пасс -- shared expert...)" -- shared_out теперь тоже
+    проходит через _moe_grad_sanitizer.
+    """
+    cfg: object
+    interpret: bool = False
+    top_k: int = 2
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True, rngs=None):
+        b, l, d = x.shape
+        flat_x = x.reshape(-1, d)
+        # ФИКС (live router diagnostics -- replaces offline synthetic
+        # replay, which twice proved the router's forward math is
+        # structurally bounded and can't be the source of a runaway on its
+        # own; see project notes on test_synthetic_router_collapse*.py).
+        # tag is unique per block via the flax scope path (e.g.
+        # "block_3/moe"), evaluated at trace time -- one distinct probe
+        # per real MoE block, not a single shared one.
+        _moe_tag = "/".join(str(p) for p in self.scope.path) if self.scope is not None else "moe"
+        flat_x_for_router = _moe_grad_sanitizer(f"moe_router_input_grad_{_moe_tag}")(flat_x)
+        
+        # ---- новая диагностика: ||flat_x|| (по строкам) ----
+        _norm_per_token = jnp.linalg.norm(flat_x_for_router, axis=1, keepdims=False)
+        self.sow("losses", "norm_x_mean", jnp.mean(_norm_per_token))
+        self.sow("losses", "norm_x_max", jnp.max(_norm_per_token))
+        self.sow("losses", "norm_x_min", jnp.min(_norm_per_token))
+        # ----------------------------------------------------
+        T = flat_x.shape[0]
+        E_routed = self.cfg.num_experts - 1
+        k = self.top_k
+        assert E_routed >= k, f"num_experts-1={E_routed} must be >= top_k={k}."
+        from model import get_model_mesh, get_batch_axis
+        mesh = get_model_mesh()
+        batch_axis = get_batch_axis()
+
+        # ---- shared expert ----
+        shared_h = nn.Dense(self.cfg.d_ff, name="shared_w1", dtype=jnp.bfloat16)(flat_x)
+        shared_h = jax.nn.gelu(shared_h)
+        shared_h = nn.Dropout(rate=self.cfg.dropout_rate)(shared_h, deterministic=deterministic)
+        shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
+        # ФИКС (этот пасс -- см. module docstring "ФИКС (этот пасс --
+        # shared expert...)"): shared_w1/shared_w2 были ЕДИНСТВЕННЫМ узлом
+        # в GmmMoEJ без градиентной защиты -- routed-путь уже санитизирован
+        # на каждом шаге backward внутри _core_bwd. Активный клип (не
+        # только детект), тот же паттерн, что уже используется для
+        # flat_x_for_router выше.
+        shared_out = _moe_grad_sanitizer(f"moe_shared_expert_grad_{_moe_tag}")(shared_out)
+
+        # ---- routing: top-k среди E_routed ----
+        # ФИКС (router collapse): router.kernel -- явный self.param (не
+        # nn.Dense), т.к. нужен прямой доступ к сырой матрице ДЛЯ
+        # нормализации столбцов ПЕРЕД матмулом. Форма (d_model, E_routed)
+        # -- та же, что раньше выдавал nn.Dense(E_routed, use_bias=False),
+        # так что чекпоинт-совместимость по ЭТОМУ параметру сохранена
+        # (веса можно даже restore'ить напрямую, если имя/форма совпадают
+        # -- restore обычно матчит по имени пути, "router"/"kernel").
+        router_kernel = self.param(
+            "router", nn.initializers.lecun_normal(), (d, E_routed), jnp.float32
+        )
+        # L2-нормализация СТОЛБЦОВ (одно направление на эксперта) --
+        # структурный потолок на величину логита, не зависящий от того,
+        # насколько разрослась норма router_kernel под оптимизатором.
+        router_kernel_normed = router_kernel * jax.lax.rsqrt(
+            jnp.sum(router_kernel ** 2, axis=0, keepdims=True) + 1e-6
+        )
+
+        # ДОБАВИТЬ: штраф за схожесть направлений экспертов (router_max_cos=0.96 —
+        # это и есть измеренное этим членом). Считаем только off-diagonal Грам-матрицу.
+        gram = jnp.dot(router_kernel_normed.T, router_kernel_normed,
+                        precision=jax.lax.Precision.HIGHEST)  # (E_routed, E_routed), диагональ ~1.0
+        eye = jnp.eye(E_routed, dtype=gram.dtype)
+        off_diag_sq = jnp.square(gram - eye) * (1.0 - eye)   # обнулить диагональ явно
+        router_collinearity = jnp.sum(off_diag_sq) / (E_routed * (E_routed - 1))
+        self.sow("losses", "router_collinearity", router_collinearity)
+
+        _max_cos_offdiag = jnp.max(jnp.abs(gram - eye))       # тот же max_cos, что вы мерили офлайн
+        self.sow("losses", "router_max_cos", _max_cos_offdiag)
+        router_temp = self.param(
+            "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
+        )
+        router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
+        # ФИКС (router saturation): нормируем вход по L2, чтобы logit ∈ [-temp, temp]
+        flat_x_normed_for_router = _safe_normalize(flat_x_for_router.astype(jnp.float32))
+        router_logits = jnp.dot(
+        flat_x_normed_for_router, router_kernel_normed, precision=jax.lax.Precision.HIGHEST
+        ) * router_temp_clipped
+        # ФИКС (live diagnostics, forward side): capture pre-clip logit
+        # magnitude and pre-normalization column norm BEFORE the existing
+        # narrow clip/sanitize -- these are the two forward-side
+        # early-warning signals the offline snapshot script computed
+        # after-the-fact; sowing them here makes them visible every real
+        # step, not just at the one step a non-finite snapshot happened to
+        # catch.
+        _max_abs_logit_preclip = jnp.max(jnp.abs(router_logits))
+        _min_col_norm = jnp.min(jnp.sqrt(jnp.sum(router_kernel ** 2, axis=0)))
+        self.sow("losses", "max_abs_logit_preclip", _max_abs_logit_preclip)
+        self.sow("losses", "min_col_norm", _min_col_norm)
+
+        if _MOE_FWD_DIAG:
+            jax.lax.cond(
+                jnp.logical_or(_max_abs_logit_preclip > _ROUTER_LOGIT_CLIP * 1.5, _min_col_norm < 1e-3),
+                lambda: jax.debug.print(
+                    "[MOE-FWD-DIAG] ⚠️ " + _moe_tag + ": max|logit|(pre-clip)={m:.3f}  "
+                    "min_col_norm={c:.6f}", m=_max_abs_logit_preclip, c=_min_col_norm,
+                ),
+                lambda: None,
+            )
+
+        router_logits = jnp.clip(router_logits, -_ROUTER_LOGIT_CLIP, _ROUTER_LOGIT_CLIP)
+        router_logits = _sanitize(router_logits)
+        if not deterministic and self.cfg.router_noise_std > 0:
+            noise_rng = self.make_rng("dropout") if rngs is None else rngs.get("dropout")
+            router_logits = router_logits + self.cfg.router_noise_std * jax.random.normal(
+                noise_rng, router_logits.shape, dtype=router_logits.dtype
+            )
+
+        # M1': top-k выбор + перенормировка гейтов ВНУТРИ выбранной пары
+        # (не softmax по всем E_routed -- иначе вес каждого выбранного
+        # эксперта занижен относительно "честного" top-k распределения).
+        expert_bias = self.param("expert_bias", nn.initializers.zeros, (E_routed,), jnp.float32)
+        self.sow("losses", "expert_bias", expert_bias)  # для W&B, тот же паттерн что router_temp
+
+        router_logits_biased = router_logits + jax.lax.stop_gradient(expert_bias)[None, :]
+        top_vals, top_idx = jax.lax.top_k(router_logits_biased, k=k)
+        top_idx = top_idx.astype(jnp.int32)
+        # ВАЖНО: вес гейта считается по НЕбиасированным логитам выбранных экспертов --
+        # bias влияет только на ВЫБОР top-k, не на итоговый вес (как в DeepSeek-V3).
+        top_vals_unbiased = jnp.take_along_axis(router_logits, top_idx, axis=-1)
+        top_gate = jax.nn.softmax(top_vals_unbiased, axis=-1)
+        _assign_counts = jnp.zeros((E_routed,), dtype=jnp.float32)
+        for _j in range(k):
+            _assign_counts = _assign_counts + jnp.sum(
+                jax.nn.one_hot(top_idx[:, _j], E_routed), axis=0
+            )
+        assignment_frac = _assign_counts / (T * k)
+        self.sow("losses", "assignment_frac", assignment_frac)
+ 
+        # aux_loss/z_loss считаются по ПОЛНОМУ softmax(router_logits) --
+        # это диагностика балансировки роутера как такового (Switch-style
+        # load-balancing loss смотрит на распределение по ВСЕМ экспертам,
+        # не только выбранным), а не по факту 2T-дисптача.
+        full_probs = jax.nn.softmax(router_logits, axis=-1)
+        full_probs = jnp.nan_to_num(full_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        mean_probs = jnp.mean(full_probs, axis=0)
+        self.sow("losses", "aux_loss", E_routed * jnp.sum(mean_probs * mean_probs))
+        self.sow("losses", "z_loss", jnp.mean(jnp.square(
+            jax.scipy.special.logsumexp(router_logits, axis=-1))))
+        self.sow("losses", "expert_utilization", mean_probs)
+        # ФИКС (диагностика): router_temp сам по себе -- полезный
+        # индикатор ("растёт ли температура сама по себе, компенсируя
+        # узкий clip"). Сожено сюда же, тем же collect_by_leaf_name-путём,
+        # что и остальные MoE-метрики -- optimizer.py уже собирает
+        # aux_loss/z_loss/expert_utilization по имени листа, router_temp
+        # добавлен по аналогии для W&B-видимости.
+        self.sow("losses", "router_temp", router_temp)
+
+        d_model, d_ff = self.cfg.d_model, self.cfg.d_ff
+        W1 = self.param("routed_w1", nn.initializers.lecun_normal(),
+                         (E_routed, d_model, d_ff), jnp.bfloat16)
+        W2 = self.param("routed_w2", nn.initializers.lecun_normal(),
+                         (E_routed, d_ff, d_model), jnp.bfloat16)
+
+        # ==================================================================
+        # M2': дублирование токенов под 2T-диспетчинг (k копий на токен,
+        # каждая помечена одним из k выбранных экспертов, взвешена своим
+        # перенормированным гейтом). Порядок по оси-k сохраняется через
+        # concatenate -- используется для обратного split на combine.
+        # ==================================================================
+        
+        def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
+            T_rep = flat_x_local.shape[0]  # = k * T_local_device
+            group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
+            perm = jnp.argsort(expert_idx_local, stable=True)
+            inv_perm = jnp.argsort(perm)
+
+            x_sorted = jnp.take(flat_x_local, perm, axis=0)
+            grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
+            out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
+
+            return jnp.take(out_sorted, inv_perm, axis=0)  # (T_rep, d), тот же порядок, что flat_x_local
+
+        # flat_x_rep: (k*T, d) -- k конкатенированных копий flat_x, в
+        # порядке [копия под top-1-выбор для каждого токена][копия под
+        # top-2-выбор для каждого токена]...
+        flat_x_rep = jnp.concatenate([flat_x] * k, axis=0)
+        expert_idx_rep = jnp.concatenate(
+            [top_idx[:, j] for j in range(k)], axis=0
+        )  # (k*T,)
+
+        if mesh is not None and batch_axis is not None:
+            def _dispatch_local_topk(flat_x_local, top_idx_local, top_gate_local, W1_local, W2_local):
+                # Внутри shard_map: flat_x_local -- (T_local, d),
+                # top_idx_local/top_gate_local -- (T_local, k).
+                flat_x_rep_local = jnp.concatenate([flat_x_local] * k, axis=0)
+                expert_idx_rep_local = jnp.concatenate(
+                    [top_idx_local[:, j] for j in range(k)], axis=0
+                )
+                out_rep_local = _dispatch_and_ffn(flat_x_rep_local, expert_idx_rep_local, W1_local, W2_local)
+                # ФИКС: split+weighted-combine (M3') ПЕРЕНЕСЕНЫ ВНУТРЬ shard_map.
+                # Причина: out_rep_local имеет форму (k*T_local, d) --
+                # если вернуть её КАК ЕСТЬ наружу под out_specs=P(batch_axis,
+                # None), shard_map соберёт глобальный массив КОНКАТЕНАЦИЕЙ
+                # ПО УСТРОЙСТВАМ вдоль batch_axis: [dev0: copy0,copy1][dev1:
+                # copy0,copy1]... -- а код снаружи ожидал бы порядок
+                # [copy0_ВСЕ][copy1_ВСЕ]. Эти два порядка совпадают ТОЛЬКО
+                # при n_devices=1 -- при n_devices>1 расходятся, давая
+                # finite, но НЕВЕРНЫЙ результат (см. M5-topk2 тест,
+                # rel_err=0.157). Комбинирование должно происходить на
+                # ЛОКАЛЬНЫХ per-device T_local-строках, ДО того как
+                # shard_map соберёт результат по batch_axis -- тогда наружу
+                # уходит уже готовый (T_local, d), без всякой k-неоднозначности.
+                out_chunks_local = jnp.split(out_rep_local, k, axis=0)  # k x (T_local, d)
+                combined_local = jnp.zeros_like(flat_x_local, dtype=jnp.float32)
+                for j in range(k):
+                    combined_local = combined_local + out_chunks_local[j].astype(jnp.float32) * top_gate_local[:, j:j+1]
+                return combined_local  # (T_local, d) -- однозначно совпадает с out_specs
+
+            in_specs = (
+                P(batch_axis, None),   # flat_x
+                P(batch_axis, None),   # top_idx
+                P(batch_axis, None),   # top_gate
+                P(None, None, None),   # W1
+                P(None, None, None),   # W2
+            )
+            out_specs = P(batch_axis, None)
+            sharded_dispatch = jax.shard_map(
+                _dispatch_local_topk, mesh=mesh,
+                in_specs=in_specs, out_specs=out_specs,
+                check_vma=False,
+            )
+            routed_out = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
+        else:
+            # без mesh: split+combine остаются снаружи, как было -- здесь
+            # неоднозначности порядка нет, потому что shard_map не участвует.
+            routed_out_rep = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
+            out_chunks = jnp.split(routed_out_rep, k, axis=0)
+            routed_out = jnp.zeros_like(flat_x, dtype=jnp.float32)
+            for j in range(k):
+                routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1]
+        # ==================================================================
+        # M3': combine -- разбить (k*T, d) обратно на k кусков по T строк
+        # каждый (тот же порядок конкатенации, что при dispatch), взвесить
+        # top_gate[:, j] и просуммировать.
+        # ==================================================================
+
+        combined = shared_out.astype(jnp.float32) + routed_out
+        combined = _sanitize(combined)
+
+        self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
+        return combined.reshape(b, l, d).astype(x.dtype)
