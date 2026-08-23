@@ -498,7 +498,7 @@ def main_execution():
     mngr_best_train = make_manager(best_train_dir, max_to_keep=1)
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
-    FORCE_FRESH_START = False  # <-- поставьте False, чтобы вернуть обычный resume
+    FORCE_FRESH_START = False# <-- поставьте False, чтобы вернуть обычный resume
     RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
 
     # ФИКС (router collapse): см. докстринг модуля выше. После graft-merge
@@ -819,6 +819,10 @@ def main_execution():
                 mngr_latest, resume_step, params, fresh_opt_state
             )  # opt_state игнорируем
             params = jax.device_put(params_merged, param_sharding)
+            embed_weights = params["embed"]["embedding"]
+            embed_norm = float(jnp.linalg.norm(embed_weights))
+            embed_max = float(jnp.max(jnp.abs(embed_weights)))
+            print(f"[DIAG] embed norm: {embed_norm:.3f}, max abs: {embed_max:.3f}")
             #Создаём свежий opt_state с нулевыми моментами и счётчиками
             opt_state = jax.device_put(tx.init(params), opt_state_sharding)
             # 4. Обнуляем аккумулятор градиентов (accum_grads НЕ является
