@@ -81,6 +81,73 @@ class MuonState(NamedTuple):
     count: jnp.ndarray
 
 
+class BurstDamperState(NamedTuple):
+    ema_norm: jnp.ndarray
+
+
+def burst_damper(decay: float = 0.98, threshold_ratio: float = 3.0, min_scale: float = 0.1):
+    """ФИКС (этот пасс -- см. chat: затяжные периоды global_grad_norm>20,
+    держащиеся сотни эффективных шагов ПОДРЯД перед тем, как дойти до
+    настоящего non-finite -- наблюдалось ДВАЖДЫ на РАЗНЫХ позициях
+    warmup-рампы (~66-80% в первый раз, ~50% во второй), т.е. проблема НЕ
+    завязана на конкретную точку кривой LR/на то, восстановлен ли
+    честный momentum или нет -- она завязана на САМ ДИАПАЗОН LR/momentum,
+    в котором архитектура (BlockDAR -- накопительный residual через
+    history_blocks + GDN-2/Mamba2/MoE) периодически заходит в нестабильный
+    режим. BURST-GUARD в train.py уже ВИДИТ этот режим заранее (несколько
+    эффективных шагов подряд с global_norm>20), но раньше только логировал
+    предупреждение -- ничего не предпринимал, чтобы реально затормозить
+    расходящийся шаг.
+
+    Это -- ОТДЕЛЬНАЯ, ДОПОЛНИТЕЛЬНАЯ (не заменяющая) линия обороны против
+    optax.clip_by_global_norm (фиксированный порог 0.25 -- см. ниже):
+    clip_by_global_norm обрезает КАЖДЫЙ шаг до одной и той же абсолютной
+    нормы, независимо от контекста -- он не различает "стабильно большой
+    grad_norm, потому что модель обучается на сложных данных" и "grad_norm
+    внезапно вырос в 5x относительно того, что было последние сотни шагов,
+    похоже на начало runaway". burst_damper -- ВТОРАЯ, more контекстно-
+    зависимая линия: держит экспоненциальное скользящее среднее (EMA)
+    нормы градиента (`ema_norm`, персистентный скаляр в opt_state -- т.е.
+    переживает resume ровно так же, как momentum AdamW/Lion/Muon, начиная
+    с фикса _generic_pytree_merge в train.py) и, если СЫРАЯ (до clip)
+    норма ЭТОГО шага более чем в `threshold_ratio` раз превышает EMA,
+    приглушает обновление коэффициентом `max(min_scale, threshold_ratio /
+    ratio)` -- то есть чем сильнее всплеск относительно недавней "нормы",
+    тем сильнее приглушение (но не более чем до min_scale, чтобы не
+    занулять шаг полностью -- полное занижение уже делает существующий
+    is_finite skip-step в train_setup.py на настоящих non-finite шагах,
+    это разные механизмы).
+
+    ВАЖНО: EMA обновляется УЖЕ ПРИГЛУШЁННОЙ нормой этого шага (`damped_norm
+    = norm * scale`), а НЕ сырой -- иначе сам burst "утягивал" бы EMA
+    вверх и через несколько шагов "легализовывал" бы уже случившийся
+    всплеск как новую норму, вместо того чтобы продолжать сопротивляться
+    ему, пока он реально не затихнет.
+
+    Вставляется ПЕРВЫМ элементом chain (до clip_by_global_norm) -- работает
+    на СЫРОМ (после nan_to_num/scale в distributed_apply_step, но до
+    clip_by_global_norm) градиенте, той же формы, что и остальной chain
+    (весь pytree разом, до multi_transform-разметки по группам -- та же
+    точка, где сейчас уже стоит clip_by_global_norm)."""
+    def init_fn(params):
+        return BurstDamperState(ema_norm=jnp.array(1.0, dtype=jnp.float32))
+
+    def update_fn(updates, state, params=None):
+        norm = optax.global_norm(updates)
+        ratio = norm / (state.ema_norm + 1e-6)
+        scale = jnp.where(
+            ratio > threshold_ratio,
+            jnp.maximum(min_scale, threshold_ratio / ratio),
+            1.0,
+        )
+        new_updates = jax.tree_util.tree_map(lambda g: g * scale, updates)
+        damped_norm = norm * scale
+        new_ema = state.ema_norm * decay + damped_norm * (1.0 - decay)
+        return new_updates, BurstDamperState(ema_norm=new_ema)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
     # ФИКС (этот пасс -- см. chat, router collapse эпизод + non-finite взрыв
     # сразу после resume): warmup-доля увеличена 10% -> 20%. Раньше короткий
