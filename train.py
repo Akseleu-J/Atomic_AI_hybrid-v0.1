@@ -810,12 +810,17 @@ def main_execution():
             #    пересоздавался с нуля целиком -- см. докстринг модуля про
             #    то, почему это было основной причиной нестабильности
             #    сразу после resume.
-            params_merged, opt_state_merged = _compatible_restore_params_and_opt_state(
+            #params_merged, opt_state_merged = _compatible_restore_params_and_opt_state(
+                #mngr_latest, resume_step, params, fresh_opt_state
+            #)
+            #params = jax.device_put(params_merged, param_sharding)
+            #opt_state = jax.device_put(opt_state_merged, opt_state_sharding)
+            params_merged, _ = _compatible_restore_params_and_opt_state(
                 mngr_latest, resume_step, params, fresh_opt_state
-            )
+            )  # opt_state игнорируем
             params = jax.device_put(params_merged, param_sharding)
-            opt_state = jax.device_put(opt_state_merged, opt_state_sharding)
-
+            #Создаём свежий opt_state с нулевыми моментами и счётчиками
+            opt_state = jax.device_put(tx.init(params), opt_state_sharding)
             # 4. Обнуляем аккумулятор градиентов (accum_grads НЕ является
             #    частью персистентного состояния оптимизатора -- это чисто
             #    внутрисессионный буфер, обнулять его при каждом resume
