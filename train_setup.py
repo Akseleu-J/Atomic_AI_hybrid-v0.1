@@ -484,9 +484,11 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 collinearity_coef=collinearity_coef,
             )
         (loss, aux_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+        micro_grad_norm = jnp.sqrt(
+        sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads))
+        )
         new_accum = jax.tree_util.tree_map(lambda a, g: a + g, accum_grads, grads)
-        return p, s, new_accum, loss, aux_info
-
+        return p, s, new_accum, loss, aux_info, micro_grad_norm
     def distributed_apply_step(p, s, accum_grads, n_accum, assignment_frac_stacked=None):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
