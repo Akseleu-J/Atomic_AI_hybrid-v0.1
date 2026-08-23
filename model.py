@@ -104,10 +104,57 @@ def get_batch_axis():
 _GDN2_FWD_DIAG = os.environ.get("GDN2_FWD_DIAG", "0") == "1"
 
 
+# ==========================================================================
+# ФИКС (этот пасс -- краш diagnose_nonfinite.py: "ValueError: Unknown
+# format code 'e' for object of type 'str'" внутри jax.debug.print при
+# ЭЙДЖЕРНОМ (без jax.jit) вызове model.apply(...)):
+#
+# _diag_maxabs/_diag_resid_breakdown раньше вызывали jax.debug.print
+# БЕЗУСЛОВНО (без проверки режима исполнения). jax.debug.print/
+# jax.debug.callback спроектированы и надёжно ведут себя именно как
+# side-effect ВНУТРИ скомпилированного (jit) графа -- там его callback
+# получает ровно тот набор args/kwargs, что был зафиксирован при
+# трассировке. При ЭЙДЖЕРНОМ вызове (как в diagnose_nonfinite.py, где
+# model.apply(...) намеренно вызывается БЕЗ jax.jit, чтобы получить
+# конкретные -- не трейсинговые -- промежуточные значения для анализа)
+# в этом же forward-проходе срабатывает НЕСКОЛЬКО РАЗНЫХ debug.print
+# вызовов подряд (у каждого свой набор именованных плейсхолдеров:
+# {f}/{m} здесь, {b}/{l} в BlockDAR, {cx}/{d} в _diag_resid_breakdown,
+# {n}/{m} в kernel_d_pipeline.py's _stage_diag и т.д.) -- в эйджер-режиме
+# внутренняя callback-очередь JAX's debug_print не даёт тех же гарантий
+# упорядоченного сопоставления fmt<->kwargs, что и под jit, и в
+# результате format-spec ":.3e" применяется к аргументу, разрешившемуся
+# в СТРОКУ (тег другого принта), а не число -- отсюда и
+# "Unknown format code 'e' for object of type 'str'".
+#
+# Ровно та же категория проблемы, что уже привела к переписыванию
+# host-side диагностики в train_setup.py (см. его ФИКС #3 -- полный
+# отказ от jax.debug.print/callback внутри distributed_apply_step в
+# пользу обычных jnp-возвратов, разбираемых на host-стороне). Здесь
+# аналогичный, но более точечный фикс: раз x -- это ЛИБО Tracer (мы
+# внутри jax.jit, debug.print работает штатно и остаётся ЕДИНСТВЕННЫМ
+# способом получить эффект внутри графа), ЛИБО уже конкретный массив
+# (эйджерный вызов, как в diagnose_nonfinite.py, где jax.debug.print в
+# принципе не нужен -- значения уже под рукой) -- проверяем это через
+# isinstance(x, jax.core.Tracer) и в эйджерном случае используем
+# ОБЫЧНЫЙ Python print с явным float()/bool(), который не завязан на
+# debug_print's callback-очередь и не может столкнуться с этим багом.
+# Поведение под jit (реальное обучение, train.py) НЕ меняется -- там
+# x всегда Tracer, ветка jax.debug.print работает как раньше.
+# ==========================================================================
+def _is_traced(x):
+    return isinstance(x, jax.core.Tracer)
+
+
 def _diag_maxabs(tag: str, x):
     """No-op (возвращает x без изменений) если GDN2_FWD_DIAG=0. Иначе печатает
     finite/non-finite статус и max|abs| конечной части -- чисто диагностика,
-    значение не меняет ни в каком режиме."""
+    значение не меняет ни в каком режиме.
+
+    ФИКС: под jit -- jax.debug.print (как раньше). В эйджер-режиме
+    (x уже конкретный массив, не Tracer) -- обычный print с
+    device_get/float/bool, не через debug_print's callback-очередь (см.
+    докстринг модуля выше про причину краша в diagnose_nonfinite.py)."""
     if not _GDN2_FWD_DIAG:
         return x
 
@@ -116,10 +163,14 @@ def _diag_maxabs(tag: str, x):
     safe_x = jnp.where(finite_mask, x, 0.0)
     max_abs = jnp.max(jnp.abs(safe_x))
 
-    jax.debug.print(
-        "[MAMBA2-FWD-DIAG] " + tag + ": all_finite={f}  max_abs={m:.3e}",
-        f=all_finite, m=max_abs,
-    )
+    if _is_traced(x):
+        jax.debug.print(
+            "[MAMBA2-FWD-DIAG] " + tag + ": all_finite={f}  max_abs={m:.3e}",
+            f=all_finite, m=max_abs,
+        )
+    else:
+        print(f"[MAMBA2-FWD-DIAG] {tag}: all_finite={bool(all_finite)}  "
+              f"max_abs={float(max_abs):.3e}")
     return x
 
 
@@ -136,6 +187,16 @@ def _diag_maxabs(tag: str, x):
 # диагностика срабатывала РАНЬШЕ и давала предупреждение, а не только
 # постфактум объяснение уже случившегося события. Управляется тем же
 # GDN2_FWD_DIAG=1 флагом -- по умолчанию OFF, нулевой оверхед.
+#
+# ФИКС (этот пасс, тот же класс бага, что и в _diag_maxabs выше): под
+# jax.lax.cond + jax.debug.print эта функция ТОЖЕ падала бы точно так же
+# при эйджерном вызове (jax.lax.cond в eager режиме исполняется сразу,
+# и внутренний jax.debug.print снова цепляет ту же callback-очередь).
+# Та же ветка is_traced(...) -- под jit используем jax.lax.cond +
+# jax.debug.print как раньше (порог проверяется НА УСТРОЙСТВЕ, без
+# host-side синхронизации на каждом шаге), в эйджер-режиме считаем порог
+# обычным Python-if над уже конкретными float-значениями и печатаем
+# обычным print.
 # ==========================================================================
 def _diag_resid_breakdown(tag: str, current_x_before, delta):
     if not _GDN2_FWD_DIAG:
@@ -144,20 +205,28 @@ def _diag_resid_breakdown(tag: str, current_x_before, delta):
     cx_before_abs = jnp.max(jnp.abs(jnp.nan_to_num(current_x_before, nan=0.0, posinf=0.0, neginf=0.0)))
     delta_abs = jnp.max(jnp.abs(jnp.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)))
 
-    def _report():
-        jax.debug.print(
-            "[RESID-BREAKDOWN-DIAG] " + tag +
-            ": current_x_before={cx:.3e}  delta={d:.3e}  "
-            "(если current_x_before уже большой -- накопление ИЗ ПРЕДЫДУЩИХ слоёв; "
-            "если delta большая, а current_x_before маленький -- источник ЭТОТ слой)",
-            cx=cx_before_abs, d=delta_abs,
-        )
+    if _is_traced(current_x_before) or _is_traced(delta):
+        def _report():
+            jax.debug.print(
+                "[RESID-BREAKDOWN-DIAG] " + tag +
+                ": current_x_before={cx:.3e}  delta={d:.3e}  "
+                "(если current_x_before уже большой -- накопление ИЗ ПРЕДЫДУЩИХ слоёв; "
+                "если delta большая, а current_x_before маленький -- источник ЭТОТ слой)",
+                cx=cx_before_abs, d=delta_abs,
+            )
 
-    jax.lax.cond(
-        jnp.maximum(cx_before_abs, delta_abs) > 5e2,
-        _report,
-        lambda: None,
-    )
+        jax.lax.cond(
+            jnp.maximum(cx_before_abs, delta_abs) > 5e2,
+            _report,
+            lambda: None,
+        )
+    else:
+        cx_v = float(cx_before_abs)
+        d_v = float(delta_abs)
+        if max(cx_v, d_v) > 5e2:
+            print(f"[RESID-BREAKDOWN-DIAG] {tag}: current_x_before={cx_v:.3e}  delta={d_v:.3e}  "
+                  f"(если current_x_before уже большой -- накопление ИЗ ПРЕДЫДУЩИХ слоёв; "
+                  f"если delta большая, а current_x_before маленький -- источник ЭТОТ слой)")
 
 
 # ==========================================================================
@@ -167,6 +236,12 @@ def _diag_resid_breakdown(tag: str, current_x_before, delta):
 # ядра, или матмул с бOльшим диапазоном значений, чем видно по forward
 # значению после clip/nan_to_num). identity-функция с custom_vjp пропускает
 # forward без изменений, а в backward проверяет входящий котангент.
+#
+# ПРИМЕЧАНИЕ: make_grad_probe/make_grad_sanitizer сами по себе безопасны
+# для эйджерного вызова без grad -- их jax.debug.print сидит внутри _bwd,
+# который вообще не выполняется, если по графу не берут jax.grad/vjp (как
+# в diagnose_nonfinite.py's forward-only проходах). Правки не требуются,
+# оставлены как есть.
 # ==========================================================================
 def make_grad_probe(tag: str):
     @jax.custom_vjp
