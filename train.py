@@ -1076,6 +1076,13 @@ def main_execution():
                 if burst_streak >= 3:
                     print(f"[BURST-GUARD] ⚠️ global_grad_norm>20 три эффективных шага подряд "
                           f"(global_step={global_step + 1}). Вероятен runaway-режим.")
+                    if global_step not in _burst_dumped_steps:
+                        snap_dir = os.path.join(ckpt_root, "burst_snapshots", str(global_step + 1))
+                        os.makedirs(snap_dir, exist_ok=True)
+                        for i, entry in enumerate(_accum_window):
+                            np.save(os.path.join(snap_dir, f"micro_{i}_input_ids.npy"), entry["input_ids"])
+                        _burst_dumped_steps.add(global_step)
+                    # остальное (alert, сброс burst_streak) – уже есть
                     wandb_logging.log_alert(
                         "Burst guard triggered",
                         f"global_grad_norm > 20 три шага подряд на step={global_step + 1}",
