@@ -934,6 +934,7 @@ def main_execution():
     nonfinite_window = deque(maxlen=NONFINITE_WINDOW_SIZE)
     _accum_window = deque(maxlen=accum_steps)
     _micro_grad_norms = []   # сбор per‑micro норм для текущего эффективного шага
+    _burst_dumped_steps = set()
     # ФИКС (compiled_apply 5-й позиционный аргумент): копит
     # aux_info["assignment_frac"] (форма (n_moe_layers, E_routed)) с
     # каждого микрошага ОДНОГО эффективного шага -- обычный Python-список
@@ -1017,7 +1018,7 @@ def main_execution():
             # выше): шестой позиционный аргумент collinearity_coef_arr
             # обязателен -- compiled_train_micro скомпилирован с
             # in_shardings длины 6.
-            params, opt_state, accum_grads, train_loss, aux_info = compiled_train_micro(
+            params, opt_state, accum_grads, train_loss, aux_info, micro_grad_norm = compiled_train_micro(
                 params, opt_state, batch, step_rng, accum_grads, collinearity_coef_arr
             )
             _micro_grad_norms.append(float(jax.device_get(micro_grad_norm)))
