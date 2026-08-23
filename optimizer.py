@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -24,40 +24,37 @@ RESUME_LR_SCALE = 0.7
 # (momentum) ТОЖЕ честно восстанавливается (_generic_pytree_merge в
 # train.py), КАЖДЫЙ resume с чекпоинта 12000 даёт РОВНО ОДНУ И ТУ ЖЕ
 # комбинацию "конкретный батч на этой позиции потока + конкретное
-# состояние оптимизатора" -- это ТОЧНО механизм loss spikes,
-# задокументированный в PaLM (Chowdhery et al. 2022, arXiv:2204.02311):
-# "spikes only occur due to the combination of specific data batches with
-# a particular model parameter state", и НЕ воспроизводятся при том же
-# батче с ДРУГИМ состоянием оптимизатора. WARMUP_FREEZE_STEP остаётся
-# полезным (более низкий эффективный LR в целом снижает вероятность
-# ЛЮБОГО спайка), но НЕ является решением именно этого повторяющегося
-# инцидента -- см. zclip_skip() ниже, которая и есть настоящее решение.
+# состояние оптимизатора". ОБНОВЛЕНИЕ (см. chat, дальнейшее расследование):
+# эксперимент показал, что взрыв воспроизводится ОДИНАКОВО и с холодным, и
+# с тёплым opt_state -- т.е. opt_state/LR-позиция ИСКЛЮЧЕНЫ как причина
+# полностью, это чисто forward/backward-проблема на конкретных
+# (params, batch). Реальный источник (см. optimizer.py's ФИКС ниже,
+# санитизация final_hidden/CE-проекции embed) -- несанитизированный путь
+# final_hidden -> embed.T матмул в chunked_cross_entropy. WARMUP_FREEZE_STEP
+# остаётся полезным как общая консервативная мера (более низкий
+# эффективный LR в целом снижает риск ЛЮБОГО спайка), но не является
+# решением конкретно этого класса инцидентов.
 #
-# ФИКС #2 (этот пасс -- см. chat: взрыв ВОСПРОИЗВЁЛСЯ ДАЖЕ С LR,
-# ПОЛНОСТЬЮ ЗАМОРОЖЕННЫМ на WARMUP_FREEZE_STEP=3000 с самого первого шага
-# после resume -- т.е. LR/warmup СТРОГО исключены как причина
-# экспериментально, не только по рассуждению). Второй факт: рост
-# global_grad_norm НЕ мгновенный спайк на одном шаге, а ПЛАВНЫЙ ДРЕЙФ на
-# протяжении ~80-100 эффективных шагов (aux_loss 8.0013->8.03,
-# router_max_cos 0.0116->0.0145, ce_loss 1.83->4.30 -- все растут
-# монотонно и постепенно, не скачком). Это ОБЪЯСНЯЕТ, почему прежний
-# zclip_skip (EMA decay=0.97, постоянная времени ~33 шага) НЕ поймал
-# событие: чистый z-score по EMA СЛЕДУЕТ за медленным трендом почти так
-# же быстро, как сам тренд растёт -- EMA "переобучается" на новую,
-# растущую норму как на новый baseline быстрее, чем успевает накопиться
-# z-отклонение. Известное слабое место EMA/z-score детекторов (ZClip и
-# аналоги) -- они хороши против одиночных импульсных выбросов, но слепы к
-# постепенному разгону нормы.
+# ФИКС #2 (этот пасс -- переключаемый режим): WARMUP_FREEZE_STEP теперь
+# ПАРАМЕТР make_hybrid_optimizer (warmup_freeze_step), а не жёсткая
+# модульная константа -- позволяет train.py явно выбирать между "заморозить
+# рост LR на фиксированном шаге" (текущий осторожный режим) и "обычный
+# полный warmup/cosine-decay без заморозки" (warmup_freeze_step=None), без
+# правки этого файла. ВАЖНО: opt_state's "count" (Adam/Muon/lr_schedule
+# позиция) продолжает расти честно НЕЗАВИСИМО от этого флага -- флаг влияет
+# только на то, ЧТО подставляется в lr_schedule(...) при вычислении LR на
+# следующем шаге, а не на само число пройденных шагов. Поэтому переключение
+# между сессиями безопасно для restore/graft-merge (см. train.py's
+# _generic_pytree_merge) -- "count" восстанавливается как было в любом
+# случае, просто дальше используется по новой формуле. Резкое переключение
+# True->False ПОСЛЕ долгого пребывания в замороженном состоянии -- риск
+# скачка LR (см. train.py's комментарий у USE_WARMUP_FREEZE), делать
+# осознанно, не как рефлекс.
 #
-# Добавлен ВТОРОЙ, независимый триггер -- абсолютное отклонение текущей
-# нормы от МЕДЛЕННОЙ EMA-базы (decay=0.995, постоянная времени ~200
-# шагов, т.е. существенно медленнее, чем окно самого дрейфа ~80-100
-# шагов) -- эта медленная EMA НЕ успевает угнаться за трендом за то же
-# окно, поэтому абсолютное отношение norm/exp(slow_ema_mean) продолжает
-# расти и пересечёт порог, даже когда быстрый z-score уже "смирился" с
-# новым уровнем. is_spike теперь срабатывает по ЛЮБОМУ из двух условий.
+# DEFAULT_WARMUP_FREEZE_STEP оставлен как модульная константа -- значение
+# по умолчанию, если вызывающая сторона явно не передала warmup_freeze_step.
 # ==========================================================================
-WARMUP_FREEZE_STEP = 1000
+DEFAULT_WARMUP_FREEZE_STEP = 1000
 
 
 def make_grad_probe(tag: str):
@@ -223,7 +220,30 @@ def zclip_skip(decay: float = 0.97, z_thresh: float = 2.5, warmup_ema_steps: int
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
+def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False,
+                           warmup_freeze_step: Optional[int] = DEFAULT_WARMUP_FREEZE_STEP):
+    """ФИКС #2 (см. докстринг WARMUP_FREEZE_STEP выше): warmup_freeze_step
+    теперь параметр, а не жёсткая модульная константа.
+
+    warmup_freeze_step: если задан (int) -- LR-schedule "замораживается" на
+        этом шаге: lr_schedule(min(step, warmup_freeze_step)) -- дальнейший
+        рост step (в т.ч. после resume, где opt_state's "count" продолжает
+        расти честно) НЕ поднимает эффективный LR выше значения на
+        freeze_step. Это осторожный, консервативный режим -- ниже общий
+        эффективный LR снижает риск ЛЮБОГО спайка, но НЕ является
+        целевым решением конкретного класса инцидентов (см. модульный
+        докстринг).
+    warmup_freeze_step=None: обычный полный warmup/cosine-decay без
+        заморозки -- lr_schedule(step) напрямую, schedule доходит до конца
+        total_steps как и было изначально задумано.
+
+    warmup_freeze_step остаётся Python int/None (НЕ traced-значение) --
+    смена режима встраивается в jnp.minimum(step, warmup_freeze_step) как
+    константа времени компиляции, требует пересборки tx (нормально,
+    происходит один раз при старте прогона в make_shard_and_compile, НЕ
+    предназначено для переключения посреди одной длинной сессии без
+    рестарта -- см. train.py's докстринг у USE_WARMUP_FREEZE про риск
+    резкого скачка LR при таком переключении)."""
     warmup_steps = max(500, int(total_steps * 0.20))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
@@ -242,8 +262,13 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         frac = jnp.clip((step - ramp_start) / RAMP_STEPS, 0.0, 1.0)
         return RESUME_LR_SCALE + (1.0 - RESUME_LR_SCALE) * frac
 
-    lion_lr = lambda step: 2e-4 * lr_schedule(jnp.minimum(step, WARMUP_FREEZE_STEP)) * resume_backoff(step)
-    adamw_lr = lambda step: 6e-4 * lr_schedule(jnp.minimum(step, WARMUP_FREEZE_STEP)) * resume_backoff(step)
+    def _effective_step(step):
+        if warmup_freeze_step is None:
+            return step
+        return jnp.minimum(step, warmup_freeze_step)
+
+    lion_lr = lambda step: 2e-4 * lr_schedule(_effective_step(step)) * resume_backoff(step)
+    adamw_lr = lambda step: 6e-4 * lr_schedule(_effective_step(step)) * resume_backoff(step)
     tx_lion = optax.lion(learning_rate=lion_lr, weight_decay=0.1)
     tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
     tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
@@ -255,7 +280,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         def update_fn(updates, state, params=None):
             if params is None:
                 return updates, state
-            step_lr = base_lr * lr_schedule(jnp.minimum(state.count, WARMUP_FREEZE_STEP))
+            step_lr = base_lr * lr_schedule(_effective_step(state.count))
             new_updates = jax.tree_util.tree_map(
                 lambda p, g: (muon_orthogonalize(p, g, step_lr) - p) - step_lr * weight_decay * p,
                 params, updates,
@@ -334,7 +359,25 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
     sum_loss, sum_mask = carry
     hidden_chunk, label_chunk = chunk
 
-    logits_chunk = (hidden_chunk.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+    # ФИКС (страховка -- см. chat, non-finite градиент в группе 'embed' на
+    # global_step=12001): отдельный ЧАНК hidden внутри этого scan может, в
+    # принципе, отличаться от агрегированной статистики по всей
+    # final_hidden (диагностика на снапшоте 12001 показала весь
+    # final_hidden здоровым -- max_abs~8.7 -- но это агрегат по ВСЕЙ
+    # последовательности, не гарантия для каждого отдельного 256-токенного
+    # чанка). Клип здесь дешёвый (одна операция на (256, d_model)) --
+    # защита на будущее, симметрично остальным санитайзерам проекта.
+    hidden_chunk = jnp.nan_to_num(jnp.clip(hidden_chunk, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
+
+    # ФИКС (страховка -- тот же инцидент): `w` -- это params["embed"]["embedding"].T
+    # при tie_embeddings=True, единственный узел, где embed-таблица
+    # используется НЕ через обычный lookup, а как явная проекция в матмуле
+    # -- градиент назад в embed.embedding идёт ИМЕННО отсюда
+    # (dW = hidden_chunk.T @ dlogits). make_grad_sanitizer здесь защищает
+    # именно ЭТОТ путь бэкварда в embed, отдельно от forward-значений.
+    w_safe = make_grad_sanitizer("ce_embed_projection_w")(w)
+
+    logits_chunk = (hidden_chunk.astype(jnp.bfloat16) @ w_safe.astype(jnp.bfloat16)).astype(jnp.float32)
     logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
     logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
     logits_chunk = make_grad_sanitizer("ce_logits_chunk")(logits_chunk)
@@ -458,6 +501,17 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         w = params["embed"]["embedding"].T
     else:
         w = params["lm_head"]["kernel"]
+
+    # ФИКС (страховка -- см. chat, non-finite градиент в группе 'embed' на
+    # global_step=12001): final_hidden -- единственная крупная активация во
+    # всей модели, используемая ЗДЕСЬ как прямой вход в матмул на
+    # embed-проекцию, без прохождения через какой-либо саблеер-санитайзер
+    # ниже по графу (диагностика на реальном снапшоте 12001 показала
+    # final_hidden здоровым, max_abs~8.7 -- но это не гарантия для любого
+    # будущего батча/шага). Клип здесь -- дешёвая, симметричная защита,
+    # такая же, как уже стоит у каждого другого саблеера в model.py
+    # (delta_fanin_*, mla_flash_attn_out, moe_shared_expert_grad_* и т.д.).
+    final_hidden = jnp.nan_to_num(jnp.clip(final_hidden, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
     ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
     ce_loss = jnp.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=0.0)
