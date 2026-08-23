@@ -267,23 +267,72 @@ def _generic_pytree_merge(fresh, raw, path=()):
                 out[k] = v
         return out
 
-    # --- NamedTuple (optax states: ScaleByAdamState, MuonState, EmptyState, ...) ---
+    # --- NamedTuple (optax states: ScaleByAdamState, MuonState, EmptyState,
+    # optax.MultiTransformState, ...) ---
+    #
+    # ФИКС (КРИТИЧЕСКИЙ, этот пасс -- см. chat: opt_state count оказался 0
+    # на ВСЕХ группах после "успешного" restore, т.е. предыдущая версия
+    # этой ветки НИКОГДА реально не восстанавливала momentum): orbax's
+    # mngr.restore(..., args=StandardRestore()) БЕЗ item= (т.е. без
+    # навязывания целевой структуры target, что нам и нужно -- см.
+    # докстринг _compatible_restore_params_and_opt_state про причину)
+    # десериализует наши кастомные NamedTuple (optax.MultiTransformState,
+    # optax.ScaleByAdamState, наш MuonState) обратно как ОБЫЧНЫЕ dict (по
+    # именам полей), а НЕ как типизированные объекты нужного класса -- у
+    # dict нет атрибута "_fields", поэтому старая проверка
+    # `isinstance(raw, tuple) and hasattr(raw, "_fields")` была
+    # структурно обречена ВСЕГДА возвращать False везде, где в дереве
+    # встречается NamedTuple-обёртка -- т.е. фактически на САМОМ ВЕРХНЕМ
+    # уровне opt_state (уже на "inner_states"), откуда весь merge
+    # проваливался в fallback "оставляю свежую" для ЦЕЛОГО поддерева
+    # разом. Патч, добавивший этот merge, никогда реально не работал --
+    # opt_state оставался холодным (count=0) на каждом resume, несмотря
+    # на отсутствие ошибок и "правдоподобные" логи [MERGE]/[RESUME DEBUG].
+    #
+    # Фикс: helper _fields_source(raw, fields) -- пытается извлечь
+    # значение по каждому полю ТРЕМЯ способами (в порядке приоритета):
+    #   1. raw САМ NamedTuple того же типа -- getattr(raw, field)
+    #      (сохранено на случай, если в будущем orbax/target-режим всё же
+    #      вернёт типизированный объект).
+    #   2. raw -- dict с ключами-именами полей -- raw[field]
+    #      (ЭТО и есть реальный случай, наблюдаемый в логах).
+    #   3. raw -- plain list/tuple ТОЙ ЖЕ ДЛИНЫ, что fields -- raw[index]
+    #      позиционно (на случай другой версии orbax/сериализации, которая
+    #      могла бы отбросить имена полей вовсе).
+    # Если ни один способ не подошёл -- fallback на fresh с диагностикой,
+    # как и раньше.
     if isinstance(fresh, tuple) and hasattr(fresh, "_fields"):
-        same_type_and_fields = (
-            isinstance(raw, tuple) and hasattr(raw, "_fields") and raw._fields == fresh._fields
-        )
         if not fresh._fields:
             # Пустой NamedTuple (например, optax.EmptyState()) -- нечего
             # мёржить в принципе, просто вернуть fresh как есть.
             return fresh
-        if same_type_and_fields:
-            merged_fields = {
-                field: _generic_pytree_merge(getattr(fresh, field), getattr(raw, field), path + (field,))
-                for field in fresh._fields
-            }
+
+        def _get_field_source(field, idx):
+            if isinstance(raw, tuple) and hasattr(raw, "_fields") and field in raw._fields:
+                return True, getattr(raw, field)
+            if isinstance(raw, dict) and field in raw:
+                return True, raw[field]
+            if isinstance(raw, (list, tuple)) and len(raw) == len(fresh._fields):
+                return True, raw[idx]
+            return False, None
+
+        merged_fields = {}
+        all_found = True
+        for idx, field in enumerate(fresh._fields):
+            found, raw_field_val = _get_field_source(field, idx)
+            if not found:
+                all_found = False
+                break
+            merged_fields[field] = _generic_pytree_merge(
+                getattr(fresh, field), raw_field_val, path + (field,)
+            )
+
+        if all_found:
             return type(fresh)(**merged_fields)
-        print(f"[MERGE] несовпадение типа/полей NamedTuple на "
-              f"{'/'.join(map(str, path))}: fresh_fields={fresh._fields} -- оставляю свежую")
+
+        print(f"[MERGE] несовпадение структуры NamedTuple на "
+              f"{'/'.join(map(str, path))}: fresh_fields={fresh._fields}, "
+              f"raw_type={type(raw).__name__} -- оставляю свежую")
         return fresh
 
     # --- plain list/tuple (например, tx.chain внутри optax) ---
