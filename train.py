@@ -93,6 +93,21 @@ collinearity_coef_arr во ВСЕ вызовы compiled_train_micro.
 расширена ПЯТЫМ позиционным параметром assignment_frac_stacked -- собирается
 здесь в _assignment_frac_window по каждому микрошагу, усредняется и
 передаётся пятым позиционным аргументом в compiled_apply.
+
+ФИКС (этот пасс -- structural realign при несовпадении длины chain-tuple,
+см. чат): _generic_pytree_merge's list/tuple ветка раньше при несовпадении
+ДЛИНЫ tuple безусловно отбрасывала ВЕСЬ tuple целиком на fresh -- это
+означало, что ЛЮБОЕ изменение состава optax.chain (например, добавление
+burst_damper() первым элементом -- см. optimizer.py) на первом же resume
+после патча обнуляло ВСЕ momentum AdamW/Lion/Muon разом, а не только
+состояние нового элемента. См. _structural_tuple_realign ниже -- при
+несовпадении длины пытается сопоставить элементы ПО СТРУКТУРНОЙ СИГНАТУРЕ
+(имена полей NamedTuple / ключи dict / форма листа), а не по позиции --
+так новый BurstDamperState (уникальная сигнатура {'ema_norm'}, которой не
+было в старом чекпоинте) получает fresh-инициализацию точечно, а всё
+остальное (EmptyState клипа, MultiTransformState со всеми
+muon/lion/adamw-моментами) сопоставляется по структуре и восстанавливается
+честно, как и раньше.
 """
 import os
 import time
@@ -154,9 +169,9 @@ RESUME_BUCKET_SUBDIR = "best_train"# <-- какой слот внутри бак
 # ПРИМЕЧАНИЕ: после появления _generic_pytree_merge (graft-merge на
 # restore для params И opt_state, см. ниже) router/router_temp/expert_bias
 # УЖЕ приходят со свежей инициализацией автоматически (несовпадающие по
-# структуре листья -- merge() оставляет для них fresh как есть). Эти
-# функции оставлены в коде на случай отката на строгий StandardRestore
-# или для ручного форс-сброса router независимо от графа причин.
+# структуре листья). Эти функции оставлены в коде на случай отката на
+# строгий StandardRestore или для ручного форс-сброса router независимо
+# от графа причин.
 # ==========================================================================
 def _reset_router_params(params, seed=1234, stddev=0.02):
     """Переинициализирует ТОЛЬКО router-листья:
@@ -214,6 +229,70 @@ def _download_resume_checkpoint(local_dir, repo_subdir):
         raise ValueError(f"Неизвестный RESUME_SOURCE={RESUME_SOURCE!r}")
 
 
+# ==========================================================================
+# ФИКС (этот пасс -- см. докстринг модуля, раздел "structural realign"):
+# helper для _generic_pytree_merge's list/tuple ветки. Вычисляет
+# "сигнатуру" элемента tuple/list -- используется, когда длина raw и fresh
+# НЕ совпадает (например, optax.chain получил новый элемент), чтобы
+# сопоставлять элементы по СТРУКТУРЕ, а не по позиции.
+#
+# ВАЖНО: raw приходит из orbax БЕЗ типовой информации (NamedTuple всегда
+# десериализуется как plain dict -- см. _generic_pytree_merge's докстринг
+# про NamedTuple-ветку выше), поэтому сигнатура для dict и для
+# NamedTuple-с-теми-же-именами-полей ДОЛЖНА совпадать -- обе сводятся к
+# ("fields", frozenset(...)).
+# ==========================================================================
+def _tuple_elem_signature(x):
+    if isinstance(x, dict):
+        return ("fields", frozenset(x.keys()))
+    if isinstance(x, tuple) and hasattr(x, "_fields"):
+        return ("fields", frozenset(x._fields))
+    if isinstance(x, (list, tuple)):
+        return ("seq", len(x))
+    if hasattr(x, "shape"):
+        return ("leaf", tuple(x.shape))
+    return ("other", type(x).__name__)
+
+
+def _structural_tuple_realign(fresh_seq, raw_seq, path):
+    """fresh_seq/raw_seq -- list/tuple разной длины. Пытается сопоставить
+    каждый элемент fresh_seq С ПЕРВЫМ ещё не использованным элементом
+    raw_seq той же структурной сигнатуры (_tuple_elem_signature) --
+    порядок внутри каждой сигнатурной группы сохраняется (если сигнатур
+    несколько с одинаковым ключом, они сопоставляются по порядку
+    появления, не идеально надёжно в вырожденных случаях, но
+    ЗНАЧИТЕЛЬНО лучше, чем безусловный fresh для ВСЕГО tuple).
+    Элементы fresh_seq, для которых не нашлось соответствия в raw_seq
+    (например, только что добавленный optax-трансформ), остаются fresh
+    -- ровно так же, как несовпадающие/новые dict-ключи в основной
+    _generic_pytree_merge ветке.
+    Возвращает list той же длины, что fresh_seq.
+    """
+    used = [False] * len(raw_seq)
+    raw_sigs = [_tuple_elem_signature(r) for r in raw_seq]
+    out = []
+    unmatched_fresh_idx = []
+    for i, f in enumerate(fresh_seq):
+        f_sig = _tuple_elem_signature(f)
+        match_idx = None
+        for j, (r_sig, is_used) in enumerate(zip(raw_sigs, used)):
+            if not is_used and r_sig == f_sig:
+                match_idx = j
+                break
+        if match_idx is not None:
+            used[match_idx] = True
+            out.append(_generic_pytree_merge(f, raw_seq[match_idx], path + (i,)))
+        else:
+            print(f"[MERGE] структурный realign: элемент #{i} на "
+                  f"{'/'.join(map(str, path))} (сигнатура {f_sig}) не найден среди "
+                  f"оставшихся элементов чекпоинта -- оставляю свежую инициализацию "
+                  f"ТОЛЬКО для этого элемента (остальные элементы tuple восстановлены "
+                  f"как обычно).")
+            out.append(f)
+            unmatched_fresh_idx.append(i)
+    return out
+
+
 def _generic_pytree_merge(fresh, raw, path=()):
     """ФИКС (этот пасс -- ГЛАВНЫЙ патч, см. докстринг модуля): обобщённая
     версия старой _compatible_restore_params's внутренней merge(), которая
@@ -240,7 +319,11 @@ def _generic_pytree_merge(fresh, raw, path=()):
                             optax-состояния сам изменился между версиями
                             optax/кода -- fresh целиком, без попытки
                             частичного мёржа полей вслепую).
-      - list/tuple       -> рекурсия поэлементно, ТОЛЬКО при равной длине.
+      - list/tuple       -> рекурсия поэлементно при равной длине; ПРИ
+                            НЕСОВПАДЕНИИ ДЛИНЫ (ФИКС этого пасса) --
+                            структурный realign через
+                            _structural_tuple_realign вместо безусловного
+                            fresh для ВСЕГО tuple -- см. докстринг модуля.
       - leaf со .shape   -> восстанавливается из raw, если формы СОВПАДАЮТ
                             (jnp.asarray(raw, dtype=fresh.dtype)); при
                             несовпадении формы -- fresh, с [MERGE]
@@ -341,6 +424,19 @@ def _generic_pytree_merge(fresh, raw, path=()):
             merged = [
                 _generic_pytree_merge(f, r, path + (i,)) for i, (f, r) in enumerate(zip(fresh, raw))
             ]
+            return type(fresh)(merged) if not isinstance(fresh, tuple) else tuple(merged)
+        if isinstance(raw, (list, tuple)) and len(raw) != len(fresh):
+            # ФИКС (этот пасс -- см. докстринг модуля "structural
+            # realign"): раньше здесь был безусловный fallback на fresh
+            # для ВСЕГО tuple при несовпадении длины -- любое изменение
+            # состава optax.chain (например, добавление burst_damper())
+            # на первом resume после патча обнуляло ВСЕ momentum сразу.
+            # Пробуем сопоставить элементы по структурной сигнатуре
+            # вместо позиции -- см. _structural_tuple_realign.
+            print(f"[MERGE] несовпадение длины list/tuple на {'/'.join(map(str, path))} "
+                  f"(fresh={len(fresh)}, raw={len(raw)}) -- пробую структурный realign "
+                  f"вместо полного сброса на свежую инициализацию...")
+            merged = _structural_tuple_realign(list(fresh), list(raw), path)
             return type(fresh)(merged) if not isinstance(fresh, tuple) else tuple(merged)
         print(f"[MERGE] несовпадение длины list/tuple на {'/'.join(map(str, path))} -- оставляю свежую")
         return fresh
