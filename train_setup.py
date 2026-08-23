@@ -366,7 +366,8 @@ def make_tpu_mesh():
 
 
 def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: int,
-                           seq_len: int = 8192, accum_steps: int = 1):
+                           seq_len: int = 8192, accum_steps: int = 1, 
+                          warmup_freeze_step: int | None = 1000):
     mesh = make_tpu_mesh()
     n_devices = mesh.shape["tpu_nodes"]
 
@@ -395,7 +396,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     # наблюдалась -- трейсбек указывал на СЛЕДУЮЩУЮ строку,
     # jax.eval_shape(lambda: tx.init(...)), что маскировало реальную
     # причину). Явно проверяем тип результата вместо слепой распаковки.
-    _opt_result = make_hybrid_optimizer(total_steps=total_steps)
+    _opt_result = make_hybrid_optimizer(total_steps=total_steps, warmup_freeze_step=warmup_freeze_step)
     if isinstance(_opt_result, (optax.GradientTransformation, optax.GradientTransformationExtraArgs)):
         # optimizer.py ещё не обновлён -- вернул голый tx, lr_schedule нет.
         tx = _opt_result
