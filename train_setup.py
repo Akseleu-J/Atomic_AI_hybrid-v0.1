@@ -584,6 +584,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P(None)),
             param_sharding,
             NamedSharding(mesh, P()),   # <-- для collinearity_coef (скаляр)
+          
         ),
         out_shardings=(
             param_sharding,
@@ -591,6 +592,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             param_sharding,
             NamedSharding(mesh, P()),
             aux_info_sharding,
+            NamedSharding(mesh, P()),        # micro_grad_norm (скаляр)
         ),
     )
 
