@@ -933,6 +933,7 @@ def main_execution():
     nonfinite_consecutive_count = 0
     nonfinite_window = deque(maxlen=NONFINITE_WINDOW_SIZE)
     _accum_window = deque(maxlen=accum_steps)
+    _micro_grad_norms = []   # сбор per‑micro норм для текущего эффективного шага
     # ФИКС (compiled_apply 5-й позиционный аргумент): копит
     # aux_info["assignment_frac"] (форма (n_moe_layers, E_routed)) с
     # каждого микрошага ОДНОГО эффективного шага -- обычный Python-список
@@ -1019,6 +1020,7 @@ def main_execution():
             params, opt_state, accum_grads, train_loss, aux_info = compiled_train_micro(
                 params, opt_state, batch, step_rng, accum_grads, collinearity_coef_arr
             )
+            _micro_grad_norms.append(float(jax.device_get(micro_grad_norm)))
             if micro_step < 30:
                 jax.block_until_ready(train_loss)
             _t_compute = time.perf_counter() - _t1
@@ -1073,6 +1075,16 @@ def main_execution():
                 # host-side разбор, ноль host-callback каналов, полное
                 # покрытие W&B.
                 _global_norm_val = float(jax.device_get(global_norm))
+                # Логирование per‑micro градиентных норм
+                if _micro_grad_norms:
+                  max_micro = max(_micro_grad_norms)
+                  mean_micro = sum(_micro_grad_norms) / len(_micro_grad_norms)
+                  wandb_step_metrics = {
+                  "train/micro_grad_norm_max": max_micro,
+                  "train/micro_grad_norm_mean": mean_micro,
+                  }
+                  wandb_logging.log_metrics(global_step + 1, wandb_step_metrics)
+                  _micro_grad_norms = []   # очистка для следующего эффективного шага
                 if _global_norm_val > 20.0:
                     burst_streak += 1
                 else:
