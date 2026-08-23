@@ -173,12 +173,20 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 
         return optax.GradientTransformation(init_fn, update_fn)
 
-    # ФИКС: base_lr слегка снижен (0.01 -> 0.008) как дополнительная
-    # предосторожность параллельно с добавленным weight decay -- снижает
-    # скорость, с которой ортогонализованные обновления могут толкать норму
-    # параметров вверх на старте обучения, пока decay ещё не успел накопить
-    # эффект (decay пропорционален w, на малых w в начале почти не действует).
-    tx_muon = _muon_step(base_lr=0.008, weight_decay=0.01)
+    # ФИКС (этот пасс -- см. chat: затяжной период global_grad_norm>20 на
+    # протяжении ~800 эффективных шагов ПОСЛЕ того, как честный
+    # opt_state-merge наконец заработал, т.е. Muon больше не получает
+    # случайный "сброс момента" на каждом resume, который РАНЬШЕ,
+    # похоже, непреднамеренно периодически чинил медленный дрейф нормы
+    # параметров вверх): base_lr снижен ещё раз (0.008 -> 0.006),
+    # weight_decay увеличен (0.01 -> 0.02) -- сильнее противовес
+    # ортогонализованным обновлениям, которые сами по себе ничего не
+    # тянут к нулю. Раньше этот дрейф периодически (и случайно) обнулялся
+    # холодным restart'ом оптимизатора при каждом resume -- теперь, когда
+    # momentum реально переживает resume (см. _generic_pytree_merge's
+    # критический фикс в train.py), эта защита должна идти НЕ от
+    # случайных сбросов, а от самого механизма (сильнее decay, ниже LR).
+    tx_muon = _muon_step(base_lr=0.006, weight_decay=0.02)
 
     # ФИКС: НЕ добавляем отдельную группу multi_transform для decay_a/A_log --
     # это меняет СТРУКТУРУ opt_state (новый ключ в multi_transform), что
@@ -223,13 +231,13 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     def label_fn(params):
         return jax.tree_util.tree_map_with_path(_label_leaf, params)
 
-    # ФИКС: общий global-norm clip слегка ужесточён (0.5 -> 0.35) как
-    # дополнительный запас прочности -- дешёвая мера, не требующая
-    # архитектурных изменений, снижает амплитуду отдельных "плохих" шагов
-    # по всем группам параметров одновременно. clip_by_global_norm не имеет
-    # состояния (EmptyState), поэтому это изменение НЕ влияет на совместимость
-    # чекпоинтов.
-    clip_tx = optax.clip_by_global_norm(0.35)
+    # ФИКС (этот пасс -- см. chat: затяжной ~800-шаговый период
+    # global_grad_norm>20 перед non-finite в moe/embed/other, PARAM-DIAG
+    # ни разу не сработал -- т.е. параметры сами по себе не разрослись, но
+    # градиент долго оставался нездоровым): clip ужесточён ещё раз
+    # (0.35 -> 0.25). clip_by_global_norm не имеет состояния (EmptyState),
+    # поэтому это изменение НЕ влияет на совместимость чекпоинтов.
+    clip_tx = optax.clip_by_global_norm(0.25)
     multi_tx = optax.multi_transform(
         {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay,
          "adamw_nodecay": tx_adamw_nodecay, "frozen": tx_frozen},
