@@ -32,6 +32,30 @@ RESUME_LR_SCALE = 0.7
 # полезным (более низкий эффективный LR в целом снижает вероятность
 # ЛЮБОГО спайка), но НЕ является решением именно этого повторяющегося
 # инцидента -- см. zclip_skip() ниже, которая и есть настоящее решение.
+#
+# ФИКС #2 (этот пасс -- см. chat: взрыв ВОСПРОИЗВЁЛСЯ ДАЖЕ С LR,
+# ПОЛНОСТЬЮ ЗАМОРОЖЕННЫМ на WARMUP_FREEZE_STEP=3000 с самого первого шага
+# после resume -- т.е. LR/warmup СТРОГО исключены как причина
+# экспериментально, не только по рассуждению). Второй факт: рост
+# global_grad_norm НЕ мгновенный спайк на одном шаге, а ПЛАВНЫЙ ДРЕЙФ на
+# протяжении ~80-100 эффективных шагов (aux_loss 8.0013->8.03,
+# router_max_cos 0.0116->0.0145, ce_loss 1.83->4.30 -- все растут
+# монотонно и постепенно, не скачком). Это ОБЪЯСНЯЕТ, почему прежний
+# zclip_skip (EMA decay=0.97, постоянная времени ~33 шага) НЕ поймал
+# событие: чистый z-score по EMA СЛЕДУЕТ за медленным трендом почти так
+# же быстро, как сам тренд растёт -- EMA "переобучается" на новую,
+# растущую норму как на новый baseline быстрее, чем успевает накопиться
+# z-отклонение. Известное слабое место EMA/z-score детекторов (ZClip и
+# аналоги) -- они хороши против одиночных импульсных выбросов, но слепы к
+# постепенному разгону нормы.
+#
+# Добавлен ВТОРОЙ, независимый триггер -- абсолютное отклонение текущей
+# нормы от МЕДЛЕННОЙ EMA-базы (decay=0.995, постоянная времени ~200
+# шагов, т.е. существенно медленнее, чем окно самого дрейфа ~80-100
+# шагов) -- эта медленная EMA НЕ успевает угнаться за трендом за то же
+# окно, поэтому абсолютное отношение norm/exp(slow_ema_mean) продолжает
+# расти и пересечёт порог, даже когда быстрый z-score уже "смирился" с
+# новым уровнем. is_spike теперь срабатывает по ЛЮБОМУ из двух условий.
 # ==========================================================================
 WARMUP_FREEZE_STEP = 3000
 
@@ -115,64 +139,68 @@ class MuonState(NamedTuple):
 
 
 class ZClipState(NamedTuple):
-    ema_mean: jnp.ndarray    # EMA среднего log(grad_norm)
-    ema_var: jnp.ndarray     # EMA дисперсии log(grad_norm)
-    warm_count: jnp.ndarray  # сколько шагов EMA уже видела
+    ema_mean: jnp.ndarray        # быстрая EMA среднего log(grad_norm) -- ловит импульсные спайки
+    ema_var: jnp.ndarray         # быстрая EMA дисперсии log(grad_norm)
+    warm_count: jnp.ndarray      # сколько шагов быстрая EMA уже видела
+    slow_ema_mean: jnp.ndarray   # ФИКС #2: медленная EMA log(grad_norm) -- ловит постепенный дрейф,
+                                  # т.к. её постоянная времени (~200 шагов) существенно больше окна
+                                  # самого наблюдавшегося дрейфа (~80-100 шагов), поэтому она НЕ
+                                  # успевает "переобучиться" на новый уровень так же быстро, как
+                                  # быстрая EMA -- см. докстринг WARMUP_FREEZE_STEP выше.
+    slow_warm_count: jnp.ndarray
 
 
-def zclip_skip(decay: float = 0.97, z_thresh: float = 2.5, warmup_ema_steps: int = 25):
-    """ФИКС (ЗАМЕНЯЕТ burst_damper, см. chat + web-research): предыдущая
-    версия (ratio-порог + ЧАСТИЧНОЕ приглушение) НЕ сдвинула точку взрыва
-    -- он воспроизводился на ПОЧТИ ОДНОМ И ТОМ ЖЕ global_step (~12330-12390)
-    НЕЗАВИСИМО от WARMUP_FREEZE_STEP/параметров damper'а. Диагноз: НЕ
-    позиция на кривой LR, а ДЕТЕРМИНИРОВАННАЯ КОМБИНАЦИЯ "восстановленный
-    opt_state (честный momentum, train.py's _generic_pytree_merge) +
-    конкретный батч данных на этой позиции потока" (train_setup.py's
-    `_mixed_gen` -- фиксированный seed 123, `skip_batches`
-    детерминированно восстанавливает позицию при resume с того же
-    global_step). Это ТОЧНО механизм loss spikes из PaLM (Chowdhery et al.
-    2022, arXiv:2204.02311): "spikes only occur due to the combination of
-    specific data batches with a particular model parameter state" -- и
-    НЕ воспроизводятся с тем же батчем при ДРУГОМ состоянии оптимизатора.
+def zclip_skip(decay: float = 0.97, z_thresh: float = 2.5, warmup_ema_steps: int = 25,
+                slow_decay: float = 0.995, slow_warmup_steps: int = 60,
+                abs_drift_ratio: float = 6.0):
+    """ФИКС #2 (этот пасс, см. модульный докстринг WARMUP_FREEZE_STEP выше
+    для полного разбора): к прежнему быстрому z-score детектору (decay=0.97,
+    ловит импульсные спайки за 1 шаг) добавлен ВТОРОЙ, независимый триггер --
+    отношение текущей нормы к МЕДЛЕННОЙ EMA-базе (slow_decay=0.995,
+    постоянная времени ~200 шагов). Наблюдавшийся инцидент (растянутый на
+    ~80-100 шагов плавный дрейф, а не мгновенный спайк) НЕ ловился чистым
+    z-score, потому что быстрая EMA "гонится" за трендом почти так же
+    быстро, как сам тренд растёт. Медленная EMA специально выбрана
+    существенно медленнее самого окна дрейфа, поэтому норма успевает уйти
+    заметно выше медленной базы ДО того, как медленная EMA её "простит".
 
-    РЕШЕНИЕ -- из литературы:
-      - PaLM / FBI-LLM (arXiv:2407.07093) / Ling LLM 300B MoE
-        (arXiv:2503.05139, п.3.4.4 "Skip loss spikes and Sample retry") --
-        все используют ПОЛНЫЙ SKIP подтверждённого спайка, не приглушение.
-        FBI-LLM: "The model no longer encounters issues at the same
-        training steps using this approach".
-      - ZClip (Kumar et al. 2025, arXiv:2504.02507) -- z-score по EMA
-        среднего/дисперсии grad_norm в LOG-пространстве (log(norm) ближе к
-        нормальному распределению, чем сырая norm с тяжёлым хвостом).
-
-    z = (log(norm) - ema_mean) / sqrt(ema_var), bias-corrected первые
-    `warmup_ema_steps` шагов. z > z_thresh -> ПОЛНЫЙ SKIP (updates
-    зануляются целиком). EMA обновляется только на НЕ-спайковых шагах --
-    иначе спайк "легализовал" бы сам себя.
-
-    Состояние -- персистентные скаляры в opt_state, переживают resume
-    через train.py's _generic_pytree_merge."""
+    is_spike = (быстрый z-score > z_thresh) ИЛИ (norm > abs_drift_ratio *
+    exp(slow_ema_mean)) -- срабатывание любого из двух триггеров даёт
+    ПОЛНЫЙ SKIP шага (updates зануляются целиком), как и раньше. Обе EMA
+    обновляются только на НЕ-спайковых шагах -- иначе спайк "легализовал"
+    бы сам себя (тот же принцип, что и в прежней версии, применён к обеим
+    шкалам времени)."""
     def init_fn(params):
         return ZClipState(
             ema_mean=jnp.array(0.0, dtype=jnp.float32),
             ema_var=jnp.array(1.0, dtype=jnp.float32),
             warm_count=jnp.array(0, dtype=jnp.int32),
+            slow_ema_mean=jnp.array(0.0, dtype=jnp.float32),
+            slow_warm_count=jnp.array(0, dtype=jnp.int32),
         )
 
     def update_fn(updates, state, params=None):
         norm = optax.global_norm(updates)
         log_norm = jnp.log(jnp.maximum(norm, 1e-8))
 
+        # ---- быстрый детектор (импульсные спайки) ----
         is_warm = state.warm_count >= warmup_ema_steps
         std = jnp.sqrt(jnp.maximum(state.ema_var, 1e-8))
         z = jnp.where(is_warm, (log_norm - state.ema_mean) / std, 0.0)
+        is_spike_fast = z > z_thresh
 
-        is_spike = z > z_thresh
+        # ---- медленный детектор (постепенный дрейф) ----
+        is_slow_warm = state.slow_warm_count >= slow_warmup_steps
+        drift_ratio = jnp.exp(log_norm - state.slow_ema_mean)
+        is_spike_slow = jnp.logical_and(is_slow_warm, drift_ratio > abs_drift_ratio)
+
+        is_spike = jnp.logical_or(is_spike_fast, is_spike_slow)
 
         new_updates = jax.tree_util.tree_map(
             lambda g: jnp.where(is_spike, jnp.zeros_like(g), g), updates
         )
 
+        # быстрая EMA -- обновляется только на не-спайковых шагах
         delta = log_norm - state.ema_mean
         new_mean = jnp.where(is_spike, state.ema_mean, state.ema_mean + (1.0 - decay) * delta)
         new_var = jnp.where(
@@ -180,7 +208,17 @@ def zclip_skip(decay: float = 0.97, z_thresh: float = 2.5, warmup_ema_steps: int
         )
         new_warm_count = jnp.minimum(state.warm_count + 1, warmup_ema_steps + 1)
 
-        return new_updates, ZClipState(ema_mean=new_mean, ema_var=new_var, warm_count=new_warm_count)
+        # медленная EMA -- та же логика "не обновляться на спайке", своя decay
+        slow_delta = log_norm - state.slow_ema_mean
+        new_slow_mean = jnp.where(
+            is_spike, state.slow_ema_mean, state.slow_ema_mean + (1.0 - slow_decay) * slow_delta
+        )
+        new_slow_warm_count = jnp.minimum(state.slow_warm_count + 1, slow_warmup_steps + 1)
+
+        return new_updates, ZClipState(
+            ema_mean=new_mean, ema_var=new_var, warm_count=new_warm_count,
+            slow_ema_mean=new_slow_mean, slow_warm_count=new_slow_warm_count,
+        )
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -251,11 +289,19 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 
     clip_tx = optax.clip_by_global_norm(0.25)
 
-    # ФИКС (ГЛАВНЫЙ, см. докстринг zclip_skip() выше): заменяет прежний
-    # burst_damper. Вставляется ПЕРВЫМ элементом chain. ZClipState -- НОВЫЙ
-    # лист в opt_state -- при первом restore со старого чекпоинта
-    # _generic_pytree_merge даст fresh-инициализацию (ожидаемо, безвредно).
-    zclip_tx = zclip_skip(decay=0.97, z_thresh=2.5, warmup_ema_steps=25)
+    # ФИКС #2: zclip_skip теперь с двумя триггерами -- см. докстринг
+    # zclip_skip() выше. ZClipState приобрёл два новых поля
+    # (slow_ema_mean/slow_warm_count) -- на restore со старого чекпоинта,
+    # где ZClipState был 3-полевым, _generic_pytree_merge (train.py) уже
+    # умеет частично восстанавливать НАЙДЕННЫЕ по имени поля NamedTuple и
+    # оставлять fresh для отсутствующих -- см. лог прошлого resume
+    # ("структурный realign: элемент #0 ... не найден -- оставляю свежую
+    # инициализацию ТОЛЬКО для этого элемента"), так что добавление полей
+    # безопасно и не требует полного сброса.
+    zclip_tx = zclip_skip(
+        decay=0.97, z_thresh=2.5, warmup_ema_steps=25,
+        slow_decay=0.995, slow_warmup_steps=60, abs_drift_ratio=6.0,
+    )
 
     multi_tx = optax.multi_transform(
         {"muon": tx_muon, "lion": tx_lion, "adamw_decay": tx_adamw_decay,
@@ -264,6 +310,24 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     )
     tx = optax.chain(zclip_tx, clip_tx, multi_tx)
     return tx, lr_schedule
+
+
+# ==========================================================================
+# ФИКС #3 (этот пасс -- см. chat, per-token loss clip): защита у самого
+# источника, а не только реактивные детекторы (zclip/burst-guard) выше по
+# течению. Один "мусорный" (вырожденный/OOV-подобный/испорченная разметка)
+# токен с почти нулевой вероятностью под текущей моделью может дать CE
+# отдельного токена ~20-30+ -- при усреднении по batch*seq это в одиночку
+# доминирует над градиентом всего эффективного шага и утягивает residual
+# stream/router (см. наблюдавшийся плавный рост router_max_cos/aux_loss
+# синхронно с ce_loss -- согласуется именно с "систематически трудные
+# токены на этом сегменте потока", а не с архитектурной нестабильностью,
+# которая уже была отдельно исключена экспериментально). Клип на уровне
+# ОТДЕЛЬНОГО ТОКЕНА (до усреднения по batch) режет проблему прежде, чем
+# она попадёт в backward -- дешевле и надёжнее, чем городить более
+# сложные реактивные детекторы на градиенте после факта.
+_PER_TOKEN_CE_CLIP = 15.0
+# ==========================================================================
 
 
 def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size):
@@ -285,6 +349,12 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
         loss_vec = nll * (smooth_positive - smooth_negative) - smooth_negative * sum_log_probs
     else:
         loss_vec = nll
+
+    # ФИКС #3: per-token clip -- см. модульный докстринг _PER_TOKEN_CE_CLIP
+    # выше. Применяется ДО mask/суммирования, т.е. режет именно
+    # индивидуально-аномальные токены, не влияя на нормальные (типичный
+    # well-calibrated CE на этом датасете << 15).
+    loss_vec = jnp.minimum(loss_vec, _PER_TOKEN_CE_CLIP)
 
     mask = (label_chunk != -100).astype(jnp.float32)
     masked_loss = jnp.where(mask > 0, loss_vec, 0.0)
