@@ -159,6 +159,18 @@ self.param с той же формой (d_model, E_routed) -- ТОЛЬКО сп�
 restore -- см. train.py's router-reset patch, который в любом случае
 рекомендован отдельно для лечения уже накопленного router collapse на
 чекпоинте до этого фикса.
+
+ФИКС (этот пасс -- shared expert без градиентной защиты, см. чат: [DIAG]
+стабильно светил non-finite именно в группах moe/embed/other, при этом
+router_max_cos/min_col_norm полностью здоровы (0.02-0.08 / 0.916-0.918) --
+MoE-роутинг исключён как источник. Разобрано по узлам: routed-путь уже
+защищён -- КАЖДЫЙ gmm/tgmm вызов в _core_bwd проходит через _sanitize.
+shared_w1/shared_w2 -- голый nn.Dense БЕЗ какой-либо защиты градиента,
+единственный узел в GmmMoEJ без sanitizer'а. Добавлен _moe_grad_sanitizer
+на shared_out, тот же паттерн/тег-конвенция, что уже применяется к
+flat_x_for_router (moe_router_input_grad_*) -- активно клипует несущийся
+назад градиент (не только детектирует, как make_grad_probe), прежде чем
+он попадёт в residual stream через combined/current_x.
 """
 from __future__ import annotations
 
@@ -196,17 +208,20 @@ def _moe_grad_sanitizer(tag: str, clip_val: float = 1e3):
     optimizer.py already gives for its own local copy: avoid a
     moe_gmm.py -> model.py import for one internal helper).
 
-    Placed ONLY on the flat_x copy that feeds router_logits (see call site
-    in GmmMoEJ.__call__ below) -- NOT on the copy used by the shared
-    expert or dispatch. That isolation means the cotangent this node sees
-    on the real backward pass is EXACTLY the router's own contribution to
-    dflat_x -- i.e. the real, per-step measurement of the exact channel
-    by which a large/non-finite router gradient could contaminate the
-    shared residual stream and poison unrelated sublayers (gdn2/mla/mamba2)
-    reading the same current_x. This replaces the synthetic
-    dL/dflat_x check from the offline diagnostic script -- here it's the
-    ACTUAL gradient from the ACTUAL training step, not a proxy, and it
-    costs nothing extra since it's already being computed by autodiff.
+    Placed on the flat_x copy that feeds router_logits (see call site
+    in GmmMoEJ.__call__ below) -- isolation there means the cotangent this
+    node sees on the real backward pass is EXACTLY the router's own
+    contribution to dflat_x. This replaces the synthetic dL/dflat_x check
+    from the offline diagnostic script -- here it's the ACTUAL gradient
+    from the ACTUAL training step, not a proxy, and it costs nothing extra
+    since it's already being computed by autodiff.
+
+    ФИКС (этот пасс): ТАКЖЕ placed on shared_out (see call site below) --
+    previously the shared expert (shared_w1/shared_w2, plain nn.Dense) was
+    the ONLY node in this whole file with no gradient protection at all,
+    while the routed gmm/tgmm path already sanitizes every backward output
+    inside _core_bwd. Same helper, same reasoning, different call site --
+    see module docstring's "ФИКС (этот пасс -- shared expert...)" section.
 
     Also ACTIVELY clips (not just reports) -- same "diagnose AND fix"
     pattern already used for mla_flash_attn_out/gdn2_q_normalize/
@@ -359,6 +374,10 @@ class GmmMoEJ(nn.Module):
     ФИКС (router collapse): router теперь использует L2-нормализованные
     столбцы + обучаемую температуру -- см. module docstring "ФИКС (этот
     пасс...)" выше для полного обоснования.
+
+    ФИКС (shared expert grad protection): см. module docstring's
+    "ФИКС (этот пасс -- shared expert...)" -- shared_out теперь тоже
+    проходит через _moe_grad_sanitizer.
     """
     cfg: object
     interpret: bool = False
@@ -397,6 +416,13 @@ class GmmMoEJ(nn.Module):
         shared_h = jax.nn.gelu(shared_h)
         shared_h = nn.Dropout(rate=self.cfg.dropout_rate)(shared_h, deterministic=deterministic)
         shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
+        # ФИКС (этот пасс -- см. module docstring "ФИКС (этот пасс --
+        # shared expert...)"): shared_w1/shared_w2 были ЕДИНСТВЕННЫМ узлом
+        # в GmmMoEJ без градиентной защиты -- routed-путь уже санитизирован
+        # на каждом шаге backward внутри _core_bwd. Активный клип (не
+        # только детект), тот же паттерн, что уже используется для
+        # flat_x_for_router выше.
+        shared_out = _moe_grad_sanitizer(f"moe_shared_expert_grad_{_moe_tag}")(shared_out)
 
         # ---- routing: top-k среди E_routed ----
         # ФИКС (router collapse): router.kernel -- явный self.param (не
