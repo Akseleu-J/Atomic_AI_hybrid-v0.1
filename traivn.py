@@ -811,7 +811,7 @@ def main_execution():
             #    то, почему это было основной причиной нестабильности
             #    сразу после resume.
             params_merged, opt_state_merged = _compatible_restore_params_and_opt_state(
-                #mngr_latest, resume_step, params, fresh_opt_state
+                mngr_latest, resume_step, params, fresh_opt_state
             )
             params = jax.device_put(params_merged, param_sharding)
             opt_state = jax.device_put(opt_state_merged, opt_state_sharding)
@@ -935,6 +935,7 @@ def main_execution():
     # (не deque с maxlen, т.к. явно сбрасывается сразу после использования
     # на apply-шаге, а не скользящее окно как _accum_window).
     _assignment_frac_window = []
+    _burst_dumped_steps = set()
 
     def _save_all_needed_slots(step, cur_train_loss_val, force_latest=True, tag="", skip_hf_upload=False):
         nonlocal best_train_loss
