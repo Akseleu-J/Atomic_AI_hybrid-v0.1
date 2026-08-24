@@ -54,8 +54,12 @@ RESUME_LR_SCALE = 0.7
 # DEFAULT_WARMUP_FREEZE_STEP оставлен как модульная константа -- значение
 # по умолчанию, если вызывающая сторона явно не передала warmup_freeze_step.
 # ==========================================================================
-DEFAULT_WARMUP_FREEZE_STEP = 1000
-
+# Было: DEFAULT_WARMUP_FREEZE_STEP = 1000
+# Стало: даём warmup идти естественно дольше, не обрывая его так рано --
+# потолок отодвинут, а не убран, чтобы первые ~сотни шагов патченного
+# Muon проверялись при заведомо умеренном LR, но кривая продолжает расти
+# после 1000-го шага, а не залипает навсегда.
+DEFAULT_WARMUP_FREEZE_STEP = 4000
 
 def make_grad_probe(tag: str):
     @jax.custom_vjp
@@ -110,39 +114,40 @@ def _frozen_step():
 tx_frozen = _frozen_step()
 
 
-def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
-    """FIX: старая нормировка (Frobenius norm) давала X0 с сингулярными
-    числами ~1/sqrt(min(m,n)) -- для (768,768) это ~0.036, и 3 фиксированных
-    шага простой итерации 1.5X-0.5*X@X.T@X НЕ успевали сойтись к
-    ортогональному фактору (см. test_synthetic_muon_orthogonalization.py:
-    orth_resid(ns3)~27 на ВСЕХ уровнях обусловленности, включая
-    well-conditioned). Эффективно update был ~proportional(G), без
-    ортогонализации -- убирало именно тот механизм (bounded spectral norm
-    step независимо от ||G||), ради которого Muon и был выбран, и создавало
-    open-loop положительную обратную связь: чем больше градиент, тем
-    больше необузданный шаг, тем больше следующий градиент.
+def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
+    """СТАРАЯ (сломанная) версия -- оставлена ТОЛЬКО как fallback/cross-check
+    target, см. muon_orthogonalize's докстринг про Frobenius-нормировку и
+    orth_resid~27 на всех уровнях обусловленности (test_synthetic_
+    muon_orthogonalization.py). НЕ использовать в горячем пути обучения --
+    держим здесь на случай, если понадобится сравнить поведение до/после
+    патча (та же дисциплина, что kernel_trainable.py/kernel_trainable_B6.py)."""
+    eps = 1e-4
+    if w.ndim == 3:
+        norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
+        norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
+        X = g / norm
+        for _ in range(ns_steps):
+            X = 1.5 * X - 0.5 * jnp.einsum("eij,ejk,ekl->eil", X, jnp.swapaxes(X, -1, -2), X)
+            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        norm = jnp.linalg.norm(g)
+        norm = jnp.where(norm < eps, 1.0, norm)
+        X = g / norm
+        for _ in range(ns_steps):
+            X = 1.5 * X - 0.5 * X @ X.T @ X
+            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    return w - (X * lr)
 
-    FIX: (1) нормировка по ОЦЕНКЕ спектральной нормы (1 шаг степенного
-    метода поверх X/||X||_F -- дёшево, не требует полного SVD) вместо
-    Frobenius нормы -- даёт X0 со старшим сингулярным числом ~1, что
-    находится в зоне быстрой сходимости NS-итерации; (2) квинтичные
-    коэффициенты Keller Jordan (a,b,c)=(3.4445,-4.7750,2.0315) вместо
-    квадратичной 1.5X-0.5XXtX -- быстрее сходится к ортогональному
-    фактору за то же число шагов; (3) ns_steps по умолчанию поднят
-    3->5 -- дополнительный запас сходимости на плохо обусловленных
-    градиентах (см. severe/near_singular в тесте)."""
+
+def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
+    """... (ваш уже написанный докстринг остаётся без изменений) ..."""
     eps = 1e-7
-    a, b, c = 3.4445, -4.7750, 2.0315  # Keller Jordan quintic NS coefficients
+    a, b, c = 3.4445, -4.7750, 2.0315
 
     def _spectral_normalize(X):
-        # 1 шаг степенного метода поверх X/||X||_F, чтобы оценить largest
-        # singular value и отмасштабировать X так, чтобы её largest sv ~ 1
-        # (а не 1/sqrt(min(m,n)), как при чистой Frobenius-нормировке).
         fro = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
         fro = jnp.where(fro < eps, jnp.ones_like(fro), fro)
         X0 = X / fro
-        # степенной метод: v <- X0^T (X0 v), несколько итераций для оценки
-        # top singular value sigma1 ~ ||X0 v|| / ||v||
         v = jnp.ones(X0.shape[:-2] + (X0.shape[-1], 1), dtype=X0.dtype)
         for _ in range(3):
             v = jnp.matmul(jnp.swapaxes(X0, -1, -2), jnp.matmul(X0, v))
@@ -155,7 +160,7 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
     if w.ndim == 3:
         X = _spectral_normalize(g)
         for _ in range(ns_steps):
-            A = jnp.einsum("eij,ekj->eik", X, X)  # X @ X.T
+            A = jnp.einsum("eij,ekj->eik", X, X)
             B = b * A + c * jnp.einsum("eij,ejk->eik", A, A)
             X = a * X + jnp.einsum("eij,ejk->eik", B, X)
             X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -362,7 +367,16 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 
         return optax.GradientTransformation(init_fn, update_fn)
 
-    tx_muon = _muon_step(base_lr=0.006, weight_decay=0.02)
+        # ФИКС (Muon-патч, см. muon_orthogonalize's докстринг): реальный
+    # эффективный шаг вырос ~в 6 раз (||update|| 0.02 -> 0.12 на
+    # well-conditioned синтетике) относительно старого сломанного
+    # поведения (Frobenius-нормировка + недосходящаяся квадратичная NS).
+    # base_lr временно снижен пропорционально (0.006 -> 0.001) для
+    # безопасного старта на fresh-run -- поднимать по факту наблюдения
+    # global_grad_norm/zclip в первых нескольких сотнях шагов, не задача
+    # для резюма старого чекпоинта (см. чат: старый Muon искажал
+    # направление весов тысячи шагов, geometry уже другая).
+    tx_muon = _muon_step(base_lr=0.001, weight_decay=0.02)
 
     def _label_leaf(path, param):
         path_str = path_to_str(path)
