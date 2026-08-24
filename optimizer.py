@@ -114,28 +114,44 @@ def _frozen_step():
 tx_frozen = _frozen_step()
 
 
-def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
-    """СТАРАЯ (сломанная) версия -- оставлена ТОЛЬКО как fallback/cross-check
-    target, см. muon_orthogonalize's докстринг про Frobenius-нормировку и
-    orth_resid~27 на всех уровнях обусловленности (test_synthetic_
-    muon_orthogonalization.py). НЕ использовать в горячем пути обучения --
-    держим здесь на случай, если понадобится сравнить поведение до/после
-    патча (та же дисциплина, что kernel_trainable.py/kernel_trainable_B6.py)."""
+def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
+    """FIX: старая версия использовала квадратичный полином
+    1.5X - 0.5*X@X.T@X с ns_steps=3 -- не успевал сойтись для
+    (768,768)-матриц (orth_resid~27 на всех уровнях, тест показал).
+    
+    FIX: заменяем на квинтичный полином Keller Jordan при той же
+    Frobenius-нормировке. KJ-коэффициенты специально откалиброваны
+    под Frobenius-старт (top sv ~ 1/sqrt(min(m,n))), не под
+    спектральную нормировку -- смешивать нельзя (первая итерация
+    при спектральной нормировке: f(1)=0.701 → f(0.701)=1.25 →
+    расходится, даже несмотря на nan_to_num).
+    
+    С ns_steps=5 и KJ-полиномом сингулярные числа проходят путь
+    ~0.036 → 0.124 → 0.418 → 1.12 → 0.74 → 1.16 -- осциллирует
+    вокруг 1, но orth_resid существенно ниже, чем у старого кода,
+    и главное -- не расходится и не даёт мусорный update."""
     eps = 1e-4
+    a, b, c = 3.4445, -4.7750, 2.0315  # Keller Jordan quintic coefficients
+
     if w.ndim == 3:
         norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
         norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
         X = g / norm
         for _ in range(ns_steps):
-            X = 1.5 * X - 0.5 * jnp.einsum("eij,ejk,ekl->eil", X, jnp.swapaxes(X, -1, -2), X)
+            A = jnp.einsum("eij,ekj->eik", X, X)   # X @ X.T, batched
+            B = b * A + c * jnp.einsum("eij,ejk->eik", A, A)
+            X = a * X + jnp.einsum("eij,ejk->eik", B, X)
             X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     else:
         norm = jnp.linalg.norm(g)
         norm = jnp.where(norm < eps, 1.0, norm)
         X = g / norm
         for _ in range(ns_steps):
-            X = 1.5 * X - 0.5 * X @ X.T @ X
+            A = X @ X.T
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
             X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
     return w - (X * lr)
 
 
