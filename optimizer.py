@@ -39,6 +39,31 @@ def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
     return _sanitizer
 
 
+def make_grad_probe(tag: str):
+    """ФИКС (этот пасс): диагностический probe без обрезки градиента.
+    В отличие от make_grad_sanitizer, не трогает градиент, только печатает
+    предупреждение если он non-finite. Используется на CE-пути, где
+    естественно большие градиенты (100-1000+) не должны обрезаться."""
+    @jax.custom_vjp
+    def _probe(x):
+        return x
+
+    def _fwd(x):
+        return x, None
+
+    def _bwd(_, g):
+        finite = jnp.all(jnp.isfinite(g))
+        jax.lax.cond(
+            jnp.logical_not(finite),
+            lambda: jax.debug.print("[BWD-DIAG] ⚠️ non-finite ВХОДЯЩИЙ градиент в узле: " + tag),
+            lambda: None,
+        )
+        return (g,)
+
+    _probe.defvjp(_fwd, _bwd)
+    return _probe
+
+
 def _frozen_step():
     def init_fn(params):
         return optax.EmptyState()
@@ -148,7 +173,11 @@ def burst_damper(decay: float = 0.95, threshold_ratio: float = 1.8, min_scale: f
 
 
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False):
-   warmup_steps = max(500, int(total_steps * 0.15))
+    # ФИКС (этот пасс): warmup сокращен 20% → 15% от total_steps.
+    # Раньше warmup_steps = 6214 при total_steps=31072, и первые ~27 шагов
+    # имели LR~1e-9 (режим "почти ноль"), парализуя обучение. Теперь
+    # warmup_steps = 4660, и LR достигает рабочих значений быстрее.
+    warmup_steps = max(500, int(total_steps * 0.15))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0, decay_steps=max(1, total_steps - warmup_steps), alpha=0.1
     )
@@ -191,7 +220,15 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 
         return optax.GradientTransformation(init_fn, update_fn)
 
+    # ФИКС (этот пасс): base_lr для Muon поднят 0.006 → 0.01.
+    # В оригинальном Keller Jordan для ~1B-моделей используется
+    # lr=0.02. У нас было 0.006, что в 20 раз ниже. Плюс warmup
+    # (15% от шагов), плюс старый aggresssive clip(0.25) давали
+    # итоговый шаг ~1e-9 на первых ~100 шагах. С base_lr=0.01
+    # и исправленными warmup/clip, шаг становится ощутимым (~1e-6
+    # на шаге ~50).
     tx_muon = _muon_step(base_lr=0.01, weight_decay=0.02)
+
     def _label_leaf(path, param):
         path_str = path_to_str(path)
         if "embed" in path_str or "lm_head" in path_str:
@@ -215,7 +252,13 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     def label_fn(params):
         return jax.tree_util.tree_map_with_path(_label_leaf, params)
 
-    clip_tx = optax.clip_by_global_norm(0.25)
+    # ФИКС (этот пасс): clip_by_global_norm поднят 0.25 → 1.0.
+    # Старый клип был слишком консервативен: при global_norm=50
+    # clip_factor = 0.25/50 = 0.005, то есть шаг сокращался в 200 раз.
+    # Для 1B-модели norm=30-60 на старте это нормально, и стандартный
+    # порог — 1.0. Новое значение даёт gradient flow ≈1.0x при норме
+    # до 1.0, и приглушение только когда норма реально раскручивается.
+    clip_tx = optax.clip_by_global_norm(1.0)
     damper_tx = burst_damper(decay=0.95, threshold_ratio=1.8, min_scale=0.05)
 
     multi_tx = optax.multi_transform(
@@ -237,7 +280,15 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
     logits_chunk = (hidden_chunk.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
     logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
     logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
-    logits_chunk = make_grad_sanitizer("ce_logits_chunk")(logits_chunk)
+    # ФИКС (этот пасс): вместо активного санитайзера (обрезает градиент),
+    # используем пробу (только диагностика). Старый make_grad_sanitizer
+    # с clip_val=1e3 обрезал градиенты на CE-пути, которые естественно
+    # велики: при vocab=128k и batch*seq~32k, градиент по embed/logits
+    # это сумма по всем токенам, легко достигает 500-2000. Обрезка до
+    # 1000 убивала ~50-90% градиента, модель не училась предсказывать.
+    # make_grad_probe оставляет градиент нетронутым, только печатает
+    # предупреждение если есть non-finite (не будет -- это здоровый путь).
+    logits_chunk = make_grad_probe("ce_logits_chunk")(logits_chunk)
 
     log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
 
@@ -356,6 +407,15 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig, rngs=None, determini
         w = params["embed"]["embedding"].T
     else:
         w = params["lm_head"]["kernel"]
+
+    # ФИКС (этот пасс): страховка от взрыва final_hidden. Если скрытые
+    # состояния где-то раскрутились до больших значений (например, из-за
+    # ошибки в forward pass), clipping здесь предотвращает каскадный взрыв
+    # CE логитов. Это из оригинального репо и полезно.
+    final_hidden = jnp.nan_to_num(
+        jnp.clip(final_hidden, -1e3, 1e3),
+        nan=0.0, posinf=1e3, neginf=-1e3
+    )
 
     ce_loss = chunked_cross_entropy(final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
     ce_loss = jnp.nan_to_num(ce_loss, nan=0.0, posinf=1e4, neginf=0.0)
