@@ -17,6 +17,7 @@ RESUME_LR_SCALE = 0.7
 # ==========================================================================
 WARMUP_FREEZE_STEP = 3000
 
+
 def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
     @jax.custom_vjp
     def _sanitizer(x):
@@ -74,7 +75,7 @@ def _frozen_step():
 tx_frozen = _frozen_step()
 
 # ==========================================
-# Muon (Newton-Schulz orthogonalization)
+# Muon (SVD-based polar factor)
 # ==========================================
 def muon_orthogonalize(w, g, lr, ns_steps: int = 3):
     """ФИКС (этот пасс -- главное): вместо нарушенного Newton-Schulz 
@@ -268,6 +269,24 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     )
     tx = optax.chain(damper_tx, clip_tx, multi_tx)
     return tx, lr_schedule
+
+
+# ==========================================================================
+# ФИКС (этот пасс): extract_zclip_diagnostics для train_setup.py
+# ==========================================================================
+def extract_zclip_diagnostics(opt_state):
+    """Возвращает сырые поля zclip-диагностики из opt_state.
+    Если в tx.chain нет zclip_skip (например, используется burst_damper),
+    возвращает нулевые заглушки для совместимости с train_setup.py."""
+    zs = opt_state[0]
+    return {
+        "ema_mean": getattr(zs, "ema_mean", jnp.array(0.0, dtype=jnp.float32)),
+        "ema_var": getattr(zs, "ema_var", jnp.array(1.0, dtype=jnp.float32)),
+        "warm_count": getattr(zs, "warm_count", jnp.array(0, dtype=jnp.int32)),
+        "slow_ema_mean": getattr(zs, "slow_ema_mean", jnp.array(0.0, dtype=jnp.float32)),
+        "slow_warm_count": getattr(zs, "slow_warm_count", jnp.array(0, dtype=jnp.int32)),
+    }
+
 
 # ==========================================
 # Loss
