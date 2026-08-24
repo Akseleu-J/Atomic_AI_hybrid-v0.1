@@ -155,40 +155,6 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
     return w - (X * lr)
 
 
-def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
-    """... (ваш уже написанный докстринг остаётся без изменений) ..."""
-    eps = 1e-7
-    a, b, c = 3.4445, -4.7750, 2.0315
-
-    def _spectral_normalize(X):
-        fro = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
-        fro = jnp.where(fro < eps, jnp.ones_like(fro), fro)
-        X0 = X / fro
-        v = jnp.ones(X0.shape[:-2] + (X0.shape[-1], 1), dtype=X0.dtype)
-        for _ in range(3):
-            v = jnp.matmul(jnp.swapaxes(X0, -1, -2), jnp.matmul(X0, v))
-            v_norm = jnp.linalg.norm(v, axis=(-2, -1), keepdims=True)
-            v = v / jnp.where(v_norm < eps, jnp.ones_like(v_norm), v_norm)
-        sigma1 = jnp.linalg.norm(jnp.matmul(X0, v), axis=(-2, -1), keepdims=True)
-        sigma1 = jnp.where(sigma1 < eps, jnp.ones_like(sigma1), sigma1)
-        return X0 / sigma1
-
-    if w.ndim == 3:
-        X = _spectral_normalize(g)
-        for _ in range(ns_steps):
-            A = jnp.einsum("eij,ekj->eik", X, X)
-            B = b * A + c * jnp.einsum("eij,ejk->eik", A, A)
-            X = a * X + jnp.einsum("eij,ejk->eik", B, X)
-            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    else:
-        X = _spectral_normalize(g)
-        for _ in range(ns_steps):
-            A = X @ X.T
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-            X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return w - (X * lr)
 
 class MuonState(NamedTuple):
     count: jnp.ndarray
