@@ -220,6 +220,41 @@ def zclip_skip(decay: float = 0.97, z_thresh: float = 2.5, warmup_ema_steps: int
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+# ==========================================================================
+# ФИКС (этот пасс -- видимость zclip_skip, см. chat: градиентная норма
+# монотонно растёт >16 при стабильном замороженном LR, ce_loss растёт
+# синхронно, остальные группы/router чисты -- гипотеза "систематически
+# трудный сегмент потока данных", НЕ архитектурная нестабильность. Раньше
+# is_spike/z/drift_ratio из zclip_skip НИГДЕ не логировались -- невозможно
+# было отличить "zclip реально зануляет часть шагов" от "clip_by_global_norm
+# просто масштабирует растущий, но каждый раз применяемый градиент".
+#
+# extract_zclip_diagnostics читает уже посчитанный zclip_tx's ZClipState
+# (первый элемент tx.chain -- см. make_hybrid_optimizer) ПОСЛЕ tx.update и
+# восстанавливает is_spike для ЭТОГО шага косвенно: t.к. ZClipState сам по
+# себе не хранит is_spike явно (только результат его применения к EMA), а
+# пересчитывать is_spike здесь пришлось бы дублировать формулу, вместо
+# этого возвращаем сырые ema_mean/slow_ema_mean/warm_count -- этого
+# достаточно для host-side построения того же графика без гадания.
+# ==========================================================================
+def extract_zclip_diagnostics(opt_state):
+    """opt_state -- новый (после tx.update) optax.chain state. zclip_tx --
+    первый элемент chain (см. make_hybrid_optimizer: `tx = optax.chain(
+    zclip_tx, clip_tx, multi_tx)`), поэтому opt_state[0] -- его ZClipState.
+    Возвращает dict с сырыми полями ZClipState -- host-side (train.py)
+    считает производные величины (z, drift_ratio) сам, тем же способом,
+    что и update_fn внутри zclip_skip, чтобы не дублировать формулу дважды
+    внутри jit-графа."""
+    zs = opt_state[0]
+    return {
+        "ema_mean": zs.ema_mean,
+        "ema_var": zs.ema_var,
+        "warm_count": zs.warm_count,
+        "slow_ema_mean": zs.slow_ema_mean,
+        "slow_warm_count": zs.slow_warm_count,
+    }
+
+
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False,
                            warmup_freeze_step: Optional[int] = DEFAULT_WARMUP_FREEZE_STEP):
     """ФИКС #2 (см. докстринг WARMUP_FREEZE_STEP выше): warmup_freeze_step
@@ -351,8 +386,31 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 # ОТДЕЛЬНОГО ТОКЕНА (до усреднения по batch) режет проблему прежде, чем
 # она попадёт в backward -- дешевле и надёжнее, чем городить более
 # сложные реактивные детекторы на градиенте после факта.
+#
+# ФИКС (этот пасс -- настраиваемый порог, см. chat: градиентная норма
+# монотонно растёт >16 при стабильном LR, гипотеза "трудный сегмент
+# данных"): было жёсткой модульной константой -- теперь можно временно
+# снизить (например до 10.0) БЕЗ правки этого файла, чтобы проверить,
+# стабилизируется ли рост -- если да, подтверждает гипотезу "отдельные
+# трудные токены доминируют над градиентом", а не архитектурную
+# нестабильность. train.py может переопределить через
+# optimizer.set_per_token_ce_clip(...) ДО первой компиляции
+# (make_shard_and_compile), см. helper ниже.
 _PER_TOKEN_CE_CLIP = 15.0
 # ==========================================================================
+
+
+def set_per_token_ce_clip(value: float):
+    """ФИКС (этот пасс): позволяет train.py менять _PER_TOKEN_CE_CLIP без
+    правки этого файла -- вызывать ДО make_shard_and_compile/первой
+    компиляции (значение встраивается в jit-граф как Python-константа
+    времени трассировки через jnp.minimum(loss_vec, _PER_TOKEN_CE_CLIP)
+    внутри _chunked_ce_step, менять посреди уже скомпилированного шага
+    бессмысленно)."""
+    global _PER_TOKEN_CE_CLIP
+    _PER_TOKEN_CE_CLIP = value
+    print(f"[OPTIMIZER] _PER_TOKEN_CE_CLIP переопределён на {value} "
+          f"(вызывать до первой компиляции, иначе изменение не подействует).")
 
 
 def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size):
