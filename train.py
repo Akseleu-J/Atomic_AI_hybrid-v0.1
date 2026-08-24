@@ -1013,7 +1013,8 @@ def main_execution():
 
                 _t_apply = time.perf_counter()
                 (params, opt_state, accum_grads, was_finite,
-                 global_norm, clip_factor, group_nonfinite_flags, was_clipped) = compiled_apply(
+                 global_norm, clip_factor, group_nonfinite_flags, was_clipped,
+                 zclip_diag) = compiled_apply(
                     params, opt_state, accum_grads, accum_steps, assignment_frac_arr
                 )
                 if micro_step < 30:
@@ -1027,6 +1028,43 @@ def main_execution():
                 # host-side разбор, ноль host-callback каналов, полное
                 # покрытие W&B.
                 _global_norm_val = float(jax.device_get(global_norm))
+
+                # ФИКС (видимость zclip_skip, см. train_setup.py's ФИКС #9
+                # докстринг): пересчитываем z-score/drift_ratio host-side из
+                # СЫРЫХ полей ZClipState (уже ПОСЛЕ tx.update, т.е. это
+                # состояние ЭТОГО шага) -- ТОЙ ЖЕ формулой, что update_fn
+                # внутри optimizer.py's zclip_skip использует для принятия
+                # решения is_spike (но здесь только для логирования, само
+                # решение уже принято внутри jit-графа). Позволяет отличить
+                # "zclip реально зануляет часть шагов" от "clip_by_global_norm
+                # просто масштабирует растущий, но каждый раз применяемый
+                # градиент" -- см. chat, инцидент "градиентная норма
+                # монотонно растёт >16 при стабильном замороженном LR".
+                _zc = jax.device_get(zclip_diag)
+                _zc_ema_std = float(np.sqrt(max(float(_zc["ema_var"]), 1e-8)))
+                _zc_log_norm = float(np.log(max(_global_norm_val, 1e-8)))
+                _zc_is_warm = int(_zc["warm_count"]) >= 25       # warmup_ema_steps default в zclip_skip
+                _zc_is_slow_warm = int(_zc["slow_warm_count"]) >= 60  # slow_warmup_steps default
+                _zc_fast_z = ((_zc_log_norm - float(_zc["ema_mean"])) / _zc_ema_std) if _zc_is_warm else 0.0
+                _zc_drift_ratio = (
+                    float(np.exp(_zc_log_norm - float(_zc["slow_ema_mean"]))) if _zc_is_slow_warm else 1.0
+                )
+                _zc_likely_spike = bool(
+                    (_zc_is_warm and _zc_fast_z > 2.5) or
+                    (_zc_is_slow_warm and _zc_drift_ratio > 6.0)
+                )
+                if _zc_likely_spike:
+                    print(f"[ZCLIP-DIAG] ⚠️ похоже, zclip_skip ЗАНУЛИЛ обновление на "
+                          f"global_step={global_step + 1}: fast_z={_zc_fast_z:.2f} "
+                          f"drift_ratio={_zc_drift_ratio:.2f}")
+                wandb_logging.log_metrics(global_step + 1, {
+                    "zclip/ema_mean": float(_zc["ema_mean"]),
+                    "zclip/ema_std": _zc_ema_std,
+                    "zclip/slow_ema_mean": float(_zc["slow_ema_mean"]),
+                    "zclip/fast_z": _zc_fast_z,
+                    "zclip/drift_ratio": _zc_drift_ratio,
+                    "zclip/likely_spike_skip": int(_zc_likely_spike),
+                })
                 # Логирование per‑micro градиентных норм
                 if _micro_grad_norms:
                   max_micro = max(_micro_grad_norms)
@@ -1037,7 +1075,17 @@ def main_execution():
                   }
                   wandb_logging.log_metrics(global_step + 1, wandb_step_metrics)
                   _micro_grad_norms = []   # очистка для следующего эффективного шага
-                if _global_norm_val > 20.0:
+                # ФИКС (этот пасс -- см. chat, порог снижен с 20.0 до 8.0):
+                # раньше диагностический снимок данных срабатывал только
+                # при global_norm>20 три шага подряд -- при монотонном
+                # дрейфе (наблюдался рост от единиц до >16 за сотни шагов)
+                # снимок делался СЛИШКОМ ПОЗДНО, чтобы поймать данные,
+                # соответствующие НАЧАЛУ дрейфа. Более низкий порог даёт
+                # ранний снимок конкретных input_ids -- нужно для проверки
+                # гипотезы "систематически трудный сегмент потока данных"
+                # (см. _PER_TOKEN_CE_CLIP / mode="mixed" обсуждение).
+                _BURST_GUARD_THRESHOLD = 8.0
+                if _global_norm_val > _BURST_GUARD_THRESHOLD:
                     burst_streak += 1
                 else:
                     burst_streak = 0
@@ -1050,6 +1098,24 @@ def main_execution():
                         os.makedirs(snap_dir, exist_ok=True)
                         for i, entry in enumerate(_accum_window):
                             np.save(os.path.join(snap_dir, f"micro_{i}_input_ids.npy"), entry["input_ids"])
+                            # ФИКС (этот пасс): раньше сохранялись только
+                            # input_ids -- для проверки гипотезы "трудные
+                            # токены доминируют над CE" нужны и labels
+                            # (какие именно позиции промаскированы/что
+                            # модель должна предсказать), не только сырые
+                            # входные ids.
+                            np.save(os.path.join(snap_dir, f"micro_{i}_labels.npy"), entry["labels"])
+                        with open(os.path.join(snap_dir, "BURST_META.json"), "w") as f:
+                            json.dump({
+                                "n_micro": len(_accum_window),
+                                "global_step": int(global_step + 1),
+                                "global_norm_at_dump": _global_norm_val,
+                                "ce_loss_at_dump": float(jax.device_get(aux_info["ce_loss"])),
+                                "source_idx_per_micro": [entry["source_idx"] for entry in _accum_window],
+                            }, f)
+                        print(f"[BURST-GUARD] 📸 Снимок сохранён: {snap_dir} "
+                              f"(global_norm={_global_norm_val:.2f}, ce_loss="
+                              f"{float(jax.device_get(aux_info['ce_loss'])):.3f})")
                         _burst_dumped_steps.add(global_step)
                     # остальное (alert, сброс burst_streak) – уже есть
                     wandb_logging.log_alert(
