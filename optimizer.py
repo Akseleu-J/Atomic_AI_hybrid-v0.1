@@ -157,37 +157,37 @@ def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
 
 
 def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
-    """FIX: точный polar factor через SVD вместо аппроксимации NS.
+    """Квинтичный Newton-Schulz (Keller Jordan), Frobenius-нормировка.
+    Matmul-only -- не требует SVD/LU, полностью на MXU, на порядок быстрее.
+    Не даёт точный polar factor (orth_resid не -> 0), но даёт "достаточно
+    ортогональное" направление -- это ровно то, что использует реальный
+    Muon на масштабных моделях (не эталонный SVD, а именно это)."""
+    eps = 1e-7
+    a, b, c = 3.4445, -4.7750, 2.0315
 
-    SVD: g = U @ diag(sigma) @ V^T  ->  polar factor = U @ V^T
-    Математически точно для любой обусловленности.
-    orth_resid(SVD) ≈ 1e-15 (machine precision) vs ~27 у старой версии.
-
-    eps-fallback: при ||g|| < eps обнуляем effective_lr (не X) -- X
-    остаётся ортогональным, просто шаг = 0.
-
-    Параметр ns_steps оставлен для совместимости API, игнорируется
-    (SVD не итеративный).
-    """
-    eps = 1e-4
+    def _ns_iterate(X):
+        for _ in range(ns_steps):
+            A = X @ X.mT           # X @ X^T (batched через mT для 3D)
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+        return X
 
     if w.ndim == 3:
         norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
         safe_norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
-        g_normalized = g / safe_norm
-        U, _s, Vt = jnp.linalg.svd(g_normalized, full_matrices=False)
-        X = jnp.matmul(U, Vt)
+        X = g / safe_norm
+        X = _ns_iterate(X)
+        X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         effective_lr = jnp.where(norm < eps, jnp.zeros_like(norm), lr)
-        return w - (X * effective_lr)
     else:
         norm = jnp.linalg.norm(g)
         safe_norm = jnp.where(norm < eps, 1.0, norm)
-        g_normalized = g / safe_norm
-        U, _s, Vt = jnp.linalg.svd(g_normalized, full_matrices=False)
-        X = U @ Vt
+        X = g / safe_norm
+        X = _ns_iterate(X)
+        X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         effective_lr = jnp.where(norm < eps, 0.0, lr)
-        return w - (X * effective_lr)
 
+    return w - (X * effective_lr)
 
 # ==========================================================================
 # State NamedTuples
