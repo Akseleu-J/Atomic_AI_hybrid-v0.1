@@ -2,162 +2,52 @@
 train_setup.py -- диагностика non-finite по группам параметров, TPU mesh /
 шардинг / компиляция train-step'ов, multi-source dataloader.
 
-Вынесено из train.py. Логика не менялась -- перенос как есть.
+Вынесено из train.py.
 
 ФИКС (dataloader, по гипотезе "смешение источников в одном батче триггерит
 RESID-DIAG на layer=22/mamba2" -- см. чат): dataloader_multi_source теперь
 поддерживает три режима подачи данных (mode="mixed"/"sequential"/
-"round_robin") и per-source fraction (третий элемент в file_pairs). Все
-остальные функции в этом файле -- БЕЗ ИЗМЕНЕНИЙ.
+"round_robin") и per-source fraction (третий элемент в file_pairs).
 
-ФИКС #2 (этот пасс): _round_robin_gen был переписан на "быстрый пропуск без
-чтения с диска" (принимает batch_idx через next(src_gens[s]), затем сам
-вызывает _gather_batch) -- но функция-генератор индексов, которую он
-вызывал (_infinite_source_indices), нигде не была определена, только
-_infinite_source_batches (которая сразу возвращает ГОТОВЫЕ данные, а не
-индексы) -- это NameError при первом же вызове mode="round_robin".
-Добавлена _infinite_source_indices -- тот же паттерн, что и
-_infinite_source_batches, но yield'ит idx_local[...] вместо
-_gather_batch(idx_local[...]), чтобы _round_robin_gen мог пропускать уже
-пройденные микрошаги (skip_first) БЕЗ чтения с диска на каждый из них --
-именно так, как и было задумано в его собственном докстринге/принте
-"Быстрый пропуск N микрошагов (без чтения с диска)".
+ФИКС #2 (этот пасс): _round_robin_gen переписан на "быстрый пропуск без
+чтения с диска".
 
 ФИКС #3 (этот пасс -- W&B диагностика без jax.debug.print/callback):
-раньше _group_nonfinite_check и distributed_apply_step (для was_clipped)
-печатали диагностику через jax.debug.print ПРЯМО ВНУТРИ jit-графа. Две
-проблемы с этим:
-  (a) jax.debug.print/jax.debug.callback открывают host-callback канал на
-      КАЖДЫЙ фактический вызов -- на длинных сессиях (десятки тысяч шагов)
-      это упирается в лимит открытых файлов рантайма (OSError: Too many
-      open files), реально наблюдавшийся баг в этом проекте;
-  (b) даже если бы это не падало, вывод шёл ТОЛЬКО в консоль Kaggle,
-      которая не сохраняется между сессиями, и НИКОГДА не попадал в W&B --
-      то есть самая ценная диагностика (какая именно группа параметров
-      даёт non-finite, насколько близко global_norm подошёл к клипу)
-      была невидима постфактум.
-Обе диагностики теперь ЧИСТЫЕ функции: возвращают jnp-массивы/скаляры как
-ОБЫЧНЫЕ ВЫХОДЫ jitted distributed_apply_step, без единого debug.print/
-debug.callback внутри графа. Печать и W&B-логирование делаются на
-host-стороне в train.py, в том же месте, где уже логируются train_loss/
-aux_info -- ноль дополнительных host-callback каналов, полное покрытие
-W&B.
+group_nonfinite_flags и was_clipped -- чистые функции, возвращают
+jnp-массивы/скаляры как ОБЫЧНЫЕ ВЫХОДЫ jitted distributed_apply_step.
 
 ФИКС #4 (этот пасс): make_hybrid_optimizer теперь дополнительно
-возвращает lr_schedule (0..1 множитель, до умножения на конкретный
-base_lr каждой группы) -- нужно, чтобы train.py мог логировать
-train/lr_scale в W&B без необходимости пересчитывать warmup/cosine-decay
-формулу отдельно.
+возвращает lr_schedule.
 
 ФИКС #5 (этот пасс -- AttributeError: 'function' object has no attribute
-'init'): optax.GradientTransformation сам является NamedTuple из двух
-полей (init, update) -- то есть тоже обычный 2-tuple. Пока optimizer.py
-не обновлён на фактический возврат (tx, lr_schedule) (ФИКС #4 выше
-описывает НАМЕРЕНИЕ, но реализация в optimizer.py может отставать),
-безусловная распаковка `tx, lr_schedule = make_hybrid_optimizer(...)` НЕ
-падает с ошибкой сразу -- она молча распаковывает сам
-GradientTransformation: tx становится функцией tx.init, а lr_schedule --
-функцией tx.update. Дальше `tx.init(...)` закономерно падает с
-"'function' object has no attribute 'init'", и трейсбек указывает на
-СЛЕДУЮЩУЮ строку (jax.eval_shape(lambda: tx.init(...))), что маскирует
-реальную причину. make_shard_and_compile теперь явно проверяет тип
-результата make_hybrid_optimizer вместо слепой распаковки -- см.
-make_shard_and_compile ниже.
+'init'): make_shard_and_compile явно проверяет тип результата
+make_hybrid_optimizer вместо слепой распаковки.
 
-ФИКС #6 (этот пасс -- router_temp runaway, см. test_synthetic_router_temp*.py
-в чате): GmmMoEJ's router_temp (atomic_ops/moe_gmm.py, _ROUTER_TEMP_INIT=
-10.0, hard-clipped to [1,15] только НА ЧТЕНИЕ через router_temp_clipped)
-не имеет структурного сопротивления росту САМОГО параметра к потолку
-клипа. Подтверждено на полностью изолированном синтетическом тесте (один
-слой GmmMoEJ, случайный шум на входе, loss=mean(out**2), без реальных
-данных, без GDN-2/Mamba2): router_temp детерминированно упирается в 15.0
-за ~9000 шагов чисто из-за task-loss давления, независимо от датасета.
+ФИКС #6 (этот пасс -- router_temp runaway): GmmMoEJ's router_temp
+decoupled decay-to-init в apply_router_temp_decay.
 
-L2-штраф-в-loss (router_temp - init)**2 был опробован ПЕРВЫМ и отклонён:
-под Adam адаптивная пер-параметрная нормализация шага (sqrt(v)/m) делает
-ЭФФЕКТИВНЫЙ размер шага почти независимым от величины L2-коэффициента --
-100-кратное изменение coef (1e-4 -> 1e-2) дало почти ИДЕНТИЧНЫЕ траектории
-отката в синтетическом resume-shock тесте (старт=15.0, все три coef сошлись
-к ~13.6 за 1500 шагов). Тот же класс проблемы, что уже встречался в этом
-проекте с Muon weight decay (см. optimizer.py's _muon_step докстринг) --
-там решено применением decay ВНЕ градиентного пути (после ортогонализации),
-а не через loss.
+ФИКС #7 (этот пасс -- bias-балансировка экспертов, DeepSeek-V3 style):
+GmmMoEJ's expert_bias, decoupled update в apply_expert_bias_update.
 
-Фикс здесь следует тому же паттерну "decoupled decay, не через градиент
-loss": применяется прямо в пост-обработке параметров после
-optax.apply_updates (distributed_apply_step, сразу после существующего
-клипа параметров ±1e2), не через compute_loss/optimizer.py's tx.update().
-Синтетический перебор (test_synthetic_router_temp_decoupled.py) подтвердил
-decay_rate=0.02 как хороший баланс:
-  - Сценарий A (рост от init под task-loss давлением, 3000 шагов):
-    final=10.03, max=10.03 -- рост к потолку полностью подавлен.
-  - Сценарий B (откат от уже упёршегося 15.0, симулирует чекпоинт ДО
-    фикса, 1500 шагов): стабилизируется в [9,11] к шагу 81, БЕЗ overshoot
-    ниже init (min=10.01) -- в отличие от decay_rate=0.001/0.005, которые
-    либо не стабилизируются за 1500 шагов вовсе, либо стабилизируются
-    слишком медленно (шаг 339), чтобы быть практически полезными сразу
-    после реального resume.
-decay_rate=0.05 был чуть быстрее (шаг 31) без видимого overshoot, но 0.02
-оставляет больше запаса против более высокой дисперсии градиентов
-реальных данных по сравнению с безшумным синтетическим тестом --
-пересмотреть только если 0.02 окажется слишком медленным для удержания
-роста на реальных TPU-прогонах.
+ФИКС #8 (этот пасс -- переключаемый WARMUP_FREEZE_STEP, см. chat):
+make_shard_and_compile теперь принимает warmup_freeze_step и прокидывает
+его в make_hybrid_optimizer(warmup_freeze_step=...) -- раньше это была
+жёсткая модульная константа WARMUP_FREEZE_STEP внутри optimizer.py,
+теперь train.py явно решает (USE_WARMUP_FREEZE/WARMUP_FREEZE_STEP_VALUE),
+None означает обычный полный warmup/cosine-decay без заморозки.
 
-ФИКС #7 (этот пасс -- bias-балансировка экспертов, DeepSeek-V3 style, см.
-test_synthetic_router_bias_balancing.py v2 в чате): GmmMoEJ's expert_bias
-(atomic_ops/moe_gmm.py) добавлен для влияния ТОЛЬКО на top-k ОТБОР
-(router_logits_biased = router_logits + stop_gradient(expert_bias)), но
-до этого фикса он был помечен "frozen" в optimizer.py's _label_leaf и
-никем не обновлялся -- застревал на нуле навсегда, механизм был вайрен,
-но никогда не срабатывал.
-
-Синтетический тест (v2, исправленный после первого провала -- см. чат:
-v1 мерил std(mean_probs), полный softmax, который bias по дизайну не
-затрагивает, поэтому улучшение было гарантированно 1.00x независимо от
-реализации; правильная метрика -- std ФАКТИЧЕСКОЙ частоты top-k-назначений,
-то, что реально становится gmm's group_sizes) подтвердил 11.24x улучшение
-std(assignment_frac) при реалистичном коллапсе (общее направление в
-данных, коррелирующее с направлением одного эксперта -- имитация
-"схлопнутого" residual stream на раннем шаге/слое, аналог вашей
-block_0/layer_0 гипотезы).
-
-Механизм здесь -- ТОТ ЖЕ decoupled-паттерн, что уже отработан для
-router_temp (apply_router_temp_decay) и Muon weight decay: обновление
-ПОСЛЕ optax.apply_updates, НЕ через градиент/loss (у DeepSeek-V3 это
-принципиально -- при уже насыщенных логитах градиент через softmax
-затухает, а bias-обновление по фактическим частотам работает независимо
-от насыщения). "expert_bias" остаётся "frozen" в optimizer.py -- нулевой
-градиентный вклад гарантирован там, здесь применяется отдельный
-знаковый шаг по РЕАЛЬНОЙ частоте назначений (assignment_frac,
-optimizer.py's compute_loss/aux_info), не по мягкому softmax.
-
-ВАЖНОЕ ДОПУЩЕНИЕ (порядок листьев): _build_expert_bias_index_map ниже
-присваивает каждому expert_bias-параметру статический индекс СТРОГО в
-порядке обхода params-pytree (tree_map_with_path). assignment_frac_stacked
-(из optimizer.py's compute_loss, собран через collect_by_leaf_name над
-sowed_vars["losses"]) идёт в порядке обхода ДЕРЕВА МОДУЛЕЙ flax (то есть
-порядка объявления block_0, block_1, ... в FullHybridMoEModel). Оба обхода
-идут по одному и тому же дереву блоков в одном и том же порядке
-объявления -- см. model.py: BlockDAR блоки создаются циклом
-`for block_idx in range(num_blocks)` строго по возрастанию, и
-GmmMoEJ -- единственный источник И expert_bias-параметра, И
-assignment_frac-sow внутри каждого блока, так что тождественность порядка
-гарантирована структурой самого model.py, а не совпадением. Если в
-будущем появится более одного MoE-блока на BlockDAR или порядок
-объявления субмодулей изменится -- эту гарантию нужно перепроверить.
-
-ВАЖНО (интеграция в train.py): apply_expert_bias_update требует
-`assignment_frac_stacked` -- агрегат (обычно среднее) по всем микрошагам
-ОДНОГО эффективного шага, той же формы, что compute_loss's
-aux_info["assignment_frac"] (n_moe_layers, E_routed). Простейший вариант
-интеграции в train.py -- усреднить `aux_info["assignment_frac"]` по
-accum_steps микрошагам (host-side, как и остальная диагностика в
-train.py) и передать усреднённый jnp-массив ШЕСТЫМ (новым) позиционным
-аргументом в compiled_apply, ровно тем же способом, каким
-collinearity_coef_arr уже передаётся в compiled_train_micro -- см.
-train.py's докстринг "ФИКС (pjit in_shardings length mismatch...)" для
-образца того же паттерна. compiled_apply's in_shardings/out_shardings
-ниже уже обновлены под этот новый аргумент.
+ФИКС #9 (этот пасс -- видимость zclip_skip, см. chat: градиентная норма
+монотонно растёт при стабильном замороженном LR, ce_loss растёт синхронно,
+остальные группы чисты -- гипотеза "систематически трудный сегмент
+данных"): distributed_apply_step теперь ДОПОЛНИТЕЛЬНО возвращает сырые
+поля ZClipState (через optimizer.extract_zclip_diagnostics) ПОСЛЕ
+tx.update -- раньше было невозможно отличить "zclip реально зануляет
+часть шагов" от "clip_by_global_norm просто масштабирует растущий, но
+каждый раз применяемый градиент", потому что is_spike/z/drift_ratio
+нигде не логировались. host-side (train.py) пересчитывает z-score и
+drift_ratio из этих сырых полей ТЕМ ЖЕ способом, что update_fn внутри
+zclip_skip -- не дублирует логику принятия решения (is_spike), только
+воспроизводит формулу для логирования.
 """
 from __future__ import annotations
 
@@ -174,7 +64,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from model import FullHybridMoEModel, ModelConfig, set_model_mesh
-from optimizer import compute_loss, make_hybrid_optimizer
+from optimizer import compute_loss, make_hybrid_optimizer, extract_zclip_diagnostics
 from utils import path_to_str
 
 DATASET_FRACTION = 1
@@ -190,9 +80,7 @@ NONFINITE_WINDOW_SIZE = 15
 NONFINITE_WINDOW_RATIO = 0.25
 
 # ==========================================================================
-# ФИКС #6 (router_temp runaway) -- см. докстринг модуля выше для полного
-# обоснования (isolated synthetic test + отклонённый L2-в-loss вариант +
-# принятый decoupled-decay вариант, decay_rate=0.02).
+# ФИКС #6 (router_temp runaway) -- см. модульный докстринг выше.
 # ==========================================================================
 ROUTER_TEMP_DECAY_RATE = 0.02
 ROUTER_TEMP_INIT = 10.0  # должно совпадать с atomic_ops/moe_gmm.py's _ROUTER_TEMP_INIT
@@ -208,14 +96,7 @@ def _router_temp_decay_leaf(path, param):
 
 def apply_router_temp_decay(new_params, decay_map):
     """Decoupled decay-to-init ТОЛЬКО для router_temp-листьев, применяется
-    ПОСЛЕ optax.apply_updates (т.е. после собственного шага Adam) -- см.
-    докстринг модуля выше про то, почему это НЕ должно идти через
-    градиент/loss. decay_map -- pytree той же формы, что new_params, со
-    ROUTER_TEMP_DECAY_RATE на router_temp-листьях и 0.0 везде остальном
-    (см. _router_temp_decay_leaf) -- строится один раз в
-    make_shard_and_compile, тот же паттерн, что _decay_grad_scale, так что
-    здесь остаётся чистый jax.tree_map внутри jitted distributed_apply_step
-    (никакого Python-side string matching внутри jit-трейса)."""
+    ПОСЛЕ optax.apply_updates."""
     return jax.tree_util.tree_map(
         lambda p, rate: p - rate * (p - ROUTER_TEMP_INIT),
         new_params, decay_map,
@@ -223,30 +104,16 @@ def apply_router_temp_decay(new_params, decay_map):
 
 
 # ==========================================================================
-# ФИКС #7 (bias-балансировка экспертов, DeepSeek-V3 style) -- см. докстринг
-# модуля выше для полного обоснования (test_synthetic_router_bias_balancing.py
-# v2: 11.24x улучшение std ФАКТИЧЕСКОЙ частоты назначений при реалистичном
-# коллапсе, при том что старая метрика std(mean_probs) корректно остаётся
-# плоской -- это не баг, bias по дизайну не входит в full softmax).
+# ФИКС #7 (bias-балансировка экспертов, DeepSeek-V3 style) -- см. модульный
+# докстринг выше.
 # ==========================================================================
-EXPERT_BIAS_GAMMA = 0.02  # тот же порядок величины, что ROUTER_TEMP_DECAY_RATE,
-                           # намеренно для сопоставимости; см. синтетический
-                           # тест для калибровки, если 0.02 окажется
-                           # слишком медленным/быстрым на реальных данных.
+EXPERT_BIAS_GAMMA = 0.02
 
 
 def _build_expert_bias_index_map(abstract_params):
     """Присваивает каждому expert_bias-листу СТАТИЧЕСКИЙ (Python int, не
     jnp-массив) индекс, в порядке обхода params-pytree через
-    tree_map_with_path -- см. докстринг модуля, раздел "ВАЖНОЕ ДОПУЩЕНИЕ",
-    почему этот порядок должен совпадать с порядком строк
-    assignment_frac_stacked, собранного в optimizer.py's compute_loss.
-    Всем остальным листьям присваивается -1 (маркер "не трогать").
-    Возвращает pytree ТОЙ ЖЕ ФОРМЫ, что abstract_params, с Python int
-    (не traced) на каждом листе -- безопасно использовать внутри
-    jax.tree_util.tree_map с обычным Python if внутри leaf-функции
-    (тот же паттерн, что _decay_scale_leaf/_router_scale_leaf уже
-    используют для статичных, нетрейсящихся карт)."""
+    tree_map_with_path."""
     counter = {"i": 0}
 
     def _mark(path, leaf):
@@ -261,26 +128,9 @@ def _build_expert_bias_index_map(abstract_params):
 
 
 def apply_expert_bias_update(new_params, bias_index_map, assignment_frac_stacked, gamma=EXPERT_BIAS_GAMMA):
-    """Decoupled, вне градиента (см. докстринг модуля) обновление
-    expert_bias-листьев по правилу DeepSeek-V3: перегруженный (частота
-    назначений выше равномерной 1/E_routed) эксперт получает
-    ОТРИЦАТЕЛЬНУЮ поправку (менее вероятен при следующем top-k отборе),
-    недогруженный -- положительную. Применяется ПОСЛЕ optax.apply_updates
-    и ПОСЛЕ клипа параметров ±1e2 -- тот же порядок, что
-    apply_router_temp_decay, никакого конфликта (expert_bias типично в
-    диапазоне [-N,N] для малых N, далеко от клипа).
-
-    new_params: params ПОСЛЕ apply_updates/clip.
-    bias_index_map: pytree той же формы, что new_params, из
-        _build_expert_bias_index_map (Python int per leaf, -1 = no-op).
-    assignment_frac_stacked: (n_moe_layers, E_routed) jnp-массив -- см.
-        докстринг модуля "ВАЖНО (интеграция в train.py)" про то, как это
-        значение должно быть получено на стороне train.py (агрегат по
-        микрошагам одного эффективного шага).
-    """
+    """Decoupled, вне градиента, обновление expert_bias-листьев по правилу
+    DeepSeek-V3."""
     if assignment_frac_stacked is None:
-        # Нечего обновлять (например, старый чекпоинт/конфиг без MoE-sow) --
-        # no-op, как и остальные decoupled-фиксы при отсутствующих данных.
         return new_params
 
     def _update(p, idx):
@@ -331,14 +181,9 @@ def make_grad_group_map(params):
 
 
 def build_group_nonfinite_flags(grad_group_map):
-    """ФИКС (заменяет старую build_group_nonfinite_check): возвращает
-    ЧИСТУЮ функцию (avg_grads) -> jnp.ndarray формы (len(_DIAG_GROUPS),)
-    bool -- по каждой группе: есть ли в ней хоть один non-finite лист.
-    НИКАКОГО jax.debug.print/debug.callback внутри -- просто обычный
-    JAX-массив, который distributed_apply_step возвращает как один из
-    своих выходов (см. ФИКС #3 в докстринге модуля). Порядок элементов
-    массива соответствует порядку _DIAG_GROUPS -- host-сторона (train.py)
-    делает zip(_DIAG_GROUPS, flags) для печати/W&B."""
+    """Возвращает ЧИСТУЮ функцию (avg_grads) -> jnp.ndarray формы
+    (len(_DIAG_GROUPS),) bool -- по каждой группе: есть ли в ней хоть
+    один non-finite лист."""
     leaves_g, _ = jax.tree_util.tree_flatten(grad_group_map)
 
     def _flags(avg_grads):
@@ -366,8 +211,13 @@ def make_tpu_mesh():
 
 
 def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: int,
-                           seq_len: int = 8192, accum_steps: int = 1, 
-                          warmup_freeze_step: int | None = 1000):
+                           seq_len: int = 8192, accum_steps: int = 1,
+                           warmup_freeze_step=None):
+    """ФИКС #8 (переключаемый WARMUP_FREEZE_STEP, см. модульный докстринг
+    выше): warmup_freeze_step прокидывается напрямую в
+    make_hybrid_optimizer(warmup_freeze_step=...). None -- обычный полный
+    warmup/cosine-decay без заморозки; int -- LR-schedule заморожена на
+    этом шаге (см. optimizer.py's make_hybrid_optimizer докстринг)."""
     mesh = make_tpu_mesh()
     n_devices = mesh.shape["tpu_nodes"]
 
@@ -379,23 +229,6 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     batch_axis = "tpu_nodes"
     set_model_mesh(mesh, batch_axis=batch_axis)
 
-    # ФИКС #4: make_hybrid_optimizer теперь возвращает (tx, lr_schedule) --
-    # lr_schedule прокидывается наружу для W&B-логирования в train.py
-    # (train/lr_scale), не только для внутреннего использования optax'ом.
-    #
-    # ФИКС #5 (этот пасс, AttributeError: 'function' object has no attribute
-    # 'init'): optax.GradientTransformation САМ является NamedTuple из двух
-    # полей (init, update) -- то есть тоже обычный 2-tuple. Если
-    # optimizer.py ещё не обновлён и make_hybrid_optimizer по-прежнему
-    # возвращает ГОЛЫЙ tx (а не (tx, lr_schedule)), то безусловная
-    # распаковка `tx, lr_schedule = make_hybrid_optimizer(...)` НЕ падает
-    # с ошибкой -- она молча распаковывает сам GradientTransformation:
-    # tx становится функцией tx.init, а lr_schedule -- функцией tx.update.
-    # Дальше `tx.init(...)` закономерно падает с
-    # "'function' object has no attribute 'init'" (именно эта ошибка и
-    # наблюдалась -- трейсбек указывал на СЛЕДУЮЩУЮ строку,
-    # jax.eval_shape(lambda: tx.init(...)), что маскировало реальную
-    # причину). Явно проверяем тип результата вместо слепой распаковки.
     _opt_result = make_hybrid_optimizer(total_steps=total_steps, warmup_freeze_step=warmup_freeze_step)
     if isinstance(_opt_result, (optax.GradientTransformation, optax.GradientTransformationExtraArgs)):
         # optimizer.py ещё не обновлён -- вернул голый tx, lr_schedule нет.
@@ -450,19 +283,10 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
     _decay_grad_scale = jax.tree_util.tree_map_with_path(_decay_scale_leaf, abstract_params)
 
-    # ФИКС #6 (router_temp runaway): decay-карта строится один раз здесь,
-    # тем же паттерном, что _decay_grad_scale выше -- чистая pytree-структура
-    # (0.0/ROUTER_TEMP_DECAY_RATE на листьях), без строковых операций
-    # внутри jitted distributed_apply_step.
     _router_temp_decay_map = jax.tree_util.tree_map_with_path(
         _router_temp_decay_leaf, abstract_params
     )
 
-    # ФИКС #7 (bias-балансировка экспертов): индексная карта строится один
-    # раз здесь -- тот же паттерн, что _router_temp_decay_map выше, только
-    # вместо ставки decay несёт СТАТИЧЕСКИЙ индекс строки в
-    # assignment_frac_stacked (или -1 для не-expert_bias листьев). См.
-    # _build_expert_bias_index_map's докстринг про допущение о порядке.
     _expert_bias_index_map = _build_expert_bias_index_map(abstract_params)
 
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
@@ -490,6 +314,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         )
         new_accum = jax.tree_util.tree_map(lambda a, g: a + g, accum_grads, grads)
         return p, s, new_accum, loss, aux_info, micro_grad_norm
+
     def distributed_apply_step(p, s, accum_grads, n_accum, assignment_frac_stacked=None):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
@@ -520,25 +345,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             new_p,
         )
 
-        # ФИКС #6 (router_temp runaway): decoupled decay-to-init для
-        # router_temp-листьев, вне градиентного пути -- см. докстринг
-        # модуля / ROUTER_TEMP_DECAY_RATE выше. Применяется ПОСЛЕ клипа
-        # параметров: клип держит |w|<=1e2 общим правилом на случай взрыва,
-        # decay здесь решает узкую задачу -- удержать router_temp у
-        # разумной рабочей точки (~init=10.0), а не только в пределах
-        # overflow-safe диапазона. Никакого конфликта между ними: клип
-        # применяется первым и почти никогда не заденет router_temp (его
-        # диапазон [1,15] << 1e2), decay применяется вторым и трогает
-        # ТОЛЬКО router_temp-листья (везде остальном decay_map=0.0, т.е.
-        # no-op).
         new_p = apply_router_temp_decay(new_p, _router_temp_decay_map)
-
-        # ФИКС #7 (bias-балансировка экспертов, DeepSeek-V3 style) --
-        # decoupled, вне градиента, применяется ПОСЛЕ router_temp decay --
-        # см. докстринг модуля/apply_expert_bias_update. Если
-        # assignment_frac_stacked не передан (None -- напр. при вызове
-        # compiled_apply без обновлённого train.py, обратная совместимость
-        # сигнатуры сохранена по умолчанию), это no-op.
         new_p = apply_expert_bias_update(new_p, _expert_bias_index_map, assignment_frac_stacked)
 
         # ФИКС #3: was_clipped тоже больше не печатается через
@@ -548,9 +355,17 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             jnp.any(jnp.abs(leaf) >= 1e2) for leaf in jax.tree_util.tree_leaves(p)
         ]))
 
+        # ФИКС #9 (видимость zclip_skip, см. модульный докстринг выше):
+        # сырые поля ZClipState ПОСЛЕ tx.update -- host-side (train.py)
+        # пересчитывает z-score/drift_ratio из них тем же способом, что
+        # zclip_skip's update_fn, для логирования (НЕ для повторного
+        # принятия решения -- решение уже принято внутри tx.update).
+        zclip_diag = extract_zclip_diagnostics(new_s)
+
         zero_accum = jax.tree_util.tree_map(jnp.zeros_like, accum_grads)
         return (new_p, new_s, zero_accum, is_finite,
-                global_norm, clip_factor, group_nonfinite_flags, was_clipped)
+                global_norm, clip_factor, group_nonfinite_flags, was_clipped,
+                zclip_diag)
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -566,14 +381,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "expert_utilization": NamedSharding(mesh, P(None)),
         "moe_dropped_ratio": NamedSharding(mesh, P(None)),
         "router_temp": NamedSharding(mesh, P(None)),
-        "min_col_norm": NamedSharding(mesh, P(None)),          # NEW
-        "max_abs_logit_preclip": NamedSharding(mesh, P(None)), # NEW
+        "min_col_norm": NamedSharding(mesh, P(None)),
+        "max_abs_logit_preclip": NamedSharding(mesh, P(None)),
         "norm_x_mean": NamedSharding(mesh, P(None)),
         "norm_x_max": NamedSharding(mesh, P(None)),
         "norm_x_min": NamedSharding(mesh, P(None)),
         "router_max_cos_per_layer": NamedSharding(mesh, P()),
         "router_max_cos": NamedSharding(mesh, P()),
-        "assignment_frac": NamedSharding(mesh, P(None, None)),  # NEW (bias-балансировка)
+        "assignment_frac": NamedSharding(mesh, P(None, None)),
     }
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
@@ -585,7 +400,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P(None)),
             param_sharding,
             NamedSharding(mesh, P()),   # <-- для collinearity_coef (скаляр)
-          
+
         ),
         out_shardings=(
             param_sharding,
@@ -597,18 +412,18 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         ),
     )
 
-    # ФИКС #7 (bias-балансировка): compiled_apply теперь принимает ПЯТЫЙ
-    # позиционный аргумент -- assignment_frac_stacked, форма
-    # (n_moe_layers, E_routed). См. докстринг модуля "ВАЖНО (интеграция в
-    # train.py)" про то, как его нужно построить на стороне train.py
-    # (усреднение по микрошагам одного эффективного шага) и передавать в
-    # КАЖДЫЙ вызов compiled_apply -- ровно тем же паттерном, каким
-    # collinearity_coef_arr уже передаётся в compiled_train_micro. in_shardings
-    # ниже уже включает пятый элемент; ЛЮБОЙ существующий вызов
-    # compiled_apply(...) с 4 позиционными аргументами перестанет работать
-    # (pjit потребует ровно 5) -- этот сайт-эффект неизбежен при добавлении
-    # нового jit-аргумента, см. train.py's собственный докстринг про
-    # аналогичный инцидент с collinearity_coef.
+    # ФИКС #9: zclip_diag -- новый (девятый) выход distributed_apply_step,
+    # dict скаляров той же формы, что ZClipState (ema_mean/ema_var/
+    # warm_count/slow_ema_mean/slow_warm_count). out_shardings ниже
+    # добавлен девятым позиционным элементом.
+    zclip_diag_sharding = {
+        "ema_mean": NamedSharding(mesh, P()),
+        "ema_var": NamedSharding(mesh, P()),
+        "warm_count": NamedSharding(mesh, P()),
+        "slow_ema_mean": NamedSharding(mesh, P()),
+        "slow_warm_count": NamedSharding(mesh, P()),
+    }
+
     compiled_apply = jax.jit(
         distributed_apply_step,
         donate_argnums=(0, 1, 2),
@@ -617,7 +432,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             opt_state_sharding,
             param_sharding,
             NamedSharding(mesh, P()),
-            NamedSharding(mesh, P(None, None)),   # <-- NEW: assignment_frac_stacked
+            NamedSharding(mesh, P(None, None)),   # <-- assignment_frac_stacked
         ),
         out_shardings=(
             param_sharding,
@@ -628,13 +443,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P()),        # clip_factor
             NamedSharding(mesh, P(None)),    # group_nonfinite_flags, shape (len(_DIAG_GROUPS),)
             NamedSharding(mesh, P()),        # was_clipped
+            zclip_diag_sharding,              # ФИКС #9: zclip diagnostics
         ),
     )
 
     compiled_val = jax.jit(
         distributed_val_step,
         in_shardings=(param_sharding, {"input_ids": data_sharding, "labels": data_sharding}),
-        out_shardings=NamedSharding(mesh, P()), 
+        out_shardings=NamedSharding(mesh, P()),
     )
 
     return (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
@@ -665,11 +481,8 @@ def resolve_source_files(output_dir, prefix):
 
 
 def build_manifest(file_pairs):
-    """ФИКС: теперь принимает и 2-tuple (ids_path, lbls_path), и 3-tuple
-    (ids_path, lbls_path, fraction) -- третий элемент здесь просто
-    игнорируется (используется выше по стеку, в dataloader_multi_source, до
-    вызова build_manifest), чтобы старые вызовы с 2-tuple продолжали
-    работать без изменений."""
+    """Принимает и 2-tuple (ids_path, lbls_path), и 3-tuple
+    (ids_path, lbls_path, fraction)."""
     manifest = []
     total = 0
     for entry in file_pairs:
@@ -686,47 +499,14 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                              dataset_fraction=1.0, fraction_seed=777, skip_batches=0,
                              mode="mixed"):
     """
-    file_pairs: список (ids_path, lbls_path) ИЛИ (ids_path, lbls_path, fraction)
-    -- fraction (0.0-1.0) для ИМЕННО ЭТОГО источника, по умолчанию 1.0, если
-    не указан (полная обратная совместимость со старым 2-tuple форматом).
+    file_pairs: список (ids_path, lbls_path) ИЛИ (ids_path, lbls_path, fraction).
 
-    ФИКС (гипотеза: смешанные батчи из разнородных источников -- один из
-    возможных факторов частого RESID-DIAG на layer=22/mamba2 при полном
-    6-датасетном пуле против стабильных 4000-6000 шагов на 2 источниках --
-    см. чат): три режима подачи данных, mode=
-
-      "mixed" (default, СТАРОЕ поведение, byte-for-byte то же самое, если
-        вызвать без явного mode=) -- все источники в одном глобально
-        перемешанном пуле, один батч может содержать строки из НЕСКОЛЬКИХ
-        источников сразу.
-
-      "sequential" -- источники проходятся ПО ОЧЕРЕДИ целиком, в порядке
-        file_pairs: сначала ВСЕ шаги первого источника (с локальным shuffle
-        внутри источника на каждый повторный проход), потом полностью
-        второй, и т.д. Ни один батч не смешивает разные источники, но
-        модель подолгу (сотни-тысячи шагов) видит только один источник
-        подряд -- ближе к curriculum learning, чем к обычному перемешанному
-        обучению; риск временного смещения градиентного сигнала в сторону
-        "текущего" источника, если LR всё ещё заметен (cosine decay ещё не
-        близко к alpha).
-
-      "round_robin" -- на каждом МИКРО-шаге ровно один источник, источники
-        чередуются по кругу в порядке file_pairs (0,1,...,S-1,0,1,...).
-        Внутри батча источники не смешиваются, но и не залипают надолго --
-        за accum_steps подряд идущих микрошага эффективный шаг (после
-        суммирования градиентов) обычно видит несколько РАЗНЫХ источников.
-        ВАЖНО: посещает каждый источник с РАВНОЙ частотой (1/n_sources за
-        цикл) НЕЗАВИСИМО от его размера -- в отличие от "mixed", где
-        вероятность строки из источника ~ пропорциональна его размеру.
-        Для маленьких источников (agentpack/rstar/syntheticcode) это
-        эффективно ПЕРЕВЕШИВАЕТ их относительно природной доли -- нормально
-        для короткого диагностического прогона, но не для финального
-        полного обучения без явного контроля через per-source fraction.
-
-    Каждый батч в mode="round_robin" несёт дополнительное поле
-    "_source_idx" (индекс источника в file_pairs, для диагностики -- если
-    сработает RESID-DIAG/non-finite, можно сохранить это поле рядом со
-    снапшотом и сразу узнать источник-виновник).
+    mode="mixed" (default) -- все источники в одном глобально перемешанном
+      пуле, один батч может содержать строки из НЕСКОЛЬКИХ источников.
+    mode="sequential" -- источники проходятся ПО ОЧЕРЕДИ целиком.
+    mode="round_robin" -- на каждом МИКРО-шаге ровно один источник,
+      источники чередуются по кругу, посещает каждый источник с РАВНОЙ
+      частотой независимо от размера, батч несёт "_source_idx".
     """
     normalized_pairs = []
     for entry in file_pairs:
@@ -785,8 +565,6 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
 
     all_idx = np.concatenate(per_source_idx)
 
-    # ---- старый ГЛОБАЛЬНЫЙ dataset_fraction -- оставлен для обратной
-    # совместимости, применяется ПОВЕРХ уже отфильтрованного по источникам ----
     if dataset_fraction < 1.0:
         frac_rng = np.random.RandomState(fraction_seed)
         n_keep = int(len(all_idx) * dataset_fraction)
@@ -818,11 +596,6 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                   f"{len(src_train_idx):,} train-блоков")
 
     def _infinite_source_batches(src_idx, seed):
-        """Бесконечный генератор ГОТОВЫХ (ids_np, lbls_np) батчей одного
-        источника -- используется там, где пропуск уже пройденных
-        микрошагов не нужен (или где чтение с диска на каждый шаг
-        приемлемо). Оставлена как есть -- см. _infinite_source_indices
-        ниже для варианта, который умеет пропускать без чтения с диска."""
         local_rng = np.random.RandomState(seed)
         idx_local = np.copy(src_idx)
         while True:
@@ -833,16 +606,6 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                 yield _gather_batch(batch_idx)
 
     def _infinite_source_indices(src_idx, seed):
-        """ФИКС: недостающая функция -- _round_robin_gen ниже вызывал
-        _infinite_source_indices(...), которая нигде не была определена
-        (NameError при первом же mode="round_robin"). Тот же паттерн, что
-        _infinite_source_batches выше, но yield'ит СЫРЫЕ ИНДЕКСЫ
-        (idx_local[...]), а не результат _gather_batch(...) -- это и
-        позволяет _round_robin_gen пропускать уже пройденные микрошаги при
-        resume БЕЗ обращения к диску на каждый из них: во время пропуска
-        просто прокручивается RNG/цикл индексов, а _gather_batch (реальное
-        mmap-чтение) вызывается только начиная с первого НЕ пропускаемого
-        шага -- см. _round_robin_gen."""
         local_rng = np.random.RandomState(seed)
         idx_local = np.copy(src_idx)
         while True:
