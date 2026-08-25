@@ -44,7 +44,7 @@ def _stat(x):
     return maxabs, all_finite
 
 
-def gdn2_kernel_stage_diagnostics(q, k, v, w, b, g, scale):
+def gdn2_kernel_stage_diagnostics(q, k, v, w, b, g, scale, axis_name = None):
     """Пересчитывает Kernel A -> B -> C ПОД stop_gradient (эта функция
     НИКОГДА не участвует в backward -- чисто диагностический побочный
     прогон) и возвращает плоский dict СКАЛЯРОВ:
@@ -56,6 +56,12 @@ def gdn2_kernel_stage_diagnostics(q, k, v, w, b, g, scale):
     Вызывать из GatedDeltaNet2J.__call__ СРАЗУ ПОСЛЕ основного
     (дифференцируемого) вызова gdn2_pallas_forward_trainable, на тех же
     (уже санитизированных) q/k/v/w/b/g -- см. model.py.
+    axis_name: если задан (например, "tpu_nodes" -- batch_axis mesh'а) --
+    функция ДОЛЖНА вызываться внутри jax.shard_map с этим axis_name,
+    иначе pmax/pmin ниже упадут с ошибкой "unbound axis name". Нужен,
+    чтобы agregировать maxabs/isfinite ГЛОБАЛЬНО по всем шардам батча,
+    а не только по локальному шарду -- без этого out_specs=P() (replicated)
+    либо падает, либо тихо даёт значение произвольного шарда.
     """
     q_sg, k_sg, v_sg, w_sg, b_sg, g_sg = jax.lax.stop_gradient((q, k, v, w, b, g))
 
@@ -69,6 +75,9 @@ def gdn2_kernel_stage_diagnostics(q, k, v, w, b, g, scale):
         ("w_pseudo", w_pseudo), ("u", u), ("kg", kg), ("qg", qg),
     ):
         maxabs, isfinite = _stat(val)
+        if axis_name is not None:
+            maxabs = jax.lax.pmax(maxabs, axis_name=axis_name)
+            isfinite = jax.lax.pmin(isfinite, axis_name=axis_name)
         out[f"{name}_maxabs"] = maxabs
         out[f"{name}_isfinite"] = isfinite
     return out
