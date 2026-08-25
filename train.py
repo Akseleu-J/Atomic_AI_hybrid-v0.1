@@ -535,7 +535,7 @@ def main_execution():
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
     FORCE_FRESH_START = False# <-- поставьте False, чтобы вернуть обычный resume
-    RESUME_FROM_SLOT = "best_train"  # <-- используется только если FORCE_FRESH_START=False
+    RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
 
     # ФИКС (router collapse): см. докстринг модуля выше. После graft-merge
     # (и для params, и для opt_state) router/router_temp/expert_bias уже
