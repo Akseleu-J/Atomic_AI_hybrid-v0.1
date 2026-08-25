@@ -179,15 +179,28 @@ def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
 
 
 def _muon_ns_iterate(X, ns_steps: int = 5):
-    """Общий Newton-Schulz(5)-итератор, вынесенный отдельно от
-    muon_orthogonalize, чтобы _muon_orth_diag (ниже) мог посчитать РОВНО
-    тот же X, что реально используется в апдейте, без дублирования
-    формулы в двух местах с риском рассинхронизации."""
     a, b, c = 3.4445, -4.7750, 2.0315
+    
+    # --- КЛЮЧЕВОЕ: всегда работаем с меньшей квадратной матрицей ---
+    # Для batched: shape=(..., m, n). Транспонировать последние 2 оси если m > n
+    was_tall = X.shape[-2] > X.shape[-1]
+    if was_tall:
+        X = jnp.swapaxes(X, -2, -1)  # аналог .mT в PyTorch
+    
+    # Нормализация по Frobenius (keepdims для совместимости с batched)
+    norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
+    X = X / (norm + 1e-7)
+    
+    # NS-итерация (теперь A всегда маленькая: (..., min(m,n), min(m,n)))
     for _ in range(ns_steps):
-        A = X @ X.mT
+        A = X @ jnp.swapaxes(X, -2, -1)  # X @ X.mT
         B = b * A + c * (A @ A)
         X = a * X + B @ X
+    
+    # Обратное транспонирование
+    if was_tall:
+        X = jnp.swapaxes(X, -2, -1)
+    
     return X
 
 
@@ -217,33 +230,34 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
     return w - (X * effective_lr)
 
 
-def _muon_orth_diag(g, ns_steps: int = 5):
-    eps = 1e-7
-    if g.ndim == 3:
-        norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
-        safe_norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
-        X = _muon_ns_iterate(g / safe_norm, ns_steps)
-        X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        XXt = X @ X.mT
-        # ФИКС: X @ X.mT имеет форму (..., X.shape[-2], X.shape[-2]) --
-        # eye должен строиться по ЭТОЙ оси, а не по X.shape[-1] (столбцы).
-        # Для квадратных Muon-параметров (напр. 768x768) обе оси совпадают,
-        # и баг маскировался; на прямоугольных матрицах (например,
-        # (768, d_latent) в MLA/DAR-проекциях) X.shape[-1] != X.shape[-2],
-        # и jnp.eye(X.shape[-1]) даёт неверный размер -> broadcast TypeError
-        # в X @ X.mT - eye.
-        eye = jnp.eye(X.shape[-2], dtype=X.dtype)[None]
-        resid = jnp.linalg.norm(XXt - eye, axis=(-2, -1))
-        return jnp.max(resid)
+def _muon_orth_diag(g, ns_steps=5):
+    """Диагностика orth_resid — должна повторять логику _muon_ns_iterate"""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = jnp.asarray(g)
+    
+    was_tall = X.shape[-2] > X.shape[-1]
+    if was_tall:
+        X = jnp.swapaxes(X, -2, -1)
+    
+    X = X / (jnp.linalg.norm(X, axis=(-2, -1), keepdims=True) + 1e-7)
+    
+    for _ in range(ns_steps):
+        A = X @ jnp.swapaxes(X, -2, -1)
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    
+    if was_tall:
+        X = jnp.swapaxes(X, -2, -1)
+    
+    # orth_resid = ||X^T X - I||_F
+    if X.shape[-2] >= X.shape[-1]:
+        prod = jnp.swapaxes(X, -2, -1) @ X
+        n = X.shape[-1]
     else:
-        norm = jnp.linalg.norm(g)
-        safe_norm = jnp.where(norm < eps, 1.0, norm)
-        X = _muon_ns_iterate(g / safe_norm, ns_steps)
-        X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        # ФИКС: то же самое для 2D-случая -- X @ X.T имеет форму
-        # (X.shape[-2], X.shape[-2]).
-        eye = jnp.eye(X.shape[-2], dtype=X.dtype)
-        return jnp.linalg.norm(X @ X.T - eye)
+        prod = X @ jnp.swapaxes(X, -2, -1)
+        n = X.shape[-2]
+    I = jnp.eye(n, dtype=prod.dtype)
+    return jnp.linalg.norm(prod - I)
 
 # ==========================================================================
 # State NamedTuples
