@@ -607,6 +607,13 @@ class GmmMoEJ(nn.Module):
                 check_vma=False,
             )
             routed_out = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
+            mesh = get_model_mesh()
+            batch_axis = get_batch_axis()
+            if mesh is None:
+            raise RuntimeError(
+                "GmmMoEJ: get_model_mesh() вернул None во время трассировки — "
+                "set_model_mesh() должен быть вызван до первого model.init()/jit."
+           )
         else:
             # без mesh: split+combine остаются снаружи, как было -- здесь
             # неоднозначности порядка нет, потому что shard_map не участвует.
