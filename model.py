@@ -694,7 +694,7 @@ def _gdn2_recurrence_impl(k, e, z, alpha, q, dtype):
 
     return jnp.moveaxis(out_t, 0, 1)
 
-
+from atomic_ops.kernel_diag import gdn2_kernel_stage_diagnostics
 class GatedDeltaNet2J(nn.Module):
     cfg: ModelConfig
 
@@ -802,7 +802,18 @@ class GatedDeltaNet2J(nn.Module):
             out, _h_final = _gdn2_fixed(q, k, v, w_gate, b_gate, g)
 
         out = out.reshape(b, l, d)
-
+        # ==================================================================
+        # ДИАГНОСТИКА (всегда включена) -- ВНУТРЕННИЕ стадии Pallas-пайплайна
+        # (Aqk/Akk/A/w_pseudo/u/kg/qg), не только итоговый выход слоя. Ловит
+        # именно тот класс инцидента, который уже случался (near-singular
+        # Akk в Kernel B -> large-but-finite A, всплывающее как inf только
+        # несколько кернелов спустя в Kernel D) -- см. kernel_b_solve.py и
+        # kernel_c_recompute.py докстринги. Под stop_gradient, не участвует
+        # в backward -- см. atomic_ops/kernel_diag.py.
+        # ==================================================================
+        _gdn2_stage_diag = gdn2_kernel_stage_diagnostics(q, k, v, w_gate, b_gate, g, scale=1.0)
+        for _stage_name, _stage_val in _gdn2_stage_diag.items():
+            self.sow("losses", f"gdn2_kernelstage_{_stage_name}", _stage_val)
         # ДИАГНОСТИКА (всегда включена): GDN-2 Pallas-пайплайн выход ДО
         # нормы -- max|abs|/isfinite по o и по h_final (несущий carry
         # state -- если ОН начинает расти, это влияет на ВСЕ последующие
