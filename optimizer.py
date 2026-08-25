@@ -337,17 +337,52 @@ def extract_zclip_diagnostics(opt_state):
     }
 
 
-def extract_muon_diagnostics_detailed(opt_state):
-    """Как collect_by_leaf_name, но с путями — чтобы узнать КОНКРЕТНЫЙ
-    параметр с худшим orth_resid, а не только max по всем."""
+def extract_muon_diagnostics_per_leaf(opt_state):
+    """Возвращает {path_str: orth_resid} для КАЖДОГО muon-листа отдельно.
+    Вызывать offline/редко (Python-side дерево путей, не для каждого jit-шага).
+
+    Использование после restore:
+        diag = extract_muon_diagnostics_per_leaf(opt_state)
+        for path, resid in sorted(diag.items(), key=lambda kv: -float(kv[1])):
+            print(f"{float(resid):8.3f}  {path}")
+    """
     result = {}
+
     def _mark(path, leaf):
         path_str = path_to_str(path)
-        if "orth_resid" in path_str:
+        if "orth_resid" in path_str and hasattr(leaf, "shape"):
             result[path_str] = leaf
         return leaf
+
     jax.tree_util.tree_map_with_path(_mark, opt_state)
     return result
+
+
+def dump_muon_gradient_snapshot(avg_grads, label_fn, params, out_path):
+    """Сохраняет на диск (np.savez) градиенты всех muon-параметров вместе
+    с путями -- offline считаешь np.linalg.svd на каждом и смотришь
+    разброс сингулярных чисел. Вызывать host-side, НЕ внутри jit."""
+    import numpy as np
+
+    labels = label_fn(params)
+    flat_grads_with_path, _ = jax.tree_util.tree_flatten_with_path(avg_grads)
+    flat_labels, _ = jax.tree_util.tree_flatten(labels)
+
+    to_save = {}
+    report = []
+    for (path, grad_leaf), label_leaf in zip(flat_grads_with_path, flat_labels):
+        if label_leaf == "muon":
+            path_str = path_to_str(path)
+            arr = np.asarray(jax.device_get(grad_leaf), dtype=np.float32)
+            key = path_str.replace("/", "__")
+            to_save[key] = arr
+            report.append((path_str, arr.shape))
+
+    np.savez(out_path, **to_save)
+    print(f"[MUON-SNAPSHOT] Сохранено {len(to_save)} muon-градиентов в {out_path}")
+    for path_str, shape in report:
+        print(f"  {path_str}: shape={shape}")
+    return report
 
 # ==========================================================================
 # Основной оптимизатор
