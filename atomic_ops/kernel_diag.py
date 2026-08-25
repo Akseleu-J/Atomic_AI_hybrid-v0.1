@@ -71,5 +71,4 @@ def gdn2_kernel_stage_diagnostics(q, k, v, w, b, g, scale):
         maxabs, isfinite = _stat(val)
         out[f"{name}_maxabs"] = maxabs
         out[f"{name}_isfinite"] = isfinite
-    return out"
- https://claude.ai/#:~:text=%22%22%22%0Aatomic_ops/kernel_diag,isfinit
+    return out
