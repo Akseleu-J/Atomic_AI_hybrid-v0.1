@@ -1689,5 +1689,5 @@ if __name__ == "__main__":
     # зависит от этого флага -- она всегда включена независимо от
     # GDN2_FWD_DIAG, поскольку идёт через self.sow(...)/чистые jnp-выходы,
     # а не debug.print/callback.
-    # os.environ["GDN2_FWD_DIAG"] = "1"
+    os.environ["GDN2_FWD_DIAG"] = "1"
     main_execution()
