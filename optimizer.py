@@ -336,7 +336,23 @@ def extract_zclip_diagnostics(opt_state):
         "slow_warm_count": jnp.zeros((), dtype=jnp.int32),
     }
 
+def  extract_muon_diagnostics(opt_state):
+    """ФИКС #4 (см. модульный докстринг): собирает orth_resid со ВСЕХ
+    MuonState-листьев внутри opt_state (там ровно один на каждый
+    muon-размеченный параметр -- multi_transform's per-leaf state) через
+    collect_by_leaf_name (utils.py, уже умеет ходить по NamedTuple/dict/
+    tuple вперемешку -- ровно то, что нужно для optax.chain внутри
+    multi_transform). Возвращает СКАЛЯР -- max orth_resid по ВСЕМ
+    muon-параметрам этого шага (худший случай -- самый информативный для
+    "начал ли где-то NS(5) переставать сходиться").
 
+    Вызывается из train_setup.py's distributed_apply_step ПОСЛЕ tx.update
+    -- то есть значение относится именно к обновлению, которое было
+    ПРИМЕНЕНО на этом шаге, не к предыдущему."""
+    values = collect_by_leaf_name(opt_state, "orth_resid")
+    if not values:
+        return jnp.array(0.0, dtype=jnp.float32)
+    return jnp.max(jnp.stack([v.astype(jnp.float32) for v in values]))
 def extract_muon_diagnostics_per_leaf(opt_state):
     """Возвращает {path_str: orth_resid} для КАЖДОГО muon-листа отдельно.
     Вызывать offline/редко (Python-side дерево путей, не для каждого jit-шага).
