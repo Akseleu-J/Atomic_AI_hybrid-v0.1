@@ -61,7 +61,7 @@ RESUME_LR_SCALE = 0.7
 # Поднят 1000 -> 4000 чтобы LR рос естественно в течение настоящего warmup
 # (warmup_steps = max(500, 0.15*total_steps) ≈ 4660 шагов при total=31072),
 # а не обрывался на середине.
-DEFAULT_WARMUP_FREEZE_STEP = 2600
+DEFAULT_WARMUP_FREEZE_STEP = 1000
 
 # per-token CE clip -- оставлен для совместимости с set_per_token_ce_clip()
 # Не применяется в _chunked_ce_step в этой версии (убран намеренно --
