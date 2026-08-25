@@ -218,23 +218,6 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
 
 
 def _muon_orth_diag(g, ns_steps: int = 5):
-    """ФИКС #4 (ВСЕГДА включённая диагностика Muon, см. модульный
-    докстринг): считает orth_resid = max_i ||X_i X_i^T - I||_F ДЛЯ ТОГО ЖЕ
-    X, что muon_orthogonalize реально использует в апдейте (тот же
-    _muon_ns_iterate, та же нормировка) -- т.е. это НЕ приближение и не
-    другая формула, а прямое измерение "насколько ортогонален
-    фактический update этого шага". Идеал (истинный polar factor,
-    как претендует докстринг модуля) -- orth_resid -> 0. NS(5) даёт
-    что-то заметно больше нуля, но должно быть << исходного
-    muon_orthogonalize_legacy's ~27 -- если на практике снова видно
-    значения такого порядка, NS(5) на данных условиях модели фактически
-    не ортогонализирует, и это прямой количественный сигнал (не
-    гипотеза), а не просто "подозреваем".
-
-    ВОЗВРАЩАЕТ СКАЛЯР (max по всей матрице/батчу матриц g), дёшево
-    относительно самого forward/backward шага -- один лишний
-    NS(5)-прогон на muon-размеченный параметр, тот же порядок стоимости,
-    что и сам muon_orthogonalize."""
     eps = 1e-7
     if g.ndim == 3:
         norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
@@ -242,7 +225,14 @@ def _muon_orth_diag(g, ns_steps: int = 5):
         X = _muon_ns_iterate(g / safe_norm, ns_steps)
         X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         XXt = X @ X.mT
-        eye = jnp.eye(X.shape[-1], dtype=X.dtype)[None]
+        # ФИКС: X @ X.mT имеет форму (..., X.shape[-2], X.shape[-2]) --
+        # eye должен строиться по ЭТОЙ оси, а не по X.shape[-1] (столбцы).
+        # Для квадратных Muon-параметров (напр. 768x768) обе оси совпадают,
+        # и баг маскировался; на прямоугольных матрицах (например,
+        # (768, d_latent) в MLA/DAR-проекциях) X.shape[-1] != X.shape[-2],
+        # и jnp.eye(X.shape[-1]) даёт неверный размер -> broadcast TypeError
+        # в X @ X.mT - eye.
+        eye = jnp.eye(X.shape[-2], dtype=X.dtype)[None]
         resid = jnp.linalg.norm(XXt - eye, axis=(-2, -1))
         return jnp.max(resid)
     else:
@@ -250,9 +240,10 @@ def _muon_orth_diag(g, ns_steps: int = 5):
         safe_norm = jnp.where(norm < eps, 1.0, norm)
         X = _muon_ns_iterate(g / safe_norm, ns_steps)
         X = jnp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        eye = jnp.eye(X.shape[-1], dtype=X.dtype)
+        # ФИКС: то же самое для 2D-случая -- X @ X.T имеет форму
+        # (X.shape[-2], X.shape[-2]).
+        eye = jnp.eye(X.shape[-2], dtype=X.dtype)
         return jnp.linalg.norm(X @ X.T - eye)
-
 
 # ==========================================================================
 # State NamedTuples
