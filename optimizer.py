@@ -661,6 +661,17 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
             "gdn2_out_maxabs",
             "mla_input_maxabs", "mla_out_maxabs",
             "final_hidden_maxabs", "final_hidden_isfinite",
+            # ФИКС (kernel-internal diagnostics, см. atomic_ops/kernel_diag.py):
+            # состояние ВНУТРИ Pallas-пайплайна GDN-2 (Aqk/Akk/A/w_pseudo/
+            # u/kg/qg) -- ловит near-singular Akk в Kernel B ДО того, как
+            # это всплывёт как inf в Kernel D несколькими шагами позже.
+            "gdn2_kernelstage_aqk_maxabs", "gdn2_kernelstage_aqk_isfinite",
+            "gdn2_kernelstage_akk_maxabs", "gdn2_kernelstage_akk_isfinite",
+            "gdn2_kernelstage_a_wy_inverse_maxabs", "gdn2_kernelstage_a_wy_inverse_isfinite",
+            "gdn2_kernelstage_w_pseudo_maxabs", "gdn2_kernelstage_w_pseudo_isfinite",
+            "gdn2_kernelstage_u_maxabs", "gdn2_kernelstage_u_isfinite",
+            "gdn2_kernelstage_kg_maxabs", "gdn2_kernelstage_kg_isfinite",
+            "gdn2_kernelstage_qg_maxabs", "gdn2_kernelstage_qg_isfinite",
         )
         for name in _DIAG_LEAF_NAMES:
             vals = collect_by_leaf_name(losses, name)
