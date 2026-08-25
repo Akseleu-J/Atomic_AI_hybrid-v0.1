@@ -239,8 +239,10 @@ def _muon_orth_diag(g, ns_steps=5):
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
     
-    X = X / (jnp.linalg.norm(X, axis=(-2, -1), keepdims=True) + 1e-7)
-    
+    norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
+    eps = 1e-7
+    safe_norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
+    X = X / safe_norm
     for _ in range(ns_steps):
         A = X @ jnp.swapaxes(X, -2, -1)
         B = b * A + c * (A @ A)
@@ -514,6 +516,11 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
             return "adamw_nodecay"
         if param.ndim >= 2:
             if "mamba" in path_str:
+                return "lion"
+            # ФИКС: w2 (down-projection экспертов) → Lion.
+            # NS5 не сходится на rank-deficient градиентах w2 после активации,
+            # вызывая монотонный дрейф нормы и взрыв через 2-13k шагов.
+            if "w2" in path_str and ("expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str):
                 return "lion"
             if muon_diagnostic_disable:
                 return "adamw_nodecay"
