@@ -80,7 +80,7 @@ def make_manager(local_dir, max_to_keep):
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
-        enable_async_checkpointing=True,   # ПАТЧ: было False
+        enable_async_checkpointing=False,   # ПАТЧ: было False
     )
     return ocp.CheckpointManager(local_dir, ocp.StandardCheckpointer(), options)
 
