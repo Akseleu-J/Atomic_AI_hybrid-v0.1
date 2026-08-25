@@ -1553,8 +1553,14 @@ def main_execution():
                         ("mla_out_maxabs", "actdiag/mla_out_maxabs_worst"),
                         ("final_hidden_maxabs", "actdiag/final_hidden_maxabs"),
                     ):
-                      for _kstage in ("aqk", "akk", "a_wy_inverse", "w_pseudo", "u", "kg", "qg"):
-                        p_mk = f"gdn2_kernelstage_{_kstage}_maxabs"
+                        if aux_info.get(_diag_key) is not None:
+                            _v = np.atleast_1d(jax.device_get(aux_info[_diag_key]))
+                            wandb_step_metrics[_wb_key] = float(np.max(_v))
+
+                    # ФИКС (kernel-internal diagnostics) -- ОТДЕЛЬНЫЙ цикл,
+                    # не вложенный в предыдущий.
+                    for _kstage in ("aqk", "akk", "a_wy_inverse", "w_pseudo", "u", "kg", "qg"):
+                        _mk = f"gdn2_kernelstage_{_kstage}_maxabs"
                         _fk = f"gdn2_kernelstage_{_kstage}_isfinite"
                         if aux_info.get(_mk) is not None:
                             _v = np.atleast_1d(jax.device_get(aux_info[_mk]))
@@ -1569,10 +1575,7 @@ def main_execution():
                                     "GDN-2 kernel-internal non-finite",
                                     f"{_kstage} non-finite на слоях {_bad}, step={global_step}.",
                                     level="WARN",
-  )
-                        if aux_info.get(_diag_key) is not None:
-                            _v = np.atleast_1d(jax.device_get(aux_info[_diag_key]))
-                            wandb_step_metrics[_wb_key] = float(np.max(_v))
+                                )
 
                     wandb_logging.log_metrics(global_step, wandb_step_metrics)
 
