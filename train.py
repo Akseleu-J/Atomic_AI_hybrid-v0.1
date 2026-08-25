@@ -1553,6 +1553,23 @@ def main_execution():
                         ("mla_out_maxabs", "actdiag/mla_out_maxabs_worst"),
                         ("final_hidden_maxabs", "actdiag/final_hidden_maxabs"),
                     ):
+                      for _kstage in ("aqk", "akk", "a_wy_inverse", "w_pseudo", "u", "kg", "qg"):
+                        p_mk = f"gdn2_kernelstage_{_kstage}_maxabs"
+                        _fk = f"gdn2_kernelstage_{_kstage}_isfinite"
+                        if aux_info.get(_mk) is not None:
+                            _v = np.atleast_1d(jax.device_get(aux_info[_mk]))
+                            _f = np.atleast_1d(jax.device_get(aux_info.get(_fk, np.ones_like(_v))))
+                            worst_idx = int(_v.argmax())
+                            wandb_step_metrics[f"kerneldiag/{_kstage}_maxabs_worst"] = float(_v[worst_idx])
+                            _bad = [i for i in range(len(_f)) if not bool(_f[i])]
+                            if _bad:
+                                print(f"[KERNEL-DIAG] ⚠️ non-finite {_kstage} (внутри Pallas-пайплайна) "
+                                      f"на GDN-2 слоях {_bad} на global_step={global_step}")
+                                wandb_logging.log_alert(
+                                    "GDN-2 kernel-internal non-finite",
+                                    f"{_kstage} non-finite на слоях {_bad}, step={global_step}.",
+                                    level="WARN",
+  )
                         if aux_info.get(_diag_key) is not None:
                             _v = np.atleast_1d(jax.device_get(aux_info[_diag_key]))
                             wandb_step_metrics[_wb_key] = float(np.max(_v))
