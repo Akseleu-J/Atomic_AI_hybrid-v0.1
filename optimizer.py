@@ -207,12 +207,14 @@ def _muon_ns_iterate(X, ns_steps: int = 5):
     return X
 
 
-def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
-    """Квинтичный Newton-Schulz (Keller Jordan), Frobenius-нормировка.
-    Matmul-only -- не требует SVD/LU, полностью на MXU, на порядок быстрее.
-    Не даёт точный polar factor (orth_resid не -> 0), но даёт "достаточно
-    ортогональное" направление -- это ровно то, что использует реальный
-    Muon на масштабных моделях (не эталонный SVD, а именно это)."""
+def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
+    """ФИКС: ns_steps по умолчанию поднят 5 -> 7 -- synthetic_muon_test.py
+    Проверка 2 показала разрыв ~4-8 до синтетического full-rank потолка
+    на квадратных (768,768) параметрах при ns_steps=5 (это не структурная
+    недостижимость, а просто мало итераций для d=768 -- потолок сам по
+    себе не 0, но реальный градиент был заметно выше даже потолка).
+    Экстремально прямоугольные MoE w1/w2 выведены из-под Muon отдельным
+    патчем (_label_leaf), т.к. для них большего ns_steps недостаточно."""
     eps = 1e-7
 
     if w.ndim == 3:
@@ -484,16 +486,11 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
                 return updates, state
             step_lr = base_lr * lr_schedule(_effective_step(state.count))
             new_updates = jax.tree_util.tree_map(
-                lambda p, g: (muon_orthogonalize(p, g, step_lr) - p)
+                lambda p, g: (muon_orthogonalize(p, g, step_lr, ns_steps=7) - p)
                              - step_lr * weight_decay * p,
                 params, updates,
             )
-            # ФИКС #4: diag считается на КАЖДОМ листе этой multi_transform-
-            # подветки (уже отфильтрованной label_fn'ом до только
-            # muon-параметров) -- максимум по ним всем и есть худший
-            # случай на этом шаге. Дёшево относительно самого апдейта
-            # (тот же порядок работы, что muon_orthogonalize уже делает).
-            per_leaf_resid = jax.tree_util.tree_map(lambda g: _muon_orth_diag(g), updates)
+            per_leaf_resid = jax.tree_util.tree_map(lambda g: _muon_orth_diag(g, ns_steps=7), updates)
             leaf_resids = jax.tree_util.tree_leaves(per_leaf_resid)
             step_orth_resid = (
                 jnp.max(jnp.stack(leaf_resids)) if leaf_resids
