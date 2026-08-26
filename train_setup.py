@@ -297,7 +297,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     # строим список путей muon-параметров ОДИН РАЗ здесь -- нужен train.py
     # для расшифровки worst_leaf_idx (число из jit-графа) в реальный путь.
     try:
-        _MUON_LEAF_PATHS = build_muon_leaf_paths(abstract_params, _optimizer_label_leaf)
+        _whole_tree_label_fn = lambda p: jax.tree_util.tree_map_with_path(_optimizer_label_leaf, p)
+        _MUON_LEAF_PATHS = build_muon_leaf_paths(abstract_params, _whole_tree_label_fn)
         print(f"[MUON-DIAG] Локализация включена: {len(_MUON_LEAF_PATHS)} muon-параметров "
               f"проиндексированы для расшифровки worst_leaf_idx каждый шаг.")
     except Exception as e:
