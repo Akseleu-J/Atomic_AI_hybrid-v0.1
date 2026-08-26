@@ -422,8 +422,8 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
           leaf_maxabs = jnp.stack([jnp.max(jnp.abs(g.astype(jnp.float32))) for g in leaves_g])
           worst_leaf_grad_norm = leaf_norms[worst_idx]
           worst_leaf_grad_maxabs = leaf_maxabs[worst_idx]
-          step_mean_orth_resid = jnp.mean(per_leaf_resid)   # НОВОЕ
-
+          _valid_mask = leaf_norms_pre >= _EPS_GRAD
+          step_mean_orth_resid = jnp.sum(jnp.where(_valid_mask, per_leaf_resid, 0.0)) / jnp.maximum(jnp.sum(_valid_mask), 1)
           # НОВОЕ: норма и maxabs градиента ИМЕННО худшего листа -- дёшево
           # (один-два reduce поверх уже посчитанного stacked tensor нельзя,
           # т.к. листья разной формы, но динамический индекс через lax.switch
