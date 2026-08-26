@@ -1,45 +1,29 @@
 """
 optimizer.py -- гибридный оптимизатор (Muon/Lion/AdamW) + CE-loss.
 
-ФИКС (этот пасс -- локализация orth_resid, см. чат): MuonState получил
-новое поле worst_leaf_idx -- индекс худшего по orth_resid листа ВНУТРИ
-muon-подветки params, на КАЖДОМ шаге. extract_muon_diagnostics теперь
-возвращает (max_resid, worst_leaf_idx) вместо одного скаляра.
-build_muon_leaf_paths -- чистая Python-функция (вызывается один раз в
-train_setup.py), строит список путей в ТОМ ЖЕ порядке flatten(), в
-котором multi_transform обходит muon-подветку -- нужен train.py, чтобы
-расшифровать worst_leaf_idx в реальный путь параметра КАЖДЫЙ шаг, без
-offline-скриптов.
+ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к оптимизатору): compute_loss
+больше НЕ собирает kernel/activation-level sow'нутые метрики
+(layer_delta_*, layer_resid_*, mamba2_input_*, mamba2_ssm_out_*, gdn2_*,
+gdn2_kernelstage_*, mla_*, final_hidden_*) -- эти self.sow(...) вызовы
+удалены из model.py (см. его докстринг), поэтому collect_by_leaf_name для
+них теперь всегда вернёт пустой список. aux_info больше не тащит
+diag_stacked. Оптимизаторская диагностика (per-group nonfinite flags,
+per-layer grad/weight norm/maxabs/nonfinite, muon orth_resid+worst_leaf_idx,
+per-group grad norms) остаётся ПОЛНОСТЬЮ -- она живёт в train_setup.py и
+здесь не трогалась.
 
-_label_leaf вынесен на уровень МОДУЛЯ (был вложенной функцией внутри
-make_hybrid_optimizer) -- иначе train_setup.py не может импортировать его
-для build_muon_leaf_paths.
+ФИКС (локализация orth_resid, предыдущий пасс, без изменений в этом
+пассе): MuonState несёт worst_leaf_idx -- индекс худшего по orth_resid
+листа ВНУТРИ muon-подветки params, на КАЖДОМ шаге. extract_muon_diagnostics
+возвращает (max_resid, worst_leaf_idx). build_muon_leaf_paths -- чистая
+Python-функция (вызывается один раз в train_setup.py), строит список путей
+в ТОМ ЖЕ порядке flatten(), в котором multi_transform обходит muon-подветку.
 
-ФИКС (структурные исключения из Muon, живые логи 12900-12958, см. чат):
-- conv_w -- rank<=4 при d_model=768, структурно вырождена для спектральной
-  ортогонализации (synthetic_muon_test.py показал осцилляцию orth_resid
-  с ростом ns_steps вместо сходимости) -- переведена на Lion.
-- routed/shared MoE-экспертов w1 (d_model,d_ff) И w2 (d_ff,d_model) --
-  экстремально прямоугольные (aspect ratio 5.3x при d_ff=4096,
-  d_model=768), давали orth_resid=58-59 стабильно на ВСЕХ 8 блоках --
-  переведены на Lion.
-
-ФИКС (NS-итератор): margin *1.01 в _muon_ns_iterate/_muon_orth_diag --
-гарантирует sv_max(X0) строго < 1 перед стартом квинтики (без margin
-деление на чистую Frobenius-норму даёт sv_max≈1.0 ровно на границе
-устойчивости NS(5), что давало осцилляцию на низкоранговых матрицах).
-ns_steps поднят 5 -> 7 для оставшихся (в основном квадратных 768x768)
-muon-параметров.
-
-DEFAULT_WARMUP_FREEZE_STEP поднят 1000 -> 5000 (см. чат).
-
-ФИКС #3 (совместимость API с train.py/train_setup.py):
-- DEFAULT_WARMUP_FREEZE_STEP экспортируется как модульная константа
-- make_hybrid_optimizer принимает warmup_freeze_step параметр
-- extract_zclip_diagnostics возвращает правильные jnp-массивы
-
-ФИКС #4 (ВСЕГДА включённая диагностика Muon + сбор sow'нутых метрик из
-model.py) -- см. предыдущие пассы, без изменений логики compute_loss.
+ФИКС (структурные исключения из Muon, без изменений в этом пассе):
+- conv_w -- rank<=4, структурно вырождена для спектральной ортогонализации
+  -- переведена на Lion.
+- routed/shared MoE-экспертов w1/w2 -- экстремально прямоугольные,
+  давали orth_resid=58-59 стабильно -- переведены на Lion.
 """
 from typing import NamedTuple, Optional
 
@@ -55,7 +39,6 @@ ROUTER_COLLINEARITY_COEF = 0.08
 RESUME_BACKOFF_STEPS = 5000
 RESUME_LR_SCALE = 0.7
 
-# ФИКС: 1000 -> 5000 (см. чат).
 DEFAULT_WARMUP_FREEZE_STEP = 5000
 
 _PER_TOKEN_CE_CLIP = 15.0
@@ -138,10 +121,7 @@ tx_frozen = _frozen_step()
 # ==========================================================================
 
 def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
-    """СТАРАЯ (сломанная) версия -- Frobenius norm + квадратичный NS.
-    Оставлена ТОЛЬКО как fallback/cross-check. НЕ использовать в обучении.
-    orth_resid~27.3 на ВСЕХ уровнях обусловленности -- фактически update
-    ≈ const·G (без ортогонализации)."""
+    """СТАРАЯ (сломанная) версия -- fallback/cross-check only."""
     eps = 1e-4
     if w.ndim == 3:
         norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
@@ -162,13 +142,6 @@ def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
 
 
 def _muon_ns_iterate(X, ns_steps: int = 7):
-    """Квинтичный Newton-Schulz. ФИКС: работает с транспонированием для
-    "tall" матриц (больше строк, чем столбцов) -- полярная итерация
-    сходится лучше на "wide"/квадратной форме. ФИКС: margin *1.01 --
-    гарантирует sv_max(X0) строго < 1 перед стартом квинтики (без margin
-    деление на чистую Frobenius-норму даёт sv_max≈1.0 ровно на границе
-    устойчивости NS(5), что давало наблюдаемую осцилляцию на
-    низкоранговых/rank-deficient матрицах, например conv_w)."""
     a, b, c = 3.4445, -4.7750, 2.0315
 
     was_tall = X.shape[-2] > X.shape[-1]
@@ -190,9 +163,6 @@ def _muon_ns_iterate(X, ns_steps: int = 7):
 
 
 def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
-    """ФИКС: ns_steps 5 -> 7. После relabel w1/w2/conv_w -> Lion под Muon
-    остаются в основном квадратные (768,768) веса -- лишние 2 матмула
-    здесь стоят недорого относительно остального forward/backward."""
     eps = 1e-7
 
     if w.ndim == 3:
@@ -214,12 +184,6 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
 
 
 def _muon_orth_diag(g, ns_steps: int = 7):
-    """Считает orth_resid = ||prod - I||_F ОТДЕЛЬНО от muon_orthogonalize
-    (не переиспользует _muon_ns_iterate по историческим причинам -- код
-    идентичен, оставлено раздельно для явности при чтении диагностики).
-    ФИКС: тот же margin *1.01, что в _muon_ns_iterate -- иначе диагностика
-    считала бы resid для ДРУГОЙ (не margin'ированной) итерации, чем та,
-    что реально применяется в апдейте."""
     a, b, c = 3.4445, -4.7750, 2.0315
     X = jnp.asarray(g)
 
@@ -255,14 +219,6 @@ def _muon_orth_diag(g, ns_steps: int = 7):
 class MuonState(NamedTuple):
     count: jnp.ndarray
     orth_resid: jnp.ndarray
-    # ФИКС (локализация, см. чат): индекс (int32) худшего по orth_resid
-    # листа ВНУТРИ muon-подветки params, на ЭТОМ шаге. Порядок совпадает
-    # с build_muon_leaf_paths(abstract_params, _label_leaf) -- см. эту
-    # функцию ниже и её вызов в train_setup.py. Новое поле в NamedTuple
-    # -- при resume со старых чекпоинтов graft-merge (_generic_pytree_merge
-    # в train.py) оставит его свежим (нулевым) для чекпоинтов, где этого
-    # поля ещё не было -- это ожидаемо, см. train.py's докстринг про
-    # несовпадающие поля.
     worst_leaf_idx: jnp.ndarray
 
 
@@ -318,12 +274,9 @@ def extract_zclip_diagnostics(opt_state):
 
 
 def extract_muon_diagnostics(opt_state):
-    """ФИКС (локализация, см. чат): теперь возвращает ПАРУ
-    (max_orth_resid, worst_leaf_idx) вместо одного скаляра.
-    worst_leaf_idx -- индекс листа ВНУТРИ muon-подветки params (см.
-    build_muon_leaf_paths -- нужен для сопоставления индекса с реальным
-    путём на host-стороне train.py). Если muon-подветка пуста (например,
-    muon_diagnostic_disable=True) -- возвращает (0.0, -1)."""
+    """Возвращает (max_orth_resid, worst_leaf_idx). worst_leaf_idx -- индекс
+    листа ВНУТРИ muon-подветки params (см. build_muon_leaf_paths). Если
+    muon-подветка пуста -- (0.0, -1)."""
     resid_values = collect_by_leaf_name(opt_state, "orth_resid")
     idx_values = collect_by_leaf_name(opt_state, "worst_leaf_idx")
     if not resid_values:
@@ -336,22 +289,8 @@ def extract_muon_diagnostics(opt_state):
 def build_muon_leaf_paths(params, label_fn):
     """ЧИСТАЯ Python-функция (НЕ jit, вызывается ОДИН РАЗ при старте
     обучения, в train_setup.py's make_shard_and_compile) -- строит список
-    путей параметров, помеченных label_fn как "muon", В ТОМ ЖЕ ПОРЯДКЕ,
-    в котором jax.tree_util.tree_flatten обходит ИСХОДНОЕ дерево params.
-
-    ВАЖНО: update_fn внутри _muon_step ниже строит per_leaf_resid через
-    jax.tree_util.tree_flatten(updates), где `updates` -- это уже ТОЛЬКО
-    muon-подветка, которую multi_transform передаёт в tx_muon.update().
-    optax.multi_transform сохраняет относительный порядок листьев одной
-    метки ТЕМ ЖЕ, каким их обходит flatten() ИСХОДНОГО (полного) params
-    -- то есть если здесь мы отфильтруем flatten(params) по label=="muon"
-    в порядке обхода, порядок будет СОВПАДАТЬ с порядком, который видит
-    update_fn. Это же предположение проверяется тем, что
-    extract_muon_diagnostics's worst_leaf_idx стабильно указывает на один
-    и тот же путь для повторяющихся orth_resid (см. чат, значение 27.713
-    неизменно на десятках шагов подряд -- если бы порядок расходился,
-    расшифрованный путь бы "прыгал" случайно).
-    """
+    путей параметров, помеченных label_fn как "muon", В ТОМ ЖЕ ПОРЯДКЕ, в
+    котором jax.tree_util.tree_flatten обходит ИСХОДНОЕ дерево params."""
     labels = label_fn(params)
     flat_params_with_path, _ = jax.tree_util.tree_flatten_with_path(params)
     flat_labels, _ = jax.tree_util.tree_flatten(labels)
@@ -363,13 +302,6 @@ def build_muon_leaf_paths(params, label_fn):
     return muon_paths
 
 
-# ==========================================================================
-# label_fn -- ВЫНЕСЕН НА УРОВЕНЬ МОДУЛЯ (был вложенным в
-# make_hybrid_optimizer) -- train_setup.py импортирует его напрямую для
-# build_muon_leaf_paths, без необходимости вызывать make_hybrid_optimizer
-# заново или дублировать логику классификации.
-# ==========================================================================
-
 def _label_leaf(path, param):
     path_str = path_to_str(path)
     if "embed" in path_str or "lm_head" in path_str:
@@ -380,21 +312,11 @@ def _label_leaf(path, param):
         return "frozen"
     if "router" in path_str:
         return "adamw_nodecay"
-    # ФИКС: conv_w -- rank<=4 при d_model=768, структурно вырождена для
-    # спектральной ортогонализации (см. чат/synthetic_muon_test.py --
-    # осцилляция orth_resid с ростом ns_steps вместо сходимости).
     if "conv_w" in path_str:
         return "lion"
     if param.ndim >= 2:
         if "mamba" in path_str:
             return "lion"
-        # ФИКС: РАСШИРЕНО с "только w2" на "w1 И w2" -- живые логи на
-        # шаге 12900-12902 показывают orth_resid=58-59 на ВСЕХ w2
-        # (routed И shared, все 8 блоков) стабильно, fresh-init тест
-        # показал w1 тоже заметно хуже потолка. Оба -- экстремально
-        # прямоугольные (4096x768 / 768x4096, aspect ratio 5.3x) -- NS
-        # структурно не годится для этой формы независимо от того, w1
-        # это или w2.
         if ("w1" in path_str or "w2" in path_str) and (
             "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
         ):
@@ -404,10 +326,6 @@ def _label_leaf(path, param):
 
 
 def _make_label_fn(muon_diagnostic_disable: bool):
-    """Обёртка над модульным _label_leaf, применяющая
-    muon_diagnostic_disable (перевод ВСЕХ muon-параметров на
-    adamw_nodecay, для временного полного отключения Muon -- см. чат:
-    'может вообще муон убрать пока что')."""
     def label_fn(params):
         def _leaf(path, param):
             lbl = _label_leaf(path, param)
@@ -425,18 +343,6 @@ def _make_label_fn(muon_diagnostic_disable: bool):
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False,
                            warmup_freeze_step: Optional[int] = DEFAULT_WARMUP_FREEZE_STEP,
                            muon_ns_steps: int = 7):
-    """Гибридный оптимизатор: Muon (NS7) / Lion / AdamW.
-
-    muon_diagnostic_disable: если True -- ВСЕ параметры, которые иначе
-    получили бы метку "muon", переводятся на "adamw_nodecay" (полное
-    временное отключение Muon без изменения структуры/имён групп -- см.
-    чат про возможность откатиться на Lion/AdamW, пока NS-итерация не
-    разобрана до конца).
-
-    warmup_freeze_step: если задан (int) -- LR заморожен на этом шаге.
-        None -- полный warmup/cosine-decay без заморозки.
-        DEFAULT_WARMUP_FREEZE_STEP=5000 (см. чат).
-    """
     warmup_steps = max(500, int(total_steps * 0.15))
     cosine = optax.cosine_decay_schedule(
         init_value=1.0,
@@ -488,8 +394,6 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
                 params, updates,
             )
 
-            # ФИКС (локализация, см. чат): argmax через явный flatten с
-            # сохранением порядка -- НЕ jax.tree_map (там индекс теряется).
             leaves_g, _ = jax.tree_util.tree_flatten(updates)
             per_leaf_resid = jnp.stack([
                 _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
@@ -625,8 +529,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
     router_max_cos_per_layer = None
     router_max_cos = 0.0
 
-    diag_stacked = {}
-
     if not deterministic:
         final_hidden, sowed_vars = outputs
         losses = sowed_vars["losses"]
@@ -663,29 +565,12 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
             router_max_cos_per_layer = jnp.stack(max_cos_list)
             router_max_cos = jnp.max(router_max_cos_per_layer)
 
-        _DIAG_LEAF_NAMES = (
-            "layer_delta_maxabs", "layer_delta_isfinite",
-            "layer_resid_maxabs", "layer_resid_isfinite",
-            "mamba2_input_maxabs", "mamba2_input_isfinite", "mamba2_A_maxabs",
-            "mamba2_ssm_out_pre_norm_maxabs", "mamba2_ssm_out_pre_norm_isfinite",
-            "mamba2_ssm_out_maxabs",
-            "gdn2_input_maxabs", "gdn2_input_isfinite", "gdn2_decay_a_maxabs",
-            "gdn2_raw_out_maxabs", "gdn2_raw_out_isfinite", "gdn2_h_final_maxabs",
-            "gdn2_out_maxabs",
-            "mla_input_maxabs", "mla_out_maxabs",
-            "final_hidden_maxabs", "final_hidden_isfinite",
-            "gdn2_kernelstage_aqk_maxabs", "gdn2_kernelstage_aqk_isfinite",
-            "gdn2_kernelstage_akk_maxabs", "gdn2_kernelstage_akk_isfinite",
-            "gdn2_kernelstage_a_wy_inverse_maxabs", "gdn2_kernelstage_a_wy_inverse_isfinite",
-            "gdn2_kernelstage_w_pseudo_maxabs", "gdn2_kernelstage_w_pseudo_isfinite",
-            "gdn2_kernelstage_u_maxabs", "gdn2_kernelstage_u_isfinite",
-            "gdn2_kernelstage_kg_maxabs", "gdn2_kernelstage_kg_isfinite",
-            "gdn2_kernelstage_qg_maxabs", "gdn2_kernelstage_qg_isfinite",
-        )
-        for name in _DIAG_LEAF_NAMES:
-            vals = collect_by_leaf_name(losses, name)
-            if vals:
-                diag_stacked[name] = jnp.stack(vals)
+        # ФИКС (этот пасс): kernel/activation-level diag collection
+        # (layer_delta_*, layer_resid_*, mamba2_*, gdn2_*, gdn2_kernelstage_*,
+        # mla_*, final_hidden_*) удалён -- эти self.sow(...) больше не
+        # существуют в model.py, оптимизаторская диагностика (per-group/
+        # per-layer grad/weight stats, muon) полностью живёт в
+        # train_setup.py и не зависит от этого блока.
     else:
         final_hidden = outputs
 
@@ -728,6 +613,5 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
             "router_max_cos":             router_max_cos,
             "assignment_frac":            assignment_frac_stacked,
         }
-        aux_info.update(diag_stacked)
         return total_loss, aux_info
     return total_loss
