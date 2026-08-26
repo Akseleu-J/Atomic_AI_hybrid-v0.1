@@ -24,7 +24,7 @@ def path_to_str(path) -> str:
             parts.append(str(p.idx))
         else:
             parts.append(str(p))
-    return "".join(parts).lower()
+    return "/".join(parts).lower()
     
 def collect_by_leaf_name(tree, target_name):
     import jax
