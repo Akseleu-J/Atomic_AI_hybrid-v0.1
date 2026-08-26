@@ -68,20 +68,26 @@ print("[MODEL] ⚙️ Mamba2: используется Pallas forward (M2 cumdec
       "-- backward всё ещё дифференцирует через него).")
 
 # ==========================================================================
-# ФИКС (этот пасс -- ВСЕГДА включённая по-слойная диагностика, см. чат):
-# GDN2_FWD_DIAG-диагностика ниже по файлу (_diag_maxabs/_diag_resid_breakdown,
-# jax.debug.print под lax.cond) остаётся КАК ЕСТЬ (полезна для точечной
-# ручной отладки одного прогона), но она (а) выключена по умолчанию, (б)
-# агрегирует "gdn2"/"mamba2" одной кучей, а не по физическому слою, (в)
-# host-callback на каждый шаг -- дорого держать постоянно включённой.
+# ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к оптимизатору): все
+# kernel/activation-level self.sow(...) вызовы (gdn2_input_*, gdn2_raw_out_*,
+# gdn2_h_final_maxabs, gdn2_out_maxabs, gdn2_kernelstage_* -- через
+# atomic_ops/kernel_diag.py, mamba2_input_*, mamba2_ssm_out_*, mla_input_*,
+# mla_out_*, layer_delta_*, layer_resid_*, final_hidden_*) УДАЛЕНЫ из
+# forward-пути. Причина: они (а) требовали ЛИШНЕГО пересчёта Kernel A/B/C
+# под stop_gradient на каждый GDN-2 слой каждый шаг (kernel_diag.py's
+# gdn2_kernel_stage_diagnostics, дорого и не нужно для стабильности самого
+# обучения), (б) дублировали информацию, которую optimizer/train_setup уже
+# дают на уровне градиентов и весов ПО ФИЗИЧЕСКОМУ СЛОЮ (см.
+# train_setup.py's layer_grad_norm/layer_grad_maxabs/layer_grad_nonfinite +
+# layer_w_norm/layer_w_maxabs/layer_w_nonfinite, diagnostics.py's
+# build_leaf_stats_fn) -- то есть достаточно для диагностики "какая группа/
+# слой нестабильны", без необходимости смотреть внутрь самого Pallas-ядра.
+# Санитизация (clip/nan_to_num) НИГДЕ не тронута -- убрана только отчётность.
 #
-# Параллельно с ней добавлена ВТОРАЯ, ВСЕГДА включённая линия диагностики
-# через self.sow(...) -- ЧИСТЫЕ jnp-значения (max|abs|, isfinite),
-# собираемые host-side после шага через collect_by_leaf_name (utils.py),
-# ровно тем же паттерном, что MoE уже использует для router_temp/
-# norm_x_mean. Никакого debug.print/callback -- эти self.sow(...) вызовы
-# добавлены прямо в BlockDARLayer/BlockDAR/Mamba2J/GatedDeltaNet2J/MLAJ/
-# FullHybridMoEModel ниже, с пометкой "ДИАГНОСТИКА (всегда вкл)".
+# GDN2_FWD_DIAG-диагностика ниже по файлу (_diag_maxabs/_diag_resid_breakdown,
+# jax.debug.print под lax.cond) остаётся КАК ЕСТЬ, но выключена по
+# умолчанию (env var) -- используйте её только для точечной ручной отладки
+# одного прогона, не для постоянно включённого мониторинга.
 # ==========================================================================
 
 try:
@@ -113,65 +119,19 @@ def get_batch_axis():
 # ==========================================================================
 # ДИАГНОСТИКА (сквозная, переиспользует тот же флаг, что kernel_d_pipeline.py
 # использует для GDN-2 -- GDN2_FWD_DIAG=1, по умолчанию OFF, нулевой оверхед
-# в обычном обучении). Добавлена сюда (module-level, model.py) для
-# использования внутри Mamba2J -- см. её докстринг ниже: диагностика нужна,
-# чтобы увидеть, реально ли новый RMSNorm перед out_proj сбивает амплитуду
-# SSM-выхода, а не просто гадать по [RESID-DIAG] на несколько слоёв позже.
+# в обычном обучении). Manual/point-in-time debugging only -- see module
+# docstring above about why the always-on kernel/activation sow()s were
+# removed in favor of the optimizer-side per-layer diagnostics.
 # ==========================================================================
 _GDN2_FWD_DIAG = os.environ.get("GDN2_FWD_DIAG", "0") == "1"
 
 
-# ==========================================================================
-# ФИКС (этот пасс -- краш diagnose_nonfinite.py: "ValueError: Unknown
-# format code 'e' for object of type 'str'" внутри jax.debug.print при
-# ЭЙДЖЕРНОМ (без jax.jit) вызове model.apply(...)):
-#
-# _diag_maxabs/_diag_resid_breakdown раньше вызывали jax.debug.print
-# БЕЗУСЛОВНО (без проверки режима исполнения). jax.debug.print/
-# jax.debug.callback спроектированы и надёжно ведут себя именно как
-# side-effect ВНУТРИ скомпилированного (jit) графа -- там его callback
-# получает ровно тот набор args/kwargs, что был зафиксирован при
-# трассировке. При ЭЙДЖЕРНОМ вызове (как в diagnose_nonfinite.py, где
-# model.apply(...) намеренно вызывается БЕЗ jax.jit, чтобы получить
-# конкретные -- не трейсинговые -- промежуточные значения для анализа)
-# в этом же forward-проходе срабатывает НЕСКОЛЬКО РАЗНЫХ debug.print
-# вызовов подряд (у каждого свой набор именованных плейсхолдеров:
-# {f}/{m} здесь, {b}/{l} в BlockDAR, {cx}/{d} в _diag_resid_breakdown,
-# {n}/{m} в kernel_d_pipeline.py's _stage_diag и т.д.) -- в эйджер-режиме
-# внутренняя callback-очередь JAX's debug_print не даёт тех же гарантий
-# упорядоченного сопоставления fmt<->kwargs, что и под jit, и в
-# результате format-spec ":.3e" применяется к аргументу, разрешившемуся
-# в СТРОКУ (тег другого принта), а не число -- отсюда и
-# "Unknown format code 'e' for object of type 'str'".
-#
-# Ровно та же категория проблемы, что уже привела к переписыванию
-# host-side диагностики в train_setup.py (см. его ФИКС #3 -- полный
-# отказ от jax.debug.print/callback внутри distributed_apply_step в
-# пользу обычных jnp-возвратов, разбираемых на host-стороне). Здесь
-# аналогичный, но более точечный фикс: раз x -- это ЛИБО Tracer (мы
-# внутри jax.jit, debug.print работает штатно и остаётся ЕДИНСТВЕННЫМ
-# способом получить эффект внутри графа), ЛИБО уже конкретный массив
-# (эйджерный вызов, как в diagnose_nonfinite.py, где jax.debug.print в
-# принципе не нужен -- значения уже под рукой) -- проверяем это через
-# isinstance(x, jax.core.Tracer) и в эйджерном случае используем
-# ОБЫЧНЫЙ Python print с явным float()/bool(), который не завязан на
-# debug_print's callback-очередь и не может столкнуться с этим багом.
-# Поведение под jit (реальное обучение, train.py) НЕ меняется -- там
-# x всегда Tracer, ветка jax.debug.print работает как раньше.
-# ==========================================================================
 def _is_traced(x):
     return isinstance(x, jax.core.Tracer)
 
 
 def _diag_maxabs(tag: str, x):
-    """No-op (возвращает x без изменений) если GDN2_FWD_DIAG=0. Иначе печатает
-    finite/non-finite статус и max|abs| конечной части -- чисто диагностика,
-    значение не меняет ни в каком режиме.
-
-    ФИКС: под jit -- jax.debug.print (как раньше). В эйджер-режиме
-    (x уже конкретный массив, не Tracer) -- обычный print с
-    device_get/float/bool, не через debug_print's callback-очередь (см.
-    докстринг модуля выше про причину краша в diagnose_nonfinite.py)."""
+    """No-op (возвращает x без изменений) если GDN2_FWD_DIAG=0."""
     if not _GDN2_FWD_DIAG:
         return x
 
@@ -191,30 +151,6 @@ def _diag_maxabs(tag: str, x):
     return x
 
 
-# ==========================================================================
-# ДИАГНОСТИКА #2 (этот пасс -- точечная локализация RESID-DIAG на
-# layer=22/block=7/mamba2 при round_robin dataloader): [RESID-DIAG] в
-# BlockDAR печатает max|abs| ПОСЛЕ current_x+delta, но не говорит, откуда
-# пришла величина -- current_x УЖЕ был близко к порогу ДО этого слоя
-# (значит проблема в накоплении по предыдущим слоям/блокам), или delta
-# именно ЭТОГО sublayer'а (mamba2 на layer=22) добавила скачок сама по
-# себе (значит проблема локальна для этого слоя). Печатает ОБА числа
-# отдельно, только когда суммарный результат уже приближается к клипу --
-# порог 5e2 выбран НИЖЕ порога самого RESID-DIAG (1e3), чтобы эта
-# диагностика срабатывала РАНЬШЕ и давала предупреждение, а не только
-# постфактум объяснение уже случившегося события. Управляется тем же
-# GDN2_FWD_DIAG=1 флагом -- по умолчанию OFF, нулевой оверхед.
-#
-# ФИКС (этот пасс, тот же класс бага, что и в _diag_maxabs выше): под
-# jax.lax.cond + jax.debug.print эта функция ТОЖЕ падала бы точно так же
-# при эйджерном вызове (jax.lax.cond в eager режиме исполняется сразу,
-# и внутренний jax.debug.print снова цепляет ту же callback-очередь).
-# Та же ветка is_traced(...) -- под jit используем jax.lax.cond +
-# jax.debug.print как раньше (порог проверяется НА УСТРОЙСТВЕ, без
-# host-side синхронизации на каждом шаге), в эйджер-режиме считаем порог
-# обычным Python-if над уже конкретными float-значениями и печатаем
-# обычным print.
-# ==========================================================================
 def _diag_resid_breakdown(tag: str, current_x_before, delta):
     if not _GDN2_FWD_DIAG:
         return
@@ -246,20 +182,6 @@ def _diag_resid_breakdown(tag: str, current_x_before, delta):
                   f"если delta большая, а current_x_before маленький -- источник ЭТОТ слой)")
 
 
-# ==========================================================================
-# ДИАГНОСТИКА (2-й уровень): forward-активации уже проверены (FWD-DIAG) и
-# оказались finite, а градиент всё равно non-finite -- значит проблема
-# именно в backward конкретного узла (например, custom VJP flash-attention
-# ядра, или матмул с бOльшим диапазоном значений, чем видно по forward
-# значению после clip/nan_to_num). identity-функция с custom_vjp пропускает
-# forward без изменений, а в backward проверяет входящий котангент.
-#
-# ПРИМЕЧАНИЕ: make_grad_probe/make_grad_sanitizer сами по себе безопасны
-# для эйджерного вызова без grad -- их jax.debug.print сидит внутри _bwd,
-# который вообще не выполняется, если по графу не берут jax.grad/vjp (как
-# в diagnose_nonfinite.py's forward-only проходах). Правки не требуются,
-# оставлены как есть.
-# ==========================================================================
 def make_grad_probe(tag: str):
     @jax.custom_vjp
     def _probe(x):
@@ -284,10 +206,7 @@ def make_grad_probe(tag: str):
 def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
     """Как make_grad_probe, но не только печатает, а АКТИВНО чинит non-finite
     градиент (nan_to_num + клип) прежде чем отдать его дальше по backward
-    графу. Используется в узлах со своим сложным custom VJP (pallas
-    flash-attention) или длинной scan-рекуррентностью (Mamba2), где
-    санитизация только forward-входов (как для GDN-2/Mamba2 сделано выше)
-    не гарантирует конечность именно ГРАДИЕНТА, вычисляемого внутри."""
+    графу."""
     @jax.custom_vjp
     def _sanitizer(x):
         return x
@@ -396,23 +315,10 @@ class MLAJ(nn.Module):
         K_rope = apply_rope(K, cos[None, None, :, :d_head], sin[None, None, :, :d_head])
         V = V.reshape(b, l, n_heads, d_head).transpose(0, 2, 1, 3)
 
-        # ФИКС: единственный модуль без входной санитизации перед
-        # flash-attention (GDN-2 нормирует q/k, Mamba2 клипает B/C/dt) --
-        # подтверждено логом, где mla_flash_attn_out регулярно требовал
-        # спасения градиента. Клип входа тем же способом (±1e3), что и везде.
         def _sanitize(t):
             return jnp.nan_to_num(jnp.clip(t, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         Q_rope, K_rope, V = map(_sanitize, (Q_rope, K_rope, V))
-
-        # ДИАГНОСТИКА (всегда включена, см. diagnostics.py / чат): вход в
-        # flash-attention -- ЧИСТЫЙ jnp max|abs|, sow'ится как обычная
-        # величина, без debug.print/callback. Собирается host-side через
-        # collect_by_leaf_name в optimizer.py, логируется в train.py.
-        self.sow(
-            "losses", "mla_input_maxabs",
-            jnp.max(jnp.stack([jnp.max(jnp.abs(Q_rope)), jnp.max(jnp.abs(K_rope)), jnp.max(jnp.abs(V))])),
-        )
 
         sm_scale = 1.0 / math.sqrt(d_head)
 
@@ -471,20 +377,7 @@ class MLAJ(nn.Module):
 
         out = out.transpose(0, 2, 1, 3).reshape(b, l, self.cfg.d_model)
 
-        # ФИКС (по аналогии с out_norm в GatedDeltaNet2J / ssm_out_norm в
-        # Mamba2J -- см. их докстринги): MLA была единственным из трёх типов
-        # саблеера БЕЗ нормировки выхода перед финальной проекцией. До этого
-        # момента make_grad_sanitizer чинил только градиент на backward, но
-        # ничего не ограничивал в forward -- амплитуда выхода attention могла
-        # свободно плавать перед W_o и уходить в history_blocks/local_deltas
-        # ненормированной, ровно как это было прослежено для Mamba2 (RESID-DIAG,
-        # рост current_x после mla-слоёв в block0/3/6). RMSNorm здесь -- тот же
-        # приём, применённый к последнему из трёх недостающих мест.
         out = nn.RMSNorm(epsilon=1e-6, name="attn_out_norm")(out).astype(x.dtype)
-
-        # ДИАГНОСТИКА (всегда включена): выход MLA после нормы -- финальная
-        # амплитуда, которая идёт в W_o и дальше в residual stream.
-        self.sow("losses", "mla_out_maxabs", jnp.max(jnp.abs(out)))
 
         out = make_grad_sanitizer("mla_flash_attn_out")(out)
         return nn.Dense(self.cfg.d_model, use_bias=False, name="W_o", dtype=jnp.bfloat16)(out)
@@ -538,61 +431,10 @@ class Mamba2J(nn.Module):
 
         dt, B, C, x_conv = map(_sanitize, (dt, B, C, x_conv))
 
-        # ДИАГНОСТИКА (всегда включена, см. чат): вход в SSD-пайплайн после
-        # санитизации -- max|abs| и isfinite по dt/B/C/x_conv (кандидаты
-        # #1 на "накопление ДО того, как дошло до kernel_d_pipeline.py's
-        # GDN2_FWD_DIAG"). A_log/A тоже -- decay может дрейфовать
-        # независимо от активаций.
-        self.sow(
-            "losses", "mamba2_input_maxabs",
-            jnp.max(jnp.stack([
-                jnp.max(jnp.abs(dt)), jnp.max(jnp.abs(B)),
-                jnp.max(jnp.abs(C)), jnp.max(jnp.abs(x_conv)),
-            ])),
-        )
-        self.sow(
-            "losses", "mamba2_input_isfinite",
-            jnp.all(jnp.stack([
-                jnp.all(jnp.isfinite(dt)), jnp.all(jnp.isfinite(B)),
-                jnp.all(jnp.isfinite(C)), jnp.all(jnp.isfinite(x_conv)),
-                jnp.all(jnp.isfinite(A)),
-            ])).astype(jnp.float32),
-        )
-        self.sow("losses", "mamba2_A_maxabs", jnp.max(jnp.abs(A)))
-
         chunk_size = min(self.cfg.deltanet_chunk_size, l)
         if l % chunk_size != 0:
             raise ValueError(f"seq_len={l} must be divisible by deltanet_chunk_size={chunk_size}.")
 
-        # ==================================================================
-        # M6 (интеграция M2->M3->M4->M5 Pallas-пайплайна): reshape (b,l,d_inner)
-        # -> (b,l,n_heads_ssm,headdim) для dt/x_conv; B/C остаются
-        # (b,l,d_state) -- общие на все головы, как и в SSD-конвенции.
-        #
-        # ФИКС (главное отличие от временной M0/M1-интеграции): dt_h/x_h/B_f/
-        # C_f раньше принудительно кастовались в float32 ПЕРЕД вызовом
-        # mamba2_ssd_reference -- это было корректно для чистого JAX-пути
-        # (сам mamba2_ssd_reference всё равно делает .astype(f32) внутри), но
-        # теперь, когда вызывается mamba2_pallas_forward_trainable (M5,
-        # custom_vjp обёртка над Pallas M2/M3/M4), она рассчитана и
-        # провалидирована именно на ВХОДНЫЕ dt/x/B/C в bfloat16 (как они и
-        # приходят из nn.Dense(..., dtype=bfloat16) выше) -- см.
-        # kernel_mamba2_trainable.py: обёртка кастует градиенты ОБРАТНО к
-        # dtype каждого форвард-входа на границе custom_vjp, и это
-        # предположение проверено test_mamba2_kernel_trainable.py's
-        # test_gradients_finite_and_dtype_correct_bfloat16 именно на bf16
-        # входах. Преждевременный .astype(float32) здесь бы (а) свёл на нет
-        # экономию памяти bf16, которую использует остальная модель, и (b)
-        # означал бы, что реальный тренировочный путь никогда не проходит
-        # тот самый bf16-режим, который был явно провалидирован в M5 --
-        # вместо этого он тихо всегда шёл бы через fp32-путь, для которого
-        # dtype-cast-at-boundary логика обёртки формально не нужна (и
-        # поэтому её баги в bf16-режиме остались бы незамеченными).
-        #
-        # A остаётся float32 (как и раньше) -- это уже его натуральный dtype
-        # (a_param/A_log -- self.param без dtype=, т.е. float32 по
-        # умолчанию), обёртка ожидает A именно в float32.
-        # ==================================================================
         mesh = get_model_mesh()
         batch_axis = get_batch_axis()
         dt_h = dt.reshape(b, l, n_heads_ssm, headdim)
@@ -600,24 +442,8 @@ class Mamba2J(nn.Module):
         B_f = B
         C_f = C
 
-        # ФИКС (тот же паттерн, что уже используется для GDN-2 в
-        # GatedDeltaNet2J -- см. sharded_gdn2 ниже по файлу): Mosaic/Pallas
-        # кернели НЕ умеют автоматически шардиться по FSDP mesh'у --
-        # "Mosaic kernels cannot be automatically partitioned. Please wrap
-        # the call in a shard_map." Раньше mamba2_pallas_forward_trainable
-        # вызывался напрямую (без shard_map), что было корректно только
-        # для unit-тестов (там mesh=None) -- в реальном train.py mesh
-        # всегда задан (make_tpu_mesh() в train_setup.py), и тот же вызов
-        # падает при первом же model.init() под jax.jit с in_shardings.
         state0_zeros = jnp.zeros((b, n_heads_ssm, headdim, d_state), dtype=jnp.float32)
 
-        # ФИКС: partial(fn, chunk_size=chunk_size) не защищает позицию
-        # chunk_size от positional-заполнения — shard_map вызывает обёрнутую
-        # функцию позиционно (dt_h, x_h, B_f, C_f, A, state0_zeros), и 6-й
-        # позиционный аргумент (state0_zeros) занимает слот chunk_size,
-        # который partial уже связал через keyword -> "got multiple values
-        # for argument 'chunk_size'". Явная функция с именованными
-        # параметрами фиксирует порядок.
         def _mamba2_fixed(dt_, x_, B_, C_, A_, state0_):
             return mamba2_pallas_forward_trainable(
                 dt_, x_, B_, C_, A_, chunk_size=chunk_size, state0=state0_
@@ -644,15 +470,8 @@ class Mamba2J(nn.Module):
 
         y = y_h.reshape(b, l, d_inner).astype(x_bc.dtype)
         y = _diag_maxabs("mamba2_ssm_out_pre_norm", y)
-        # ДИАГНОСТИКА (всегда включена): SSD-выход ДО нормы -- отдельно от
-        # env-gated _diag_maxabs выше (который печатает только при
-        # GDN2_FWD_DIAG=1), эта sow-версия работает каждый шаг.
-        self.sow("losses", "mamba2_ssm_out_pre_norm_maxabs",
-                 jnp.max(jnp.abs(jnp.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0))))
-        self.sow("losses", "mamba2_ssm_out_pre_norm_isfinite", jnp.all(jnp.isfinite(y)).astype(jnp.float32))
         y = nn.RMSNorm(epsilon=1e-6, name="ssm_out_norm")(y).astype(x_bc.dtype)
         y = _diag_maxabs("mamba2_ssm_out_post_norm", y)
-        self.sow("losses", "mamba2_ssm_out_maxabs", jnp.max(jnp.abs(y)))
 
         out = y * jax.nn.silu(res)
         out = jnp.clip(out, jnp.array(-3e2, dtype=out.dtype), jnp.array(3e2, dtype=out.dtype))
@@ -694,7 +513,7 @@ def _gdn2_recurrence_impl(k, e, z, alpha, q, dtype):
 
     return jnp.moveaxis(out_t, 0, 1)
 
-from atomic_ops.kernel_diag import gdn2_kernel_stage_diagnostics
+
 class GatedDeltaNet2J(nn.Module):
     cfg: ModelConfig
 
@@ -752,26 +571,6 @@ class GatedDeltaNet2J(nn.Module):
 
         q, k, v, w_gate, b_gate, g = map(_sanitize, (q, k, v, w_gate, b_gate, g))
 
-        # ДИАГНОСТИКА (всегда включена, см. чат): вход в GDN-2 Pallas-пайплайн
-        # после санитизации -- max|abs|/isfinite по q/k/v/w_gate/b_gate/g,
-        # плюс отдельно decay_a (a_param) -- известная "горячая точка"
-        # нестабильности (см. optimizer.py's _decay_grad_scale/0.2x).
-        self.sow(
-            "losses", "gdn2_input_maxabs",
-            jnp.max(jnp.stack([
-                jnp.max(jnp.abs(q)), jnp.max(jnp.abs(k)), jnp.max(jnp.abs(v)),
-                jnp.max(jnp.abs(w_gate)), jnp.max(jnp.abs(b_gate)), jnp.max(jnp.abs(g)),
-            ])),
-        )
-        self.sow(
-            "losses", "gdn2_input_isfinite",
-            jnp.all(jnp.stack([
-                jnp.all(jnp.isfinite(q)), jnp.all(jnp.isfinite(k)), jnp.all(jnp.isfinite(v)),
-                jnp.all(jnp.isfinite(w_gate)), jnp.all(jnp.isfinite(b_gate)), jnp.all(jnp.isfinite(g)),
-            ])).astype(jnp.float32),
-        )
-        self.sow("losses", "gdn2_decay_a_maxabs", jnp.max(jnp.abs(a_param)))
-
         if l % GDN2_PALLAS_BT != 0:
             raise ValueError(
                 f"seq_len={l} must be divisible by the Pallas GDN-2 chunk size "
@@ -803,79 +602,8 @@ class GatedDeltaNet2J(nn.Module):
             out, _h_final = _gdn2_fixed(q, k, v, w_gate, b_gate, g)
 
         out = out.reshape(b, l, d)
-        # ==================================================================
-        # ДИАГНОСТИКА (всегда включена) -- ВНУТРЕННИЕ стадии Pallas-пайплайна
-        # (Aqk/Akk/A/w_pseudo/u/kg/qg), не только итоговый выход слоя. Ловит
-        # именно тот класс инцидента, который уже случался (near-singular
-        # Akk в Kernel B -> large-but-finite A, всплывающее как inf только
-        # несколько кернелов спустя в Kernel D) -- см. kernel_b_solve.py и
-        # kernel_c_recompute.py докстринги. Под stop_gradient, не участвует
-        # в backward -- см. atomic_ops/kernel_diag.py.
-        #
-        # ФИКС (NotImplementedError: Mosaic kernels cannot be automatically
-        # partitioned): этот diag-вызов сам содержит Pallas-кернели (Kernel
-        # A/B/C через build_chunk_scores_pallas/wy_solve_pallas/
-        # recompute_wy_pallas) -- как и основной sharded_gdn2 чуть выше,
-        # он ОБЯЗАН идти через jax.shard_map под FSDP mesh, иначе XLA
-        # пытается автоматически партиционировать Mosaic-кернель и падает
-        # с "Mosaic kernels cannot be automatically partitioned. Please
-        # wrap the call in a shard_map." Раньше эта диагностика вызывалась
-        # напрямую (без shard_map), что работало только при mesh=None
-        # (unit-тесты) и падало в реальном train.py, где mesh всегда задан
-        # (см. train_setup.py's make_tpu_mesh()).
-        #
-        # out_specs=P() (replicated) для каждого maxabs/isfinite: эти
-        # величины -- глобальные скаляры мониторинга, поэтому ВНУТРИ
-        # kernel_diag.py's gdn2_kernel_stage_diagnostics они дополнительно
-        # редуцируются коллективами (jax.lax.pmax для maxabs, jax.lax.pmin
-        # для isfinite/0-1-флага) по batch_axis -- см. её параметр
-        # axis_name. Без этой редукции out_specs=P() либо падает
-        # ("value is not replicated across shards"), либо тихо возвращает
-        # значение одного произвольного шарда вместо честного глобального
-        # максимума/AND по всем устройствам.
-        # ==================================================================
-        _gdn2_diag_stage_names = (
-            "aqk", "akk", "a_wy_inverse", "w_pseudo", "u", "kg", "qg",
-        )
-        _gdn2_diag_out_spec = {}
-        for _name in _gdn2_diag_stage_names:
-            _gdn2_diag_out_spec[f"{_name}_maxabs"] = P()
-            _gdn2_diag_out_spec[f"{_name}_isfinite"] = P()
-
-        if mesh is not None:
-            _gdn2_stage_diag_fn = partial(
-                gdn2_kernel_stage_diagnostics, scale=1.0, axis_name=batch_axis
-            )
-            sharded_gdn2_diag = jax.shard_map(
-                _gdn2_stage_diag_fn,
-                mesh=mesh,
-                in_specs=(in_spec, in_spec, in_spec, in_spec, in_spec, in_spec),
-                out_specs=_gdn2_diag_out_spec,
-                check_vma=False,
-            )
-            _gdn2_stage_diag = sharded_gdn2_diag(q, k, v, w_gate, b_gate, g)
-        else:
-            _gdn2_stage_diag = gdn2_kernel_stage_diagnostics(
-                q, k, v, w_gate, b_gate, g, scale=1.0
-            )
-
-        for _stage_name, _stage_val in _gdn2_stage_diag.items():
-            self.sow("losses", f"gdn2_kernelstage_{_stage_name}", _stage_val)
-        # (см. также atomic_ops/kernel_diag.py -- gdn2_kernel_stage_diagnostics
-        # теперь принимает axis_name и редуцирует maxabs/isfinite коллективами
-        # pmax/pmin, когда вызывается внутри shard_map -- см. правку выше.)
-        # ДИАГНОСТИКА (всегда включена): GDN-2 Pallas-пайплайн выход ДО
-        # нормы -- max|abs|/isfinite по o и по h_final (несущий carry
-        # state -- если ОН начинает расти, это влияет на ВСЕ последующие
-        # чанки, а не только текущий).
-        self.sow("losses", "gdn2_raw_out_maxabs",
-                 jnp.max(jnp.abs(jnp.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0))))
-        self.sow("losses", "gdn2_raw_out_isfinite", jnp.all(jnp.isfinite(out)).astype(jnp.float32))
-        self.sow("losses", "gdn2_h_final_maxabs",
-                 jnp.max(jnp.abs(jnp.nan_to_num(_h_final, nan=0.0, posinf=0.0, neginf=0.0))))
 
         out = nn.RMSNorm(epsilon=1e-6, name="out_norm")(out).astype(x.dtype)
-        self.sow("losses", "gdn2_out_maxabs", jnp.max(jnp.abs(out)))
         return nn.Dense(d, use_bias=False, name="out_proj", dtype=jnp.bfloat16)(out * jax.nn.silu(out_gate))
 
 
@@ -1047,20 +775,6 @@ class BlockDARLayer(nn.Module):
 
         delta = make_grad_probe(f"sublayer_out_layer{self.layer_idx}_{self.layer_type}")(delta)
 
-        # ==================================================================
-        # ДИАГНОСТИКА (ВСЕГДА ВКЛЮЧЕНА, см. чат): raw delta ДО финального
-        # клипа -- max|abs| и isfinite для этого конкретного ФИЗИЧЕСКОГО
-        # слоя (self.layer_idx, self.layer_type), sow'ится как обычная
-        # jnp-величина без debug.print/callback. Порядок вызовов (block
-        # major, layer minor -- см. BlockDAR.__call__'s for-loop и
-        # FullHybridMoEModel's block_idx-loop) СОВПАДАЕТ с порядком
-        # diagnostics.layer_tags_in_sow_order(cfg) -- train.py использует
-        # это соответствие для подписи столбцов в W&B.
-        # ==================================================================
-        _delta_safe = jnp.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-        self.sow("losses", "layer_delta_maxabs", jnp.max(jnp.abs(_delta_safe)))
-        self.sow("losses", "layer_delta_isfinite", jnp.all(jnp.isfinite(delta)).astype(jnp.float32))
-
         delta = jnp.nan_to_num(jnp.clip(delta, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
         return delta
@@ -1114,19 +828,6 @@ class BlockDAR(nn.Module):
                 lambda: None,
             )
 
-            # ==================================================================
-            # ДИАГНОСТИКА (ВСЕГДА ВКЛЮЧЕНА, см. чат): та же величина, что
-            # выше уже вычислена для env-gated [RESID-DIAG] (cx_abs_max) и
-            # delta_finite -- здесь дополнительно sow'ится КАЖДЫЙ шаг, без
-            # флага, без debug.print. Это residual stream ПОСЛЕ конкретного
-            # физического слоя (layer_idx) -- именно то число, которое
-            # нужно, чтобы увидеть монотонный дрейф residual stream по
-            # шагам обучения ПО КАЖДОМУ слою отдельно (не только когда он
-            # уже пересёк порог 1e3).
-            # ==================================================================
-            self.sow("losses", "layer_resid_maxabs", cx_abs_max)
-            self.sow("losses", "layer_resid_isfinite", delta_finite.astype(jnp.float32))
-
             local_deltas.append(delta)
 
             _resid_clip = 5e2 if layer_type == "mamba2" else 1e3
@@ -1179,18 +880,9 @@ class FullHybridMoEModel(nn.Module):
 
         num_blocks = self.cfg.num_layers // self.cfg.layers_per_block
 
-        # было:
-        #RematBlock = BlockDAR
-
-        # стало:
         RematBlock = nn.remat(
                BlockDAR,
-               static_argnums=(6, 7),   # (deterministic, rngs) -- Python-level control
-                              # flow (if rngs is not None / dropout branches
-                              # внутри MLAJ/GmmMoEJ/BlockDARLayer) не может
-                              # трассироваться как обычный traced-аргумент;
-                              # remat требует явно пометить такие позиции
-                              # static_argnums (см. jax.checkpoint docstring).
+               static_argnums=(6, 7),
             )
 
         for block_idx in range(num_blocks):
@@ -1201,14 +893,6 @@ class FullHybridMoEModel(nn.Module):
             )(x, x_input, history_blocks, causal_mask, cos, sin, deterministic, rngs)
 
         final = nn.RMSNorm(epsilon=1e-6, name="final_norm")(x).astype(x.dtype)
-
-        # ДИАГНОСТИКА (всегда включена, см. чат): финальный hidden state
-        # ПЕРЕД CE-проекцией -- последняя точка перед chunked_cross_entropy
-        # в optimizer.py (которая сама уже клипует ±1e3 -- это число
-        # показывает, насколько близко к этому клипу мы реально идём).
-        self.sow("losses", "final_hidden_maxabs",
-                 jnp.max(jnp.abs(jnp.nan_to_num(final, nan=0.0, posinf=0.0, neginf=0.0))))
-        self.sow("losses", "final_hidden_isfinite", jnp.all(jnp.isfinite(final)).astype(jnp.float32))
 
         if return_hidden:
             return final
