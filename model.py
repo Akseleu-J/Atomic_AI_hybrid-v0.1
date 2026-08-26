@@ -696,6 +696,23 @@ class HybridDARAttention(nn.Module):
         n = len(all_sources)
         if n == 0:
             return jnp.zeros_like(current_x)
+        if n == 1:
+            # ФИКС: единственный источник -- softmax по оси размера 1
+            # тождественно даёт вес 1.0 независимо от q_proj/k_proj,
+            # т.е. градиент через них структурно нулевой (не численно
+            # маленький, а РОВНО ноль) -- k_proj/q_proj в этом вызове
+            # никогда ничему не учатся, только тратят FLOPs и портят
+            # Muon-диагностику (orth_resid для нулевого градиента ==
+            # sqrt(dim), константный артефакт, всегда "выигрывает" argmax).
+            # Тот же shortcut, что IntraBlockAttention уже применяет для
+            # n_sources==1.
+            return all_sources[0].astype(current_x.dtype)
+
+        b, l, d = current_x.shape
+        stack = jnp.stack(all_sources, axis=0)
+        
+        if n == 0:
+            return jnp.zeros_like(current_x)
 
         b, l, d = current_x.shape
         stack = jnp.stack(all_sources, axis=0)
