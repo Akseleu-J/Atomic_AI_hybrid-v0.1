@@ -127,7 +127,7 @@ from optimizer import ROUTER_COLLINEARITY_COEF
 #     (repo_id из Kaggle secret HF_REPO_ID) — upload_slot() это уже делает,
 #     трогать не нужно.
 # ==========================================================================
-RESUME_SOURCE = "hf_model"     # "bucket" | "hf_model" | "local_only"
+RESUME_SOURCE = "bucket"     # "bucket" | "hf_model" | "local_only"
 RESUME_BUCKET_ID = "atomic-ai-labs/atomic-light-v0.5-bucket"   # <-- ваш реальный bucket id
 RESUME_BUCKET_SUBDIR = "best_val"# <-- какой слот внутри бакета
 
@@ -374,8 +374,8 @@ def main_execution():
     mngr_best_train = make_manager(best_train_dir, max_to_keep=1)
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
-    FORCE_FRESH_START = False# <-- поставьте False, чтобы вернуть обычный resume
-    RESUME_FROM_SLOT = "latest"  # <-- используется только если FORCE_FRESH_START=False
+    FORCE_FRESH_START = True# <-- поставьте False, чтобы вернуть обычный resume
+    RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
 
     # ФИКС (router collapse): см. докстринг модуля выше. После graft-merge
     # (и для params, и для opt_state) router/router_temp/expert_bias уже
@@ -551,7 +551,7 @@ def main_execution():
     # ЗДЕСЬ, сразу ПОСЛЕ вызова.
     from train_setup import _PARAM_LAYER_TAGS, _SOW_LAYER_TAGS, _MUON_LEAF_PATHS
 
-        if _MUON_LEAF_PATHS:
+    if _MUON_LEAF_PATHS:
         print(f"[MUON-DIAG] Всего muon-параметров: {len(_MUON_LEAF_PATHS)}")
         for i, p in enumerate(_MUON_LEAF_PATHS):
             marker = "  <-- ХУДШИЙ (idx=8)" if i == 8 else ""
@@ -857,10 +857,12 @@ def main_execution():
                  layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
                  layer_w_norms, layer_w_maxabs, layer_w_nonfinite,
                  muon_orth_resid, muon_worst_leaf_idx,
-                 group_grad_norms, group_weight_norms
-                 muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs) = compiled_apply(
+                 group_grad_norms, group_weight_norms,
+                 muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs, 
+                 muon_mean_orth_resid) = compiled_apply(
                     params, opt_state, accum_grads, accum_steps, assignment_frac_arr
                 )
+                
                 if micro_step < 30:
                     jax.block_until_ready(params)
                 _t_apply_total = time.perf_counter() - _t_apply
@@ -903,16 +905,7 @@ def main_execution():
 
                 _muon_orth_resid_val = float(jax.device_get(muon_orth_resid))
                 _muon_worst_idx_val = int(jax.device_get(muon_worst_leaf_idx))  # у вас уже есть muon_worst_leaf_idx в unpacking
-                _muon_worst_grad_norm_val = float(jax.device_get(muon_worst_leaf_grad_norm))
-                _muon_worst_grad_maxabs_val = float(jax.device_get(muon_worst_leaf_grad_maxabs))
-
-                if _MUON_LEAF_PATHS and 0 <= _muon_worst_idx_val < len(_MUON_LEAF_PATHS):
-                    _muon_worst_path = _MUON_LEAF_PATHS[_muon_worst_idx_val]
-                else:
-                    _muon_worst_path = f"<idx={_muon_worst_idx_val}, путь неизвестен>"
-
-                _muon_orth_resid_val = float(jax.device_get(muon_orth_resid))
-                _muon_worst_idx_val = int(jax.device_get(muon_worst_leaf_idx))
+                _muon_mean_orth_resid_val = float(jax.device_get(muon_mean_orth_resid))
                 _muon_worst_grad_norm_val = float(jax.device_get(muon_worst_leaf_grad_norm))
                 _muon_worst_grad_maxabs_val = float(jax.device_get(muon_worst_leaf_grad_maxabs))
 
@@ -934,15 +927,12 @@ def main_execution():
                 _layer_w_nonfinite_np = jax.device_get(layer_w_nonfinite)
                 _zclip_diag_np = jax.device_get(zclip_diag)
 
-                # ФИКС (этот пасс -- НОВОЕ, диагностика по оптимизаторам,
-                # детальнее): L2-норма градиента И весов ПО КАЖДОЙ
-                # optimizer-группе -- видно "что растёт", не только
-                # булевый nonfinite-флаг.
+                # ФИКС: только device_get здесь -- заполнение
+                # wandb_step_diag_metrics происходит НИЖЕ, после того как
+                # словарь реально создан (см. ниже).
                 _group_grad_norms_np = jax.device_get(group_grad_norms)
                 _group_weight_norms_np = jax.device_get(group_weight_norms)
-                for _name, _gn, _wn in zip(_DIAG_GROUPS, _group_grad_norms_np, _group_weight_norms_np):
-                    wandb_step_diag_metrics[f"group_grad_norm/{_name}"] = float(_gn)
-                    wandb_step_diag_metrics[f"group_weight_norm/{_name}"] = float(_wn)
+
                 _layer_diag_metrics = {}
                 for _tag, _gn, _gm, _gnf, _wn, _wm, _wnf in zip(
                     _PARAM_LAYER_TAGS, _layer_grad_norms_np, _layer_grad_maxabs_np, _layer_grad_nonfinite_np,
@@ -959,7 +949,6 @@ def main_execution():
                     _layer_diag_metrics[f"layer_w_maxabs/{_tag}"] = float(_wm)
                     _layer_diag_metrics[f"layer_w_nonfinite/{_tag}"] = int(bool(_wnf))
 
-
                 _nonfinite_groups_this_step = [
                     name for name, flag in zip(_DIAG_GROUPS, _group_flags_np) if bool(flag)
                 ]
@@ -975,6 +964,7 @@ def main_execution():
                     "train/clip_factor": _clip_factor_val,
                     "train/param_clip_triggered": int(_was_clipped_val),
                     "train/muon_orth_resid": _muon_orth_resid_val,
+                    "train/muon_orth_resid_mean": _muon_mean_orth_resid_val,   # НОВОЕ
                     "train/muon_worst_leaf_idx": _muon_worst_idx_val,
                     "train/muon_worst_leaf_path": _muon_worst_path,
                     "train/muon_worst_leaf_grad_norm": _muon_worst_grad_norm_val,
