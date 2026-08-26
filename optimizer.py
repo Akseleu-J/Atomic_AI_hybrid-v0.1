@@ -180,41 +180,36 @@ def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
 
 def _muon_ns_iterate(X, ns_steps: int = 5):
     a, b, c = 3.4445, -4.7750, 2.0315
-    
-    # --- КЛЮЧЕВОЕ: всегда работаем с меньшей квадратной матрицей ---
+
     was_tall = X.shape[-2] > X.shape[-1]
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
-    
-    # ФИКС (synthetic_muon_test.py, Проверка 3): норма без запаса даёт
-    # sv_max(X0)≈1.0 ровно на границе устойчивости квинтики KJ -- на
-    # низкоранговых матрицах (conv_w, rank<<d) это даёт наблюдаемую
-    # осцилляцию/дивергенцию с ростом ns_steps (0.42 -> 0.97 -> 0.43 ->
-    # 0.97 на ns=5/10/15/20). *1.01 гарантирует sv_max(X0) строго < 1,
-    # закрывает разрыв ценой чуть более медленной сходимости на
-    # well-conditioned матрицах (пренебрежимо).
+
+    # ФИКС: margin *1.01 -- гарантирует sv_max(X0) строго < 1 перед стартом
+    # квинтики. Без margin деление на чистую Frobenius-норму даёт
+    # sv_max≈1.0 ровно на границе устойчивости NS(5), что даёт наблюдаемую
+    # осцилляцию на низкоранговых/rank-deficient матрицах (conv_w и т.п.).
     norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
     X = X / (norm * 1.01 + 1e-7)
-    
+
     for _ in range(ns_steps):
         A = X @ jnp.swapaxes(X, -2, -1)
         B = b * A + c * (A @ A)
         X = a * X + B @ X
-    
+
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
-    
+
     return X
 
 
 def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
-    """ФИКС: ns_steps по умолчанию поднят 5 -> 7 -- synthetic_muon_test.py
-    Проверка 2 показала разрыв ~4-8 до синтетического full-rank потолка
-    на квадратных (768,768) параметрах при ns_steps=5 (это не структурная
-    недостижимость, а просто мало итераций для d=768 -- потолок сам по
-    себе не 0, но реальный градиент был заметно выше даже потолка).
-    Экстремально прямоугольные MoE w1/w2 выведены из-под Muon отдельным
-    патчем (_label_leaf), т.к. для них большего ns_steps недостаточно."""
+    """ФИКС: ns_steps 5 -> 7. После патча 2 (relabel w1/w2/conv_w -> Lion)
+    под Muon остаются в основном квадратные (768,768) веса, для которых
+    разрыв "потолок vs реальный" объясняется НЕДОстатком итераций
+    (потолок сам не 0, но реальный градиент ощутимо выше даже потолка при
+    ns_steps=5), а не структурной невозможностью формы -- лишние 2 матмула
+    здесь стоят недорого относительно остального forward/backward."""
     eps = 1e-7
 
     if w.ndim == 3:
@@ -238,24 +233,23 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
 def _muon_orth_diag(g, ns_steps=5):
     a, b, c = 3.4445, -4.7750, 2.0315
     X = jnp.asarray(g)
-    
+
     was_tall = X.shape[-2] > X.shape[-1]
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
-    
+
     norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
     eps = 1e-7
-    # ФИКС: тот же *1.01 margin, что в _muon_ns_iterate -- иначе
-    # диагностика меряет НЕ ту итерацию, что реально применяется.
+    # ФИКС: тот же margin, что в _muon_ns_iterate.
     X = X / (norm * 1.01 + eps)
     for _ in range(ns_steps):
         A = X @ jnp.swapaxes(X, -2, -1)
         B = b * A + c * (A @ A)
         X = a * X + B @ X
-    
+
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
-    
+
     if X.shape[-2] >= X.shape[-1]:
         prod = jnp.swapaxes(X, -2, -1) @ X
         n = X.shape[-1]
@@ -512,23 +506,21 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
             return "frozen"
         if "router" in path_str:
             return "adamw_nodecay"
-        # ФИКС (synthetic_muon_test.py, Проверка 3): conv_w -- (d_model, 4)
-        # или похожая форма, rank<=4 при d_model=768 -- структурно
-        # вырождена для спектральной ортогонализации, квинтика NS
-        # осциллирует/расходится на ней с ростом ns_steps вместо сходимости.
-        # Muon рассчитан на "нормальные" 2D веса, не на почти-1D covariance-
-        # подобные матрицы с экстремальным rank deficiency.
+        # ФИКС: conv_w -- rank<=4 при d_model=768, структурно вырождена
+        # для спектральной ортогонализации (см. synthetic_muon_test.py --
+        # осцилляция orth_resid с ростом ns_steps вместо сходимости).
         if "conv_w" in path_str:
             return "lion"
         if param.ndim >= 2:
             if "mamba" in path_str:
                 return "lion"
-            # ФИКС (уже было для w2): экстремальное соотношение сторон
-            # (4096/768≈5.3x) не даёт NS5 сойтись даже на синтетическом
-            # full-rank потолке (Проверка 2: потолок=19.7 при ns=5, само
-            # по себе намного выше нормального ~9 для квадратных матриц).
-            # w1 страдает ТЕМ ЖЕ структурным дефектом, что и w2 -- расширяем
-            # то же правило на него.
+            # ФИКС: РАСШИРЕНО с "только w2" на "w1 И w2" -- живые логи на
+            # шаге 12900-12902 показывают orth_resid=58-59 на ВСЕХ w2
+            # (routed И shared, все 8 блоков) стабильно, а fresh-init тест
+            # показал w1 тоже заметно хуже потолка (24-25 vs 19.7). Оба --
+            # экстремально прямоугольные (4096x768 / 768x4096, aspect
+            # ratio 5.3x) -- NS5 структурно не годится для этой формы
+            # независимо от того, w1 это или w2.
             if ("w1" in path_str or "w2" in path_str) and (
                 "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
             ):
