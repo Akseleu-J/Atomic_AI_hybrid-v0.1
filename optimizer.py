@@ -222,6 +222,7 @@ class MuonState(NamedTuple):
     worst_leaf_idx: jnp.ndarray
     worst_leaf_grad_norm: jnp.ndarray      # НОВОЕ
     worst_leaf_grad_maxabs: jnp.ndarray    # НОВОЕ
+    mean_orth_resid: jnp.ndarray    
 
 class ZClipState(NamedTuple):
     ema_mean: jnp.ndarray
@@ -279,6 +280,7 @@ def extract_muon_diagnostics(opt_state):
     idx_values = collect_by_leaf_name(opt_state, "worst_leaf_idx")
     norm_values = collect_by_leaf_name(opt_state, "worst_leaf_grad_norm")
     maxabs_values = collect_by_leaf_name(opt_state, "worst_leaf_grad_maxabs")
+    mean_values = collect_by_leaf_name(opt_state, "mean_orth_resid")   # НОВОЕ
     if not resid_values:
         z = jnp.array(0.0, dtype=jnp.float32)
         return z, jnp.array(-1, dtype=jnp.int32), z, z
@@ -286,7 +288,8 @@ def extract_muon_diagnostics(opt_state):
     worst_idx = idx_values[0].astype(jnp.int32) if idx_values else jnp.array(-1, dtype=jnp.int32)
     worst_norm = norm_values[0].astype(jnp.float32) if norm_values else jnp.array(0.0, dtype=jnp.float32)
     worst_maxabs = maxabs_values[0].astype(jnp.float32) if maxabs_values else jnp.array(0.0, dtype=jnp.float32)
-    return max_resid, worst_idx, worst_norm, worst_maxabs
+    mean_resid = mean_values[0].astype(jnp.float32) if mean_values else jnp.array(0.0, dtype=jnp.float32)   # НОВОЕ
+    return max_resid, worst_idx, worst_norm, worst_maxabs, mean_resid
 
 
 def build_muon_leaf_paths(params, label_fn):
@@ -387,6 +390,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
                 worst_leaf_idx=jnp.zeros([], jnp.int32),
                 worst_leaf_grad_norm=jnp.zeros([], jnp.float32),      # НОВОЕ
                 worst_leaf_grad_maxabs=jnp.zeros([], jnp.float32),    # НОВОЕ
+                mean_orth_resid=jnp.zeros([], jnp.float32),   # НОВОЕ
             )
 
         def update_fn(updates, state, params=None):
@@ -405,6 +409,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
            ])
           worst_idx = jnp.argmax(per_leaf_resid)
           step_orth_resid = per_leaf_resid[worst_idx]
+          step_mean_orth_resid = jnp.mean(per_leaf_resid)   # НОВОЕ
 
           # НОВОЕ: норма и maxabs градиента ИМЕННО худшего листа -- дёшево
           # (один-два reduce поверх уже посчитанного stacked tensor нельзя,
@@ -422,6 +427,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
               worst_leaf_idx=worst_idx.astype(jnp.int32),
               worst_leaf_grad_norm=worst_leaf_grad_norm,
               worst_leaf_grad_maxabs=worst_leaf_grad_maxabs,
+              mean_orth_resid=step_mean_orth_resid,
         )
 
         return optax.GradientTransformation(init_fn, update_fn)
