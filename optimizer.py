@@ -515,13 +515,26 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
             return "frozen"
         if "router" in path_str:
             return "adamw_nodecay"
+        # ФИКС (synthetic_muon_test.py, Проверка 3): conv_w -- (d_model, 4)
+        # или похожая форма, rank<=4 при d_model=768 -- структурно
+        # вырождена для спектральной ортогонализации, квинтика NS
+        # осциллирует/расходится на ней с ростом ns_steps вместо сходимости.
+        # Muon рассчитан на "нормальные" 2D веса, не на почти-1D covariance-
+        # подобные матрицы с экстремальным rank deficiency.
+        if "conv_w" in path_str:
+            return "lion"
         if param.ndim >= 2:
             if "mamba" in path_str:
                 return "lion"
-            # ФИКС: w2 (down-projection экспертов) → Lion.
-            # NS5 не сходится на rank-deficient градиентах w2 после активации,
-            # вызывая монотонный дрейф нормы и взрыв через 2-13k шагов.
-            if "w2" in path_str and ("expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str):
+            # ФИКС (уже было для w2): экстремальное соотношение сторон
+            # (4096/768≈5.3x) не даёт NS5 сойтись даже на синтетическом
+            # full-rank потолке (Проверка 2: потолок=19.7 при ns=5, само
+            # по себе намного выше нормального ~9 для квадратных матриц).
+            # w1 страдает ТЕМ ЖЕ структурным дефектом, что и w2 -- расширяем
+            # то же правило на него.
+            if ("w1" in path_str or "w2" in path_str) and (
+                "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
+            ):
                 return "lion"
             if muon_diagnostic_disable:
                 return "adamw_nodecay"
