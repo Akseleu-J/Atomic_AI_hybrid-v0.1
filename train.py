@@ -7,8 +7,30 @@ dataloader и сам цикл обучения -- жили в одном фай�
 Разнесено на:
   - checkpointing.py  -- HF Hub relay + orbax save/restore/async
   - train_setup.py    -- диагностика групп, mesh/shard/compile, dataloader
-  - wandb_logging.py  -- W&B логирование (новое)
+  - wandb_logging.py  -- W&B логирование
   - train.py (этот файл) -- только main_execution(), сам цикл обучения
+
+ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к оптимизатору, см. чат и
+train_setup.py's докстринг): compiled_apply теперь возвращает 19 значений
+(было 17) -- добавлены group_grad_norms/group_weight_norms в САМОМ КОНЦЕ,
+по тем же _DIAG_GROUPS = ("muon","lion","adamw_decay","adamw_nodecay",
+"frozen"), что и раньше давали только nonfinite-флаг. Unpacking приведён
+в соответствие, и обе новые метрики логируются в W&B на группу
+(optgroup_grad_norm/{name}, optgroup_weight_norm/{name}) -- детальнее, чем
+раньше, но по-прежнему ТОЛЬКО про оптимизатор, не про архитектуру ядра.
+
+Также убраны мёртвые блоки логирования kernel/activation-level sow()
+значений (layer_delta_*, layer_resid_*, mamba2_input_*, mamba2_A_*,
+mamba2_ssm_out_*, gdn2_input_*, gdn2_decay_a_*, gdn2_raw_out_*,
+gdn2_h_final_*, gdn2_out_*, mla_input_*, mla_out_*, gdn2_kernelstage_*,
+final_hidden_*) -- эти self.sow(...) вызовы удалены из model.py, и
+optimizer.py's compute_loss их больше не собирает и не кладёт в aux_info,
+так что aux_info.get(...) для них всегда возвращал бы None и блок был
+мёртвым кодом. Диагностика MoE-роутинга (expert_utilization,
+router_temp, min_col_norm, max_abs_logit_preclip, norm_x_mean/max/min,
+router_max_cos, moe_dropped_ratio, assignment_frac) НЕ убрана -- это не
+kernel/activation-уровень, а часть routing-логики самой MoE, которую
+compute_loss по-прежнему собирает и возвращает.
 
 ФИКС (этот пасс -- САМЫЙ ВАЖНЫЙ, см. chat): opt_state (momentum AdamW/
 Lion/Muon + внутренние step-счётчики "count", по которым optimizer.py's
@@ -27,54 +49,12 @@ non-finite взрывов, стабильно ловившихся на одно
 глобальном) диапазоне шагов после resume, независимо от того, на каком
 глобальном шаге сессия стартовала.
 
-Былаопробована промежуточная версия фикса (_resume_opt_state_count --
-принудительно выставлять "count" в global_step СРАЗУ ПОСЛЕ полного
-tx.init()), но она оказалась хуже исходного поведения: opt_state всё
-равно оставался холодным (нулевой momentum), а "count" теперь сразу
-указывал на позицию ДАЛЕКО ЗА пиком warmup -- то есть полный,
-недемпфированный LR применялся к абсолютно холодному оптимизатору с
-первого же эффективного шага после resume. Результат -- взрыв ещё
-БЫСТРЕЕ и ТЯЖЕЛЕЕ (за ~30-40 эффективных шагов вместо ~2300-2400). Этот
-патч был откачен.
-
 Правильное решение -- восстанавливать НАСТОЯЩИЙ opt_state (не просто его
 "count"), тем же принципом "graft-merge", что уже применялся для params
 (_compatible_restore_params, ниже переименована и обобщена в
 _generic_pytree_merge): читаем сырое содержимое чекпоинта БЕЗ навязывания
 строгой структуры target, рекурсивно мёрджим по путям в свежесозданную
-(tx.init(params)) структуру -- листья, чья форма совпадает (т.е. почти
-ВСЕ параметры/моменты, кроме router/expert_bias, чья структура и так
-изменилась и требует свежей инициализации независимо от momentum-вопроса),
-восстанавливаются как были: и mu/nu-моменты AdamW, и Lion-момент, и Muon's
-count, и сами lr_schedule-count'ы всех групп. Совпадающие несовпадающие/
-новые листья (router.kernel/router_temp/expert_bias) остаются со свежей
-инициализацией автоматически, как и раньше для params.
-
-Побочный эффект: resume_backoff(step) на глобальном шаге ~5000 теперь
-тоже происходит РОВНО ОДИН раз за всё обучение (т.к. count честно
-восстанавливается), а не на каждой сессии -- см. optimizer.py's докстринг.
-
-Вместе с этим (см. optimizer.py) warmup удлинён 10% -> 20%, а пик LR
-(adamw/lion) снижен ~0.6-0.67x -- обе меры дополняют восстановление
-честного opt_state: теперь холодного старта оптимизатора почти нет
-(кроме router/expert_bias, у которых он и был неизбежен из-за структурных
-изменений), а сама рампа LR более пологая и с более низким потолком,
-на случай если пик всё ещё органически высок для BlockDAR-архитектуры.
-
-==========================================================================
-КРИТИЧЕСКИЙ ФИКС (этот пасс -- РЕГРЕССИЯ, обнаружена при аудите): весь
-докстринг выше объясняет, ПОЧЕМУ opt_state должен честно восстанавливаться
-из чекпоинта. Но фактический код resume-блока ниже был найден в состоянии,
-где восстановленный opt_state (opt_state_merged) вычислялся, но тут же
-ИГНОРИРОВАЛСЯ (`params_merged, _ = _compatible_restore_params_and_opt_state(...)`
--- второе значение отбрасывалось в `_`), а вместо него на каждый resume
-собирался ПОЛНОСТЬЮ СВЕЖИЙ `opt_state = jax.device_put(tx.init(params), ...)`.
-То есть код тихо воспроизводил РОВНО ТОТ БАГ, который весь этот файл
-задокументирован как исправляющий: холодный momentum на каждом resume.
-
-Восстановлено намеренное поведение: `_compatible_restore_params_and_opt_state`
-теперь используется полностью (params И opt_state), см. блок RESUME ниже.
-==========================================================================
+(tx.init(params)) структуру.
 
 ФИКС (этот пасс, pytree mismatch на round_robin): dataloader_multi_source
 в режиме mode="round_robin" (и "sequential") кладёт в каждый батч
@@ -85,65 +65,20 @@ count, и сами lr_schedule-count'ы всех групп. Совпадающ�
 ФИКС (этот пасс, per-source fraction как гиперпараметры): SOURCE_FRACTIONS
 рядом с file_pairs.
 
-ФИКС (этот пасс, host-side group-diagnostics + W&B): per-group non-finite
-флаги, global grad norm, clip factor, флаг клипа параметров -- обычные
-outputs compiled_apply, разбираются и логируются в W&B на host-стороне.
-
 ФИКС (этот пасс -- router collapse на чекпоинте шага 2000): RESET_ROUTER_ON_RESUME
 -- см. комментарии у _reset_router_params/_reset_router_opt_state. После
 появления graft-merge (и для params, и теперь для opt_state) остаётся
 no-op предупреждением, т.к. router/expert_bias и так уже приходят свежими
 автоматически (несовпадающие по структуре листья).
 
-ФИКС (этот пасс -- router_temp runaway, см. train_setup.py's ФИКС #6):
-GmmMoEJ's router_temp -- decoupled decay-to-init в train_setup.py's
-apply_router_temp_decay уже решает это структурно; здесь только
-наблюдаемость (W&B).
-
-ФИКС (этот пасс -- pjit in_shardings length mismatch на compiled_train_micro):
-collinearity_coef -- явный 6-й позиционный jit-аргумент, передаётся как
-collinearity_coef_arr во ВСЕ вызовы compiled_train_micro.
-
-ФИКС (этот пасс -- ТОТ ЖЕ класс бага, но на compiled_apply): distributed_apply_step
-расширена ПЯТЫМ позиционным параметром assignment_frac_stacked -- собирается
-здесь в _assignment_frac_window по каждому микрошагу, усредняется и
-передаётся пятым позиционным аргументом в compiled_apply.
-
 ФИКС (этот пасс -- structural realign при несовпадении длины chain-tuple,
 см. чат): _generic_pytree_merge's list/tuple ветка раньше при несовпадении
-ДЛИНЫ tuple безусловно отбрасывала ВЕСЬ tuple целиком на fresh -- это
-означало, что ЛЮБОЕ изменение состава optax.chain (например, добавление
-burst_damper() первым элементом -- см. optimizer.py) на первом же resume
-после патча обнуляло ВСЕ momentum AdamW/Lion/Muon разом, а не только
-состояние нового элемента. См. _structural_tuple_realign ниже -- при
-несовпадении длины пытается сопоставить элементы ПО СТРУКТУРНОЙ СИГНАТУРЕ
-(имена полей NamedTuple / ключи dict / форма листа), а не по позиции --
-так новый BurstDamperState (уникальная сигнатура {'ema_norm'}, которой не
-было в старом чекпоинте) получает fresh-инициализацию точечно, а всё
-остальное (EmptyState клипа, MultiTransformState со всеми
-muon/lion/adamw-моментами) сопоставляется по структуре и восстанавливается
-честно, как и раньше.
+ДЛИНЫ tuple безусловно отбрасывала ВЕСЬ tuple целиком на fresh -- см.
+_structural_tuple_realign ниже.
 
-==========================================================================
-ФИКС (этот пасс -- краш "ValueError: too many values to unpack (expected 8)"
-на compiled_apply(...)): train_setup.py's distributed_apply_step (ФИКС #9
-"видимость zclip_skip" + ФИКС #10 "по-слойная диагностика") уже давно
-возвращает 16 значений (добавлены zclip_diag, layer_grad_norms/maxabs/
-nonfinite, layer_w_norms/maxabs/nonfinite, muon_orth_resid), и
-train_setup.py's compiled_apply's out_shardings уже подстроен под все 16 --
-но САМ call site здесь, в основном цикле обучения, всё ещё распаковывал
-только 8 старых значений. Расхождение молчало (никакого рантайм-эффекта
-до реального вызова compiled_apply) ровно до первого запуска, где оно
-сразу же валится с ValueError при первой попытке распаковки.
-
-Патч: unpacking приведён к полным 16 значениям, и все новые (muon_orth_resid,
-по-слойные grad/weight normы/maxabs/nonfinite, zclip_diag) теперь
-РЕАЛЬНО логируются в W&B каждый эффективный шаг -- ровно то, ради чего
-train_setup.py их и считает (см. его ФИКС #9/#10 докстринг), а не просто
-принимаются и отбрасываются. Non-finite на КОНКРЕТНОМ физическом слое
-дополнительно печатается в консоль как [LAYER-DIAG], тем же стилем, что
-уже есть у [DIAG]/[PARAM-DIAG] для групповой диагностики выше по файлу.
-==========================================================================
+ФИКС (локализация Muon orth_resid, см. train_setup.py): worst_leaf_idx
+из MuonState расшифровывается в реальный путь параметра через
+_MUON_LEAF_PATHS, импортированный из train_setup.py.
 """
 import os
 import time
@@ -172,7 +107,7 @@ from train_setup import (
     DATASET_FRACTION, DATASET_FRACTION_SEED,
     NONFINITE_CONSECUTIVE_LIMIT, NONFINITE_WINDOW_SIZE, NONFINITE_WINDOW_RATIO,
     SESSION_TIME_BUDGET_SECONDS,
-    _DIAG_GROUPS,   # ФИКС: нужно для host-side разбора group_nonfinite_flags
+    _DIAG_GROUPS,   # ФИКС: теперь это ОПТИМИЗАТОРСКИЕ группы (muon/lion/adamw_decay/adamw_nodecay/frozen)
 )
 import wandb_logging
 
@@ -194,7 +129,7 @@ from optimizer import ROUTER_COLLINEARITY_COEF
 # ==========================================================================
 RESUME_SOURCE = "hf_model"     # "bucket" | "hf_model" | "local_only"
 RESUME_BUCKET_ID = "atomic-ai-labs/atomic-light-v0.5-bucket"   # <-- ваш реальный bucket id
-RESUME_BUCKET_SUBDIR = "best_train"# <-- какой слот внутри бакета
+RESUME_BUCKET_SUBDIR = "best_val"# <-- какой слот внутри бакета
 
 # ==========================================================================
 # ФИКС (router collapse, см. докстринг модуля выше): переинициализация
@@ -294,14 +229,9 @@ def _structural_tuple_realign(fresh_seq, raw_seq, path):
     """fresh_seq/raw_seq -- list/tuple разной длины. Пытается сопоставить
     каждый элемент fresh_seq С ПЕРВЫМ ещё не использованным элементом
     raw_seq той же структурной сигнатуры (_tuple_elem_signature) --
-    порядок внутри каждой сигнатурной группы сохраняется (если сигнатур
-    несколько с одинаковым ключом, они сопоставляются по порядку
-    появления, не идеально надёжно в вырожденных случаях, но
-    ЗНАЧИТЕЛЬНО лучше, чем безусловный fresh для ВСЕГО tuple).
-    Элементы fresh_seq, для которых не нашлось соответствия в raw_seq
-    (например, только что добавленный optax-трансформ), остаются fresh
-    -- ровно так же, как несовпадающие/новые dict-ключи в основной
-    _generic_pytree_merge ветке.
+    порядок внутри каждой сигнатурной группы сохраняется. Элементы
+    fresh_seq, для которых не нашлось соответствия в raw_seq (например,
+    только что добавленный optax-трансформ), остаются fresh.
     Возвращает list той же длины, что fresh_seq.
     """
     used = [False] * len(raw_seq)
@@ -330,50 +260,10 @@ def _structural_tuple_realign(fresh_seq, raw_seq, path):
 
 
 def _generic_pytree_merge(fresh, raw, path=()):
-    """ФИКС (этот пасс -- ГЛАВНЫЙ патч, см. докстринг модуля): обобщённая
-    версия старой _compatible_restore_params's внутренней merge(), которая
-    умела рекурсировать ТОЛЬКО по dict-узлам -- этого хватало для params
-    (чисто dict-based pytree flax), но НЕ хватает для opt_state, чьи узлы
-    вдобавок включают NamedTuple (optax.ScaleByAdamState(count, mu, nu),
-    наш собственный MuonState(count), optax.EmptyState() для frozen/clip)
-    и обычные tuple/list (например, tx.chain внутри optax строит tuple
-    состояний по числу трансформаций).
-
-    Контракт ТОТ ЖЕ, что у старой функции: "fresh" -- только что созданная
-    (tx.init(params) / model.init(...)) структура правильной формы,
-    "raw" -- сырое, БЕЗ навязанной структуры содержимое чекпоинта
-    (mngr.restore(step, args=ocp.args.StandardRestore()), без item=).
-    Рекурсивно идёт по ОБОИМ деревьям параллельно:
-
-      - dict            -> рекурсия по ключам fresh; ключ, которого нет в
-                            raw (новый/переименованный лист, например
-                            router.kernel/router_temp/expert_bias) --
-                            остаётся fresh (свежая инициализация), с
-                            печатью [MERGE] предупреждения.
-      - NamedTuple       -> рекурсия по полям (_fields), ТОЛЬКО если raw --
-                            тоже NamedTuple с ТЕМИ ЖЕ полями (иначе тип
-                            optax-состояния сам изменился между версиями
-                            optax/кода -- fresh целиком, без попытки
-                            частичного мёржа полей вслепую).
-      - list/tuple       -> рекурсия поэлементно при равной длине; ПРИ
-                            НЕСОВПАДЕНИИ ДЛИНЫ (ФИКС этого пасса) --
-                            структурный realign через
-                            _structural_tuple_realign вместо безусловного
-                            fresh для ВСЕГО tuple -- см. докстринг модуля.
-      - leaf со .shape   -> восстанавливается из raw, если формы СОВПАДАЮТ
-                            (jnp.asarray(raw, dtype=fresh.dtype)); при
-                            несовпадении формы -- fresh, с [MERGE]
-                            предупреждением (тот же механизм, что уже был
-                            для params: например, если router.kernel
-                            когда-нибудь снова сменит форму).
-      - прочее (EmptyState(), optax.MaskedNode, None, Python int/float
-        без .shape) -- возвращается fresh КАК ЕСТЬ, без попытки сравнения:
-        для таких узлов либо нечего восстанавливать (EmptyState/MaskedNode
-        не хранят данных), либо сравнение бессмысленно.
-
-    ЧИСТАЯ функция (fresh, raw) -> merged, без побочных эффектов кроме
-    print()-диагностики (тот же стиль, что и у остальных merge/reset-
-    функций в этом файле)."""
+    """Обобщённая версия merge(): читает сырое содержимое чекпоинта БЕЗ
+    навязывания структуры target и рекурсивно мёрджит по путям в
+    свежесозданную структуру. Рекурсирует по dict / NamedTuple / list-tuple
+    / leaf-с-.shape; всё остальное возвращается как fresh."""
     # --- dict ---
     if isinstance(fresh, dict):
         out = {}
@@ -388,38 +278,6 @@ def _generic_pytree_merge(fresh, raw, path=()):
 
     # --- NamedTuple (optax states: ScaleByAdamState, MuonState, EmptyState,
     # optax.MultiTransformState, ...) ---
-    #
-    # ФИКС (КРИТИЧЕСКИЙ, этот пасс -- см. chat: opt_state count оказался 0
-    # на ВСЕХ группах после "успешного" restore, т.е. предыдущая версия
-    # этой ветки НИКОГДА реально не восстанавливала momentum): orbax's
-    # mngr.restore(..., args=StandardRestore()) БЕЗ item= (т.е. без
-    # навязывания целевой структуры target, что нам и нужно -- см.
-    # докстринг _compatible_restore_params_and_opt_state про причину)
-    # десериализует наши кастомные NamedTuple (optax.MultiTransformState,
-    # optax.ScaleByAdamState, наш MuonState) обратно как ОБЫЧНЫЕ dict (по
-    # именам полей), а НЕ как типизированные объекты нужного класса -- у
-    # dict нет атрибута "_fields", поэтому старая проверка
-    # `isinstance(raw, tuple) and hasattr(raw, "_fields")` была
-    # структурно обречена ВСЕГДА возвращать False везде, где в дереве
-    # встречается NamedTuple-обёртка -- т.е. фактически на САМОМ ВЕРХНЕМ
-    # уровне opt_state (уже на "inner_states"), откуда весь merge
-    # проваливался в fallback "оставляю свежую" для ЦЕЛОГО поддерева
-    # разом. Патч, добавивший этот merge, никогда реально не работал --
-    # opt_state оставался холодным (count=0) на каждом resume, несмотря
-    # на отсутствие ошибок и "правдоподобные" логи [MERGE]/[RESUME DEBUG].
-    #
-    # Фикс: helper _fields_source(raw, fields) -- пытается извлечь
-    # значение по каждому полю ТРЕМЯ способами (в порядке приоритета):
-    #   1. raw САМ NamedTuple того же типа -- getattr(raw, field)
-    #      (сохранено на случай, если в будущем orbax/target-режим всё же
-    #      вернёт типизированный объект).
-    #   2. raw -- dict с ключами-именами полей -- raw[field]
-    #      (ЭТО и есть реальный случай, наблюдаемый в логах).
-    #   3. raw -- plain list/tuple ТОЙ ЖЕ ДЛИНЫ, что fields -- raw[index]
-    #      позиционно (на случай другой версии orbax/сериализации, которая
-    #      могла бы отбросить имена полей вовсе).
-    # Если ни один способ не подошёл -- fallback на fresh с диагностикой,
-    # как и раньше.
     if isinstance(fresh, tuple) and hasattr(fresh, "_fields"):
         if not fresh._fields:
             # Пустой NamedTuple (например, optax.EmptyState()) -- нечего
@@ -462,13 +320,6 @@ def _generic_pytree_merge(fresh, raw, path=()):
             ]
             return type(fresh)(merged) if not isinstance(fresh, tuple) else tuple(merged)
         if isinstance(raw, (list, tuple)) and len(raw) != len(fresh):
-            # ФИКС (этот пасс -- см. докстринг модуля "structural
-            # realign"): раньше здесь был безусловный fallback на fresh
-            # для ВСЕГО tuple при несовпадении длины -- любое изменение
-            # состава optax.chain (например, добавление burst_damper())
-            # на первом resume после патча обнуляло ВСЕ momentum сразу.
-            # Пробуем сопоставить элементы по структурной сигнатуре
-            # вместо позиции -- см. _structural_tuple_realign.
             print(f"[MERGE] несовпадение длины list/tuple на {'/'.join(map(str, path))} "
                   f"(fresh={len(fresh)}, raw={len(raw)}) -- пробую структурный realign "
                   f"вместо полного сброса на свежую инициализацию...")
@@ -490,22 +341,11 @@ def _generic_pytree_merge(fresh, raw, path=()):
 
 
 def _compatible_restore_params_and_opt_state(mngr, step, fresh_params, fresh_opt_state):
-    """ФИКС (этот пасс -- см. докстринг модуля): читает ОБА поддерева
-    ("params" и "opt_state") чекпоинта ОДНИМ вызовом mngr.restore (без
-    строгого item=, т.е. без навязывания текущей структуры target -- та
-    же причина, что и раньше: router перестал быть nn.Dense{"kernel":...},
-    появился новый router_temp/expert_bias лист) и мёрджит КАЖДОЕ из них
+    """Читает ОБА поддерева ("params" и "opt_state") чекпоинта ОДНИМ
+    вызовом mngr.restore (без строгого item=) и мёрджит КАЖДОЕ из них
     через _generic_pytree_merge в соответствующую свежесозданную
-    структуру.
-
-    Если чекпоинт был сохранён ДО того, как opt_state вообще начал
-    сохраняться (не ожидается в этом проекте -- save_slot всегда пишет
-    оба ключа вместе, но защита от KeyError не помешает), opt_state
-    остаётся fresh_opt_state целиком, с предупреждением в консоль.
-
-    Возвращает (merged_params, merged_opt_state) -- НЕ шардированные
-    (raw host-side структуры) -- шардинг (jax.device_put) остаётся
-    ответственностью вызывающего кода, как и раньше для params."""
+    структуру. Возвращает (merged_params, merged_opt_state) -- НЕ
+    шардированные (raw host-side структуры)."""
     raw = mngr.restore(step, args=ocp.args.StandardRestore())  # без item -> без строгого таргета
     raw_params = raw["params"]
     merged_params = _generic_pytree_merge(fresh_params, raw_params)
@@ -535,7 +375,7 @@ def main_execution():
     mngr_best_val = make_manager(best_val_dir, max_to_keep=1)
 
     FORCE_FRESH_START = False# <-- поставьте False, чтобы вернуть обычный resume
-    RESUME_FROM_SLOT = "best_val"  # <-- используется только если FORCE_FRESH_START=False
+    RESUME_FROM_SLOT = "latest"  # <-- используется только если FORCE_FRESH_START=False
 
     # ФИКС (router collapse): см. докстринг модуля выше. После graft-merge
     # (и для params, и для opt_state) router/router_temp/expert_bias уже
@@ -619,25 +459,10 @@ def main_execution():
     # ФИКС (assignment_frac fallback shape): сколько MoE-блоков реально в
     # архитектуре -- GmmMoEJ висит на каждом BlockDAR (см. model.py), т.е.
     # ровно num_layers // layers_per_block блоков. Нужно для нулевого
-    # fallback-массива assignment_frac_arr в основном цикле ниже, на
-    # случай (структурная защита, не ожидаемый рабочий путь), если
-    # aux_info["assignment_frac"] почему-то не пришёл ни на одном микрошаге
-    # эффективного шага.
+    # fallback-массива assignment_frac_arr в основном цикле ниже.
     n_moe_layers = config.num_layers // config.layers_per_block
     n_experts_routed = config.num_experts - 1
 
-    # ==========================================================================
-    # ФИКС: per-source fraction теперь ГИПЕРПАРАМЕТРЫ здесь же, рядом с
-    # file_pairs, а не магические числа внутри кортежей ниже. dataloader_multi_source
-    # (train_setup.py) уже поддерживает 3-tuple (ids_path, lbls_path, fraction) --
-    # этот блок просто делает точку конфигурации явной и удобной для правки без
-    # необходимости лезть в сами пути. 1.0 = использовать источник полностью
-    # (старое поведение, обратная совместимость), 0.0 < frac < 1.0 = случайная
-    # подвыборка ИМЕННО этого источника (см. dataloader_multi_source per-source
-    # сэмплинг, применяется ДО train/val split и ДО глобального DATASET_FRACTION).
-    #
-    # Порядок ключей соответствует порядку источников в file_pairs ниже.
-    # ==========================================================================
     SOURCE_FRACTIONS = {
         "kodcode": 1.0,
         "math": 1.0,
@@ -680,9 +505,6 @@ def main_execution():
         ),  # syntheticcode
     ]
 
-    # ФИКС: file_pairs теперь состоит из 3-tuple (ids_path, lbls_path, fraction)
-    # -- распаковка ниже обновлена под 3 элемента (_frac здесь не используется,
-    # это чисто проверка существования файлов).
     for ids_path, lbls_path, _frac in file_pairs:
         if not os.path.exists(ids_path):
             raise FileNotFoundError(f"Не найден файл: {ids_path}")
@@ -717,46 +539,32 @@ def main_execution():
     print(f"[TPU] Компиляция XLA графа под {total_train_steps} эффективных шагов "
           f"({epochs} эпох(и) x {train_steps_per_epoch} шагов, accum={accum_steps})...")
 
-    # ФИКС: make_shard_and_compile (train_setup.py) теперь возвращает
-    # дополнительно lr_schedule 10-м элементом -- unpacking обновлён под
-    # 10 значений, иначе ValueError: too many values to unpack.
     (compiled_train_micro, compiled_apply, compiled_val, mesh, tx, model,
      param_sharding, opt_state_sharding, data_sharding, lr_schedule) = (
         make_shard_and_compile(config, total_train_steps, micro_batch_size, seq_len, accum_steps)
     )
     print(f"[TPU] Устройств в mesh: {mesh.shape['tpu_nodes']} (FSDP: params, state и батч шардированы).")
 
-    # ФИКС (layer-diagnostics logging, см. докстринг модуля -- раздел про
-    # unpacking-краш): _PARAM_LAYER_TAGS/_SOW_LAYER_TAGS -- модульные
-    # атрибуты train_setup.py, заполняемые КАК ПОБОЧНЫЙ ЭФФЕКТ
-    # make_shard_and_compile (нужны abstract_params, которые строятся
-    # только там) -- поэтому импортируются ЗДЕСЬ, сразу ПОСЛЕ вызова, а не
-    # в блоке "from train_setup import (...)" наверху файла (там они были
-    # бы ещё None). _PARAM_LAYER_TAGS используется ниже как порядок
-    # столбцов для layer_grad_*/layer_w_*-метрик, возвращаемых
-    # compiled_apply.
-    from train_setup import _PARAM_LAYER_TAGS, _SOW_LAYER_TAGS
+    # ФИКС (layer-diagnostics logging): _PARAM_LAYER_TAGS/_SOW_LAYER_TAGS/
+    # _MUON_LEAF_PATHS -- модульные атрибуты train_setup.py, заполняемые
+    # КАК ПОБОЧНЫЙ ЭФФЕКТ make_shard_and_compile -- поэтому импортируются
+    # ЗДЕСЬ, сразу ПОСЛЕ вызова.
+    from train_setup import _PARAM_LAYER_TAGS, _SOW_LAYER_TAGS, _MUON_LEAF_PATHS
 
+    if _MUON_LEAF_PATHS:
+        print(f"[MUON-DIAG] Всего muon-параметров: {len(_MUON_LEAF_PATHS)}")
+        for i, p in enumerate(_MUON_LEAF_PATHS):
+            marker = "  <-- ХУДШИЙ (idx=8)" if i == 8 else ""
+            print(f"  muon[{i}] = {p}{marker}")
+else:
+    print("[MUON-DIAG] ⚠️ _MUON_LEAF_PATHS пуст/None — локализация недоступна.")
     print(f"[LR-DIAG] warmup_steps={max(500, int(total_train_steps * 0.20))}, "
           f"total_train_steps={total_train_steps} -- opt_state (momentum + count) теперь "
           f"реально восстанавливается из чекпоинта при resume, так что warmup БОЛЬШЕ НЕ "
           f"перезапускается заново на каждой сессии (см. докстринг модуля).")
 
-    # ФИКС (pjit in_shardings length mismatch, см. докстринг модуля выше):
-    # collinearity_coef теперь ЯВНЫЙ 6-й позиционный jit-аргумент
-    # compiled_train_micro (train_setup.py's in_shardings уже ожидает
-    # ровно 6 элементов) -- строим его здесь ОДИН раз как jnp-скаляр той
-    # же величины, что optimizer.py's compute_loss уже использовал как
-    # дефолт (ROUTER_COLLINEARITY_COEF), и передаём этот же объект во
-    # ВСЕ вызовы compiled_train_micro ниже (и под memory-analysis .lower(),
-    # и в основном цикле обучения).
     collinearity_coef_arr = jnp.asarray(ROUTER_COLLINEARITY_COEF, dtype=jnp.float32)
 
-    # ФИКС (W&B): инициализация run'а. resume_id читаем из локального файла
-    # (не из orbax metadata.json, чтобы не трогать сигнатуры save_slot/
-    # save_slot_async в checkpointing.py) -- если он есть, W&B продолжит
-    # существующий run вместо создания нового при каждом рестарте
-    # Kaggle-сессии, и графики (loss/step) останутся непрерывными.
     wandb_id_path = os.path.join(ckpt_root, "wandb_run_id.txt")
     _resume_wandb_id = None
     if not FORCE_FRESH_START and os.path.exists(wandb_id_path):
@@ -826,13 +634,6 @@ def main_execution():
 
     wandb_logging.log_metrics(0, {"model/total_params": total_params, "model/weights_gb": weights_bytes / 1e9})
 
-    # ФИКС (главный патч, см. докстринг модуля): fresh_opt_state строится
-    # здесь и ДЕРЖИТСЯ рядом как "структурный шаблон" для
-    # _generic_pytree_merge ниже -- переменная `opt_state` может быть
-    # переприсвоена восстановленным (merged) значением в resume-блоке, но
-    # fresh_opt_state (правильная СТРУКТУРА на fresh params) нужна ИМЕННО
-    # для этого merge-вызова, поэтому сохраняем её под отдельным именем
-    # ДО входа в resume-блок.
     fresh_opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
     opt_state = fresh_opt_state
 
@@ -846,23 +647,6 @@ def main_execution():
         print(f"[RESUME] ⬆️ Restoring step {resume_step} из 'latest' (совместимый merge, "
               f"params И opt_state)...")
         try:
-            # ==================================================================
-            # КРИТИЧЕСКИЙ ФИКС (этот пасс, см. докстринг модуля -- РЕГРЕССИЯ):
-            # здесь ранее было найдено:
-            #
-            #   params_merged, _ = _compatible_restore_params_and_opt_state(
-            #       mngr_latest, resume_step, params, fresh_opt_state
-            #   )  # opt_state игнорируем
-            #   params = jax.device_put(params_merged, param_sharding)
-            #   opt_state = jax.device_put(tx.init(params), opt_state_sharding)
-            #
-            # -- то есть восстановленный opt_state вычислялся ценой полного
-            # чтения чекпоинта, а затем ВЫБРАСЫВАЛСЯ (`_`), и вместо него
-            # ставился полностью холодный tx.init(params). Это ровно баг,
-            # который весь докстринг этого файла объясняет как исправленный
-            # -- регрессия отменена, opt_state снова восстанавливается по
-            # назначению.
-            # ==================================================================
             params_merged, opt_state_merged = _compatible_restore_params_and_opt_state(
                 mngr_latest, resume_step, params, fresh_opt_state
             )
@@ -874,16 +658,11 @@ def main_execution():
             embed_max = float(jnp.max(jnp.abs(embed_weights)))
             print(f"[DIAG] embed norm: {embed_norm:.3f}, max abs: {embed_max:.3f}")
 
-            # 4. Обнуляем аккумулятор градиентов (accum_grads НЕ является
-            #    частью персистентного состояния оптимизатора -- это чисто
-            #    внутрисессионный буфер, обнулять его при каждом resume
-            #    корректно и раньше, и сейчас).
             accum_grads = jax.jit(
                 lambda p: jax.tree_util.tree_map(jnp.zeros_like, p),
                 out_shardings=param_sharding
             )(params)
 
-            # 5. Метаданные (если есть) -- читаем из metadata.json
             meta_path = os.path.join(latest_dir, str(resume_step), "metadata.json")
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
@@ -896,11 +675,6 @@ def main_execution():
                 global_step = resume_step
             global_rng = jax.random.PRNGKey(42 + global_step)
 
-            # 5.5. ФИКС (диагностика, см. докстринг модуля): печатаем
-            #      восстановленные "count"-значения из opt_state -- чтобы
-            #      сразу видеть, что merge реально сработал (count близок
-            #      к global_step, а НЕ 0), без необходимости лезть в
-            #      device-side структуру вручную.
             def _find_counts(path, leaf):
                 path_str = path_to_str(path)
                 if "count" in path_str and hasattr(leaf, "shape") and leaf.ndim == 0:
@@ -909,7 +683,6 @@ def main_execution():
                 return leaf
             jax.tree_util.tree_map_with_path(_find_counts, opt_state)
 
-            # 6. Валидация восстановленных параметров
             param_norm = float(jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(params))))
             has_nan = any(bool(jnp.any(jnp.isnan(x))) for x in jax.tree_util.tree_leaves(params))
             print(f"[RESUME DEBUG] param_norm={param_norm:.4f}, has_nan={has_nan}")
@@ -918,16 +691,11 @@ def main_execution():
 
             print(f"[RESUME] ✅ Restored: step={global_step}, best_val={best_val_loss:.4f}, best_train={best_train_loss:.4f}")
 
-            # 7. ФИКС (router collapse): после graft-merge (params+opt_state)
-            #    router.kernel/router_temp/expert_bias уже приходят свежими
-            #    автоматически. Повторный явный сброс здесь избыточен --
-            #    оставлен как предупреждение, а не как действие.
             if RESET_ROUTER_ON_RESUME:
                 print("[ROUTER-RESET] ⚠️ RESET_ROUTER_ON_RESUME=True, но после graft-merge "
                       "router уже свежий -- пропускаю повторный явный сброс.")
                 wandb_logging.log_metrics(global_step, {"router/reset_applied": 0})
 
-            # 8. Если восстанавливали не из "latest" (override) -- перерегистрируем в latest
             if RESUME_FROM_SLOT != "latest":
                 print(f"[RESUME OVERRIDE] Перерегистрирую шаг {global_step} в mngr_latest "
                       f"(бухгалтерия CheckpointManager была в обход при копировании)...")
@@ -950,21 +718,13 @@ def main_execution():
         file_pairs, micro_batch_size, data_sharding, seq_len=seq_len,
         dataset_fraction=DATASET_FRACTION, fraction_seed=DATASET_FRACTION_SEED,
         skip_batches=skip_micro_steps,
-        mode="mixed",  # ФИКС: было "round_robin" -- переход на пропорциональный
-                         # размеру источника сэмплинг, устраняет ~6x переупотребление
-                         # kodcode относительно его естественной доли (2.7% пула).
-                         # round_robin давал каждому источнику равную частоту (16.7%)
-                         # независимо от размера -- см. чат/train_setup.py докстринг.
+        mode="mixed",
     )
 
     _dummy_batch = {
         "input_ids": jax.device_put(jnp.zeros((micro_batch_size, seq_len), dtype=jnp.int32), data_sharding),
         "labels": jax.device_put(jnp.zeros((micro_batch_size, seq_len), dtype=jnp.int32), data_sharding),
     }
-    # ФИКС (pjit in_shardings length mismatch): compiled_train_micro теперь
-    # требует ровно 6 позиционных аргументов (см. докстринг модуля выше) --
-    # шестым передаём collinearity_coef_arr, тот же объект, что и в
-    # основном цикле ниже.
     _lowered = compiled_train_micro.lower(
         params, opt_state, _dummy_batch, global_rng, accum_grads, collinearity_coef_arr
     )
@@ -988,11 +748,6 @@ def main_execution():
     _accum_window = deque(maxlen=accum_steps)
     _micro_grad_norms = []   # сбор per‑micro норм для текущего эффективного шага
     _burst_dumped_steps = set()
-    # ФИКС (compiled_apply 5-й позиционный аргумент): копит
-    # aux_info["assignment_frac"] (форма (n_moe_layers, E_routed)) с
-    # каждого микрошага ОДНОГО эффективного шага -- обычный Python-список
-    # (не deque с maxlen, т.к. явно сбрасывается сразу после использования
-    # на apply-шаге, а не скользящее окно как _accum_window).
     _assignment_frac_window = []
 
     def _save_all_needed_slots(step, cur_train_loss_val, force_latest=True, tag="", skip_hf_upload=False):
@@ -1047,14 +802,6 @@ def main_execution():
                 break
             _t_data = time.perf_counter() - _t0
 
-            # ФИКС: round_robin/sequential кладут диагностический ключ
-            # "_source_idx" в батч -- compiled_train_micro скомпилирован
-            # под строгую pjit-сигнатуру {"input_ids","labels"} (см.
-            # train_setup.py in_shardings), лишний ключ рушит pytree-match
-            # с ValueError "Mismatch details... 3 child keys". Достаём его
-            # здесь, ДО того как батч попадёт в compiled_train_micro или
-            # _accum_window. .pop(..., None) безопасен и для mixed-режима
-            # (там ключа нет -- просто вернёт None).
             source_idx = batch.pop("_source_idx", None)
 
             _accum_window.append({
@@ -1067,10 +814,6 @@ def main_execution():
             total_tokens_processed += micro_batch_size * seq_len
 
             _t1 = time.perf_counter()
-            # ФИКС (pjit in_shardings length mismatch, см. докстринг модуля
-            # выше): шестой позиционный аргумент collinearity_coef_arr
-            # обязателен -- compiled_train_micro скомпилирован с
-            # in_shardings длины 6.
             params, opt_state, accum_grads, train_loss, aux_info, micro_grad_norm = compiled_train_micro(
                 params, opt_state, batch, step_rng, accum_grads, collinearity_coef_arr
             )
@@ -1079,11 +822,6 @@ def main_execution():
                 jax.block_until_ready(train_loss)
             _t_compute = time.perf_counter() - _t1
 
-            # ФИКС (compiled_apply 5-й позиционный аргумент): копим
-            # assignment_frac с КАЖДОГО микрошага -- aux_info["assignment_frac"]
-            # уже возвращается compiled_train_micro (собран в optimizer.py's
-            # compute_loss через collect_by_leaf_name), просто раньше нигде
-            # не сохранялся между микрошагами одного эффективного шага.
             if aux_info.get("assignment_frac") is not None:
                 _assignment_frac_window.append(jax.device_get(aux_info["assignment_frac"]))
 
@@ -1092,14 +830,6 @@ def main_execution():
 
                 _params_pre_apply_host = jax.tree_util.tree_map(jax.device_get, params)
 
-                # ФИКС (compiled_apply 5-й позиционный аргумент): усредняем
-                # по всем микрошагам ЭТОГО эффективного шага (тот же смысл,
-                # что accum_grads усредняется в distributed_apply_step через
-                # n_accum) и сбрасываем окно для следующего эффективного
-                # шага сразу после использования. Fallback -- нулевой
-                # массив нужной формы (n_moe_layers, n_experts_routed),
-                # если по какой-то причине окно пусто (не ожидается на
-                # практике, пока в архитектуре есть MoE и deterministic=False).
                 if _assignment_frac_window:
                     assignment_frac_arr = jnp.asarray(
                         np.mean(np.stack(_assignment_frac_window), axis=0), dtype=jnp.float32
@@ -1114,20 +844,20 @@ def main_execution():
                 _assignment_frac_window = []
 
                 _t_apply = time.perf_counter()
-                # ФИКС (см. докстринг модуля -- "ValueError: too many
-                # values to unpack (expected 8)"): compiled_apply
-                # (train_setup.py's distributed_apply_step, ФИКС #9/#10)
-                # возвращает 16 значений, не 8 -- unpacking приведён в
-                # соответствие с реальной сигнатурой. Новые значения
-                # (zclip_diag, layer_grad_*/layer_w_*, muon_orth_resid)
-                # разбираются и логируются в W&B ниже, сразу после
-                # существующей group-diagnostics секции.
+                # ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к
+                # оптимизатору, см. докстринг модуля): compiled_apply
+                # теперь возвращает 19 значений -- добавлены
+                # group_grad_norms/group_weight_norms в самом конце,
+                # по _DIAG_GROUPS = ("muon","lion","adamw_decay",
+                # "adamw_nodecay","frozen").
                 (params, opt_state, accum_grads, was_finite,
                  global_norm, clip_factor, group_nonfinite_flags, was_clipped,
                  zclip_diag,
                  layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
                  layer_w_norms, layer_w_maxabs, layer_w_nonfinite,
-                 muon_orth_resid) = compiled_apply(
+                 muon_orth_resid, muon_worst_leaf_idx,
+                 group_grad_norms, group_weight_norms
+                 muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs) = compiled_apply(
                     params, opt_state, accum_grads, accum_steps, assignment_frac_arr
                 )
                 if micro_step < 30:
@@ -1136,12 +866,7 @@ def main_execution():
 
                 step_was_finite = bool(jax.device_get(was_finite))
 
-                # ФИКС: раньше это печаталось внутри jit через debug.print
-                # (и НЕ логировалось в W&B вообще). Теперь -- обычный
-                # host-side разбор, ноль host-callback каналов, полное
-                # покрытие W&B.
                 _global_norm_val = float(jax.device_get(global_norm))
-                # Логирование per‑micro градиентных норм
                 if _micro_grad_norms:
                   max_micro = max(_micro_grad_norms)
                   mean_micro = sum(_micro_grad_norms) / len(_micro_grad_norms)
@@ -1150,7 +875,7 @@ def main_execution():
                   "train/micro_grad_norm_mean": mean_micro,
                   }
                   wandb_logging.log_metrics(global_step + 1, wandb_step_metrics)
-                  _micro_grad_norms = []   # очистка для следующего эффективного шага
+                  _micro_grad_norms = []
                 if _global_norm_val > 20.0:
                     burst_streak += 1
                 else:
@@ -1165,7 +890,6 @@ def main_execution():
                         for i, entry in enumerate(_accum_window):
                             np.save(os.path.join(snap_dir, f"micro_{i}_input_ids.npy"), entry["input_ids"])
                         _burst_dumped_steps.add(global_step)
-                    # остальное (alert, сброс burst_streak) – уже есть
                     wandb_logging.log_alert(
                         "Burst guard triggered",
                         f"global_grad_norm > 20 три шага подряд на step={global_step + 1}",
@@ -1176,17 +900,19 @@ def main_execution():
                 _group_flags_np = jax.device_get(group_nonfinite_flags)
                 _was_clipped_val = bool(jax.device_get(was_clipped))
 
-                # ==============================================================
-                # ФИКС (этот пасс -- логирование новых полей compiled_apply в
-                # W&B, см. докстринг модуля): muon_orth_resid + по-слойные
-                # (grad/weight) norm/maxabs/nonfinite + zclip_diag. Всё это
-                # уже реально считается внутри distributed_apply_step
-                # (train_setup.py's ФИКС #9/#10) -- раньше принималось этим
-                # файлом и никак не использовалось. device_get здесь
-                # host-side, вне jit, той же ценой, что и остальная
-                # диагностика в этом блоке.
-                # ==============================================================
                 _muon_orth_resid_val = float(jax.device_get(muon_orth_resid))
+                _muon_worst_idx_val = int(jax.device_get(muon_worst_leaf_idx))  # у вас уже есть muon_worst_leaf_idx в unpacking
+                if _MUON_LEAF_PATHS and 0 <= _muon_worst_idx_val < len(_MUON_LEAF_PATHS):
+                    _muon_worst_path = _MUON_LEAF_PATHS[_muon_worst_idx_val]
+                else:
+                    _muon_worst_path = f"<idx={_muon_worst_idx_val}, путь неизвестен>"
+
+                if _muon_orth_resid_val > 5.0:
+                    print(f"[MUON-DIAG] ⚠️ Newton-Schulz orth_resid={_muon_orth_resid_val:.3f} "
+                          f"на global_step={global_step + 1} -- ХУДШИЙ ПАРАМЕТР: {_muon_worst_path}")
+
+                wandb_step_diag_metrics["train/muon_worst_leaf_idx"] = _muon_worst_idx_val
+                wandb_step_diag_metrics["train/muon_worst_leaf_path"] = _muon_worst_path
 
                 _layer_grad_norms_np = jax.device_get(layer_grad_norms)
                 _layer_grad_maxabs_np = jax.device_get(layer_grad_maxabs)
@@ -1195,6 +921,13 @@ def main_execution():
                 _layer_w_maxabs_np = jax.device_get(layer_w_maxabs)
                 _layer_w_nonfinite_np = jax.device_get(layer_w_nonfinite)
                 _zclip_diag_np = jax.device_get(zclip_diag)
+
+                # ФИКС (этот пасс -- НОВОЕ, диагностика по оптимизаторам,
+                # детальнее): L2-норма градиента И весов ПО КАЖДОЙ
+                # optimizer-группе -- видно "что растёт", не только
+                # булевый nonfinite-флаг.
+                _group_grad_norms_np = jax.device_get(group_grad_norms)
+                _group_weight_norms_np = jax.device_get(group_weight_norms)
 
                 _layer_diag_metrics = {}
                 for _tag, _gn, _gm, _gnf, _wn, _wm, _wnf in zip(
@@ -1212,18 +945,13 @@ def main_execution():
                     _layer_diag_metrics[f"layer_w_maxabs/{_tag}"] = float(_wm)
                     _layer_diag_metrics[f"layer_w_nonfinite/{_tag}"] = int(bool(_wnf))
 
-                if _muon_orth_resid_val > 5.0:
-                    print(f"[MUON-DIAG] ⚠️ Newton-Schulz orth_resid={_muon_orth_resid_val:.3f} "
-                          f"на global_step={global_step + 1} -- худший muon-параметр этого шага "
-                          f"плохо сходится к ортогональному направлению (см. optimizer.py's "
-                          f"_muon_orth_diag).")
 
                 _nonfinite_groups_this_step = [
                     name for name, flag in zip(_DIAG_GROUPS, _group_flags_np) if bool(flag)
                 ]
                 if _nonfinite_groups_this_step:
-                    print(f"[DIAG] ⚠️ non-finite градиент в группах: {_nonfinite_groups_this_step} "
-                          f"на global_step={global_step + 1}")
+                    print(f"[DIAG] ⚠️ non-finite градиент в оптимизаторских группах: "
+                          f"{_nonfinite_groups_this_step} на global_step={global_step + 1}")
                 if _was_clipped_val:
                     print(f"[PARAM-DIAG] ⚠️ Обнаружен параметр с |w|>=100 ДО клипа -- веса разрослись "
                           f"на global_step={global_step + 1}")
@@ -1233,9 +961,15 @@ def main_execution():
                     "train/clip_factor": _clip_factor_val,
                     "train/param_clip_triggered": int(_was_clipped_val),
                     "train/muon_orth_resid": _muon_orth_resid_val,
+                    "train/muon_worst_leaf_idx": _muon_worst_idx_val,
                 }
-                for name in _DIAG_GROUPS:
+                # ФИКС (этот пасс): за оптимизаторскую группу теперь пишем
+                # И nonfinite-флаг, И grad/weight L2-норму -- детальнее,
+                # чем просто "сломалось/не сломалось".
+                for name, gn, wn in zip(_DIAG_GROUPS, _group_grad_norms_np, _group_weight_norms_np):
                     wandb_step_diag_metrics[f"nonfinite/group_{name}"] = int(name in _nonfinite_groups_this_step)
+                    wandb_step_diag_metrics[f"optgroup_grad_norm/{name}"] = float(gn)
+                    wandb_step_diag_metrics[f"optgroup_weight_norm/{name}"] = float(wn)
                 for _zk, _zv in _zclip_diag_np.items():
                     wandb_step_diag_metrics[f"zclip/{_zk}"] = float(_zv)
                 wandb_step_diag_metrics.update(_layer_diag_metrics)
@@ -1244,7 +978,7 @@ def main_execution():
                 if not step_was_finite:
                     print(f"[WARNING] ⚠️ Non-finite градиент на global_step={global_step + 1} -- "
                           f"обновление ПРОПУЩЕНО, веса не изменены. Если это повторяется часто, "
-                          f"стоит посмотреть на LR/warmup или численную стабильность GDN-2/Mamba2/Muon.")
+                          f"стоит посмотреть на LR/warmup или численную стабильность оптимизаторских групп.")
                     wandb_logging.log_metrics(global_step + 1, {"train/step_skipped_nonfinite": 1})
 
                     snap_dir = os.path.join(ckpt_root, "nonfinite_snapshots", str(global_step + 1))
@@ -1258,12 +992,6 @@ def main_execution():
                         np.save(os.path.join(snap_dir, f"micro_{i}_input_ids.npy"), entry["input_ids"])
                         np.save(os.path.join(snap_dir, f"micro_{i}_labels.npy"), entry["labels"])
                         np.save(os.path.join(snap_dir, f"micro_{i}_step_rng.npy"), np.asarray(entry["step_rng"]))
-                    # ФИКС: source_idx теперь реально прокидывается в снапшот
-                    # (раньше был бы недоступен -- batch["_source_idx"] уже
-                    # ронял бы compiled_train_micro задолго до этой точки).
-                    # Делает рабочим то, что комментарий в train_setup.py уже
-                    # обещал: "если сработает non-finite, можно сразу узнать
-                    # источник-виновник".
                     with open(os.path.join(snap_dir, "SNAPSHOT_META.json"), "w") as f:
                         json.dump({
                             "n_micro": len(_accum_window),
@@ -1308,7 +1036,7 @@ def main_execution():
                         print(f"🛑 ✅ Сохранено ЛОКАЛЬНО на шаге {global_step} (HF-заливка пропущена ради скорости "
                               f"остановки -- при желании залейте вручную позже, локальный чекпоинт лежит в "
                               f"{latest_dir}/{global_step}). Разберитесь с причиной перед повторным запуском -- "
-                              f"см. [WARNING]/[FWD-DIAG]/[BWD-DIAG]/[PARAM-DIAG] логи выше для локализации источника.")
+                              f"см. [WARNING]/[DIAG]/[PARAM-DIAG]/[MUON-DIAG] логи выше для локализации источника.")
                     except Exception as e:
                         print(f"🛑 ❌ Save при автостопе не удался: {e}")
                     stopped_by_nonfinite_limit = True
@@ -1362,8 +1090,6 @@ def main_execution():
                         f"z={jax.device_get(aux_info['z_loss']):.5f}) | "
                         f"best_train={best_train_loss:.4f}"
                     )
-                    # ФИКС (W&B): та же информация, что уже печатается в лог,
-                    # плюс throughput (токены/сек) для графиков скорости.
                     tok_per_sec = (micro_batch_size * accum_steps * seq_len) / max(
                         (_t_compute + _t_apply_total) * accum_steps, 1e-6
                     )
@@ -1465,60 +1191,21 @@ def main_execution():
                         )
                         wandb_step_metrics["moe/dropped_ratio_max"] = float(dropped[worst_drop_layer])
 
-                    # ==============================================================
-                    # ФИКС (этот пасс -- W&B для sown per-layer diagnostics из
-                    # optimizer.py's _DIAG_LEAF_NAMES / model.py's self.sow(...)):
-                    # раньше эти значения собирались в aux_info (см.
-                    # optimizer.py's compute_loss -- diag_stacked) и никогда
-                    # никуда не логировались отсюда. Логируем worst-case
-                    # (max по слоям для *_maxabs, min по слоям для *_isfinite)
-                    # каждый раз, когда доступно -- дёшево (уже собрано), и
-                    # даёт видимость в W&B без необходимости включать
-                    # GDN2_FWD_DIAG=1.
-                    # ==============================================================
-                    for _sow_name in (
-                        "layer_delta_maxabs", "layer_resid_maxabs",
-                        "mamba2_input_maxabs", "mamba2_A_maxabs",
-                        "mamba2_ssm_out_pre_norm_maxabs", "mamba2_ssm_out_maxabs",
-                        "gdn2_input_maxabs", "gdn2_decay_a_maxabs",
-                        "gdn2_raw_out_maxabs", "gdn2_h_final_maxabs", "gdn2_out_maxabs",
-                        "mla_input_maxabs", "mla_out_maxabs",
-                        "gdn2_kernelstage_aqk_maxabs", "gdn2_kernelstage_akk_maxabs",
-                        "gdn2_kernelstage_a_wy_inverse_maxabs", "gdn2_kernelstage_w_pseudo_maxabs",
-                        "gdn2_kernelstage_u_maxabs", "gdn2_kernelstage_kg_maxabs",
-                        "gdn2_kernelstage_qg_maxabs",
-                    ):
-                        _v = aux_info.get(_sow_name)
-                        if _v is not None:
-                            wandb_step_metrics[f"sow/{_sow_name}_max"] = float(jnp.max(jax.device_get(_v)))
-
-                    for _sow_name in (
-                        "layer_delta_isfinite", "layer_resid_isfinite",
-                        "mamba2_input_isfinite", "mamba2_ssm_out_pre_norm_isfinite",
-                        "gdn2_input_isfinite", "gdn2_raw_out_isfinite",
-                        "final_hidden_isfinite",
-                        "gdn2_kernelstage_aqk_isfinite", "gdn2_kernelstage_akk_isfinite",
-                        "gdn2_kernelstage_a_wy_inverse_isfinite", "gdn2_kernelstage_w_pseudo_isfinite",
-                        "gdn2_kernelstage_u_isfinite", "gdn2_kernelstage_kg_isfinite",
-                        "gdn2_kernelstage_qg_isfinite",
-                    ):
-                        _v = aux_info.get(_sow_name)
-                        if _v is not None:
-                            wandb_step_metrics[f"sow/{_sow_name}_min"] = float(jnp.min(jax.device_get(_v)))
-
-                    if aux_info.get("final_hidden_maxabs") is not None:
-                        # ФИКС (TypeError: only 0-dimensional arrays can be
-                        # converted to Python scalars): final_hidden_maxabs
-                        # can come back as a non-scalar array from
-                        # collect_by_leaf_name (same reason every other
-                        # *_maxabs field in this block is already wrapped
-                        # in jnp.max(...) before float() -- see
-                        # layer_delta_maxabs/gdn2_*_maxabs above). Bare
-                        # float() crashes the moment more than one value
-                        # is collected for this leaf name.
-                        wandb_step_metrics["sow/final_hidden_maxabs"] = float(
-                            jnp.max(jax.device_get(aux_info["final_hidden_maxabs"]))
-                        )
+                    # ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к
+                    # оптимизатору): блок логирования kernel/activation
+                    # sow()-метрик (layer_delta_*, layer_resid_*,
+                    # mamba2_input_*, mamba2_A_*, mamba2_ssm_out_*,
+                    # gdn2_input_*, gdn2_decay_a_*, gdn2_raw_out_*,
+                    # gdn2_h_final_*, gdn2_out_*, mla_input_*, mla_out_*,
+                    # gdn2_kernelstage_*, final_hidden_*) УДАЛЁН -- эти
+                    # self.sow(...) вызовы больше не существуют в
+                    # model.py, и optimizer.py's compute_loss их больше не
+                    # собирает (aux_info.get(...) для них всегда вернул бы
+                    # None). MoE-роутинг диагностика выше (expert_util,
+                    # router_temp, min_col_norm, max_abs_logit_preclip,
+                    # norm_x_*, router_max_cos, moe_dropped_ratio) НЕ
+                    # удалена -- это routing-логика, а не kernel-уровень,
+                    # и compute_loss её по-прежнему возвращает.
 
                     wandb_logging.log_metrics(global_step, wandb_step_metrics)
 
@@ -1625,10 +1312,6 @@ def main_execution():
 
     print("Обучение завершено (для этой сессии).")
 
-    # ФИКС: финальная сводка прогона -- фиксируется как W&B summary (не
-    # временной ряд), чтобы в таблице/сравнении ранов сразу были видны
-    # итоговые best_train/best_val, на каком шаге всё закончилось и по
-    # какой причине (обычное завершение / time budget / non-finite auto-stop).
     wandb_logging.set_summary({
         "final/best_train_loss": best_train_loss,
         "final/best_val_loss": best_val_loss,
