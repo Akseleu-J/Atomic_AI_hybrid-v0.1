@@ -490,6 +490,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P(None)),    # group_weight_norms  <-- НОВОЕ
             NamedSharding(mesh, P()),        # muon_worst_leaf_grad_norm    <-- НОВОЕ
             NamedSharding(mesh, P()),        # muon_worst_leaf_grad_maxabs  <-- НОВОЕ
+            NamedSharding(mesh, P()),        # muon_mean_orth_resid   <-- НОВОЕ
 
         ),
     )
