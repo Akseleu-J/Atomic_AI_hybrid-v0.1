@@ -182,22 +182,25 @@ def _muon_ns_iterate(X, ns_steps: int = 5):
     a, b, c = 3.4445, -4.7750, 2.0315
     
     # --- КЛЮЧЕВОЕ: всегда работаем с меньшей квадратной матрицей ---
-    # Для batched: shape=(..., m, n). Транспонировать последние 2 оси если m > n
     was_tall = X.shape[-2] > X.shape[-1]
     if was_tall:
-        X = jnp.swapaxes(X, -2, -1)  # аналог .mT в PyTorch
+        X = jnp.swapaxes(X, -2, -1)
     
-    # Нормализация по Frobenius (keepdims для совместимости с batched)
+    # ФИКС (synthetic_muon_test.py, Проверка 3): норма без запаса даёт
+    # sv_max(X0)≈1.0 ровно на границе устойчивости квинтики KJ -- на
+    # низкоранговых матрицах (conv_w, rank<<d) это даёт наблюдаемую
+    # осцилляцию/дивергенцию с ростом ns_steps (0.42 -> 0.97 -> 0.43 ->
+    # 0.97 на ns=5/10/15/20). *1.01 гарантирует sv_max(X0) строго < 1,
+    # закрывает разрыв ценой чуть более медленной сходимости на
+    # well-conditioned матрицах (пренебрежимо).
     norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
-    X = X / (norm + 1e-7)
+    X = X / (norm * 1.01 + 1e-7)
     
-    # NS-итерация (теперь A всегда маленькая: (..., min(m,n), min(m,n)))
     for _ in range(ns_steps):
-        A = X @ jnp.swapaxes(X, -2, -1)  # X @ X.mT
+        A = X @ jnp.swapaxes(X, -2, -1)
         B = b * A + c * (A @ A)
         X = a * X + B @ X
     
-    # Обратное транспонирование
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
     
@@ -231,7 +234,6 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 5):
 
 
 def _muon_orth_diag(g, ns_steps=5):
-    """Диагностика orth_resid — должна повторять логику _muon_ns_iterate"""
     a, b, c = 3.4445, -4.7750, 2.0315
     X = jnp.asarray(g)
     
@@ -241,8 +243,9 @@ def _muon_orth_diag(g, ns_steps=5):
     
     norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
     eps = 1e-7
-    safe_norm = jnp.where(norm < eps, jnp.ones_like(norm), norm)
-    X = X / safe_norm
+    # ФИКС: тот же *1.01 margin, что в _muon_ns_iterate -- иначе
+    # диагностика меряет НЕ ту итерацию, что реально применяется.
+    X = X / (norm * 1.01 + eps)
     for _ in range(ns_steps):
         A = X @ jnp.swapaxes(X, -2, -1)
         B = b * A + c * (A @ A)
@@ -251,7 +254,6 @@ def _muon_orth_diag(g, ns_steps=5):
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
     
-    # orth_resid = ||X^T X - I||_F
     if X.shape[-2] >= X.shape[-1]:
         prod = jnp.swapaxes(X, -2, -1) @ X
         n = X.shape[-1]
@@ -260,7 +262,6 @@ def _muon_orth_diag(g, ns_steps=5):
         n = X.shape[-2]
     I = jnp.eye(n, dtype=prod.dtype)
     return jnp.linalg.norm(prod - I)
-
 # ==========================================================================
 # State NamedTuples
 # ==========================================================================
