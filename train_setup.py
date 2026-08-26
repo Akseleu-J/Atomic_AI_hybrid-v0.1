@@ -2,67 +2,16 @@
 train_setup.py -- диагностика non-finite по группам параметров, TPU mesh /
 шардинг / компиляция train-step'ов, multi-source dataloader.
 
-Вынесено из train.py.
+ФИКС (этот пасс -- локализация Muon orth_resid, см. чат): построение
+_MUON_LEAF_PATHS через optimizer.build_muon_leaf_paths -- модульный
+атрибут, экспортируемый для train.py, чтобы КАЖДЫЙ шаг расшифровывать
+worst_leaf_idx (число из jit-графа, см. MuonState.worst_leaf_idx) в
+реальный путь параметра, без offline-скриптов. distributed_apply_step
+теперь возвращает 17 значений вместо 16 -- добавлен muon_worst_leaf_idx
+СРАЗУ ПОСЛЕ muon_orth_resid.
 
-ФИКС (dataloader, по гипотезе "смешение источников в одном батче триггерит
-RESID-DIAG на layer=22/mamba2" -- см. чат): dataloader_multi_source теперь
-поддерживает три режима подачи данных (mode="mixed"/"sequential"/
-"round_robin") и per-source fraction (третий элемент в file_pairs).
-
-ФИКС #2 (этот пасс): _round_robin_gen переписан на "быстрый пропуск без
-чтения с диска".
-
-ФИКС #3 (этот пасс -- W&B диагностика без jax.debug.print/callback):
-group_nonfinite_flags и was_clipped -- чистые функции, возвращают
-jnp-массивы/скаляры как ОБЫЧНЫЕ ВЫХОДЫ jitted distributed_apply_step.
-
-ФИКС #4 (этот пасс): make_hybrid_optimizer теперь дополнительно
-возвращает lr_schedule.
-
-ФИКС #5 (этот пасс -- AttributeError: 'function' object has no attribute
-'init'): make_shard_and_compile явно проверяет тип результата
-make_hybrid_optimizer вместо слепой распаковки.
-
-ФИКС #6 (этот пасс -- router_temp runaway): GmmMoEJ's router_temp
-decoupled decay-to-init в apply_router_temp_decay.
-
-ФИКС #7 (этот пасс -- bias-балансировка экспертов, DeepSeek-V3 style):
-GmmMoEJ's expert_bias, decoupled update в apply_expert_bias_update.
-
-ФИКС #8 (этот пасс -- переключаемый WARMUP_FREEZE_STEP, см. chat):
-make_shard_and_compile теперь принимает warmup_freeze_step и прокидывает
-его в make_hybrid_optimizer(warmup_freeze_step=...) -- раньше это была
-жёсткая модульная константа WARMUP_FREEZE_STEP внутри optimizer.py,
-теперь train.py явно решает (USE_WARMUP_FREEZE/WARMUP_FREEZE_STEP_VALUE),
-None означает обычный полный warmup/cosine-decay без заморозки.
-
-ФИКС #9 (этот пасс -- видимость zclip_skip, см. chat: градиентная норма
-монотонно растёт при стабильном замороженном LR, ce_loss растёт синхронно,
-остальные группы чисты -- гипотеза "систематически трудный сегмент
-данных"): distributed_apply_step теперь ДОПОЛНИТЕЛЬНО возвращает сырые
-поля ZClipState (через optimizer.extract_zclip_diagnostics) ПОСЛЕ
-tx.update -- раньше было невозможно отличить "zclip реально зануляет
-часть шагов" от "clip_by_global_norm просто масштабирует растущий, но
-каждый раз применяемый градиент", потому что is_spike/z/drift_ratio
-нигде не логировались. host-side (train.py) пересчитывает z-score и
-drift_ratio из этих сырых полей ТЕМ ЖЕ способом, что update_fn внутри
-zclip_skip -- не дублирует логику принятия решения (is_spike), только
-воспроизводит формулу для логирования.
-
-ФИКС #10 (этот пасс -- ВСЕГДА включённая по-слойная диагностика, см.
-чат): добавлен diagnostics.py -- гранулярность "один тег на физический
-(block_idx, layer_idx) слой" вместо "gdn2"/"mamba2"/"mla" одной кучей.
-distributed_apply_step теперь дополнительно возвращает:
-  - layer_grad_norms/layer_grad_maxabs/layer_grad_nonfinite -- по
-    avg_grads, тегированным через diagnostics.make_leaf_layer_map
-  - layer_w_norms/layer_w_maxabs/layer_w_nonfinite -- то же самое, но по
-    ВЕСАМ (new_p) после апдейта -- отдельный сигнал "разбухает ли слой
-    сам по себе", независимый от того, что градиент показывает В МОМЕНТ
-  - muon_orth_resid -- см. optimizer.py's ФИКС #4 (extract_muon_diagnostics)
-_PARAM_LAYER_TAGS (regex по путям params, "b{N}_l{M}") и _SOW_LAYER_TAGS
-(из diagnostics.layer_tags_in_sow_order, совпадает с порядком, в котором
-model.py реально sow'ит layer_delta_maxabs/layer_resid_maxabs) оба
-экспортируются -- train.py использует их как подписи столбцов в W&B.
+Остальное -- без изменений логики относительно предыдущего пасса
+(ФИКС #1-10, см. прежний докстринг ниже).
 """
 from __future__ import annotations
 
@@ -79,7 +28,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from model import FullHybridMoEModel, ModelConfig, set_model_mesh
-from optimizer import compute_loss, make_hybrid_optimizer, extract_zclip_diagnostics, extract_muon_diagnostics
+from optimizer import (
+    compute_loss, make_hybrid_optimizer, extract_zclip_diagnostics,
+    extract_muon_diagnostics, build_muon_leaf_paths, _label_leaf as _optimizer_label_leaf,
+)
 from utils import path_to_str
 from diagnostics import (
     make_leaf_layer_map, param_layer_tags, layer_tags_in_sow_order, build_leaf_stats_fn,
@@ -88,50 +40,30 @@ from diagnostics import (
 DATASET_FRACTION = 1
 DATASET_FRACTION_SEED = 777
 
-# ФИКС: автостоп при частых non-finite градиентах -- см. train.py, где эти
-# константы реально используются в цикле обучения. Оставлены здесь же,
-# рядом с диагностикой групп, которую они венчают логически, но train.py
-# импортирует их напрямую отсюда, чтобы не дублировать значения в двух
-# местах.
 NONFINITE_CONSECUTIVE_LIMIT = 4
 NONFINITE_WINDOW_SIZE = 15
 NONFINITE_WINDOW_RATIO = 0.25
 
-# ==========================================================================
-# ФИКС #6 (router_temp runaway) -- см. модульный докстринг выше.
-# ==========================================================================
 ROUTER_TEMP_DECAY_RATE = 0.02
-ROUTER_TEMP_INIT = 10.0  # должно совпадать с atomic_ops/moe_gmm.py's _ROUTER_TEMP_INIT
+ROUTER_TEMP_INIT = 10.0
 
 
 def _router_temp_decay_leaf(path, param):
-    """tree_map_with_path leaf fn -- тот же паттерн, что _decay_scale_leaf
-    ниже: определяет router_temp-листья по подстроке в пути, возвращает
-    СТАВКУ decay для этого листа (0.0 для всех остальных -- т.е. no-op)."""
     path_str = path_to_str(path)
     return ROUTER_TEMP_DECAY_RATE if "router_temp" in path_str else 0.0
 
 
 def apply_router_temp_decay(new_params, decay_map):
-    """Decoupled decay-to-init ТОЛЬКО для router_temp-листьев, применяется
-    ПОСЛЕ optax.apply_updates."""
     return jax.tree_util.tree_map(
         lambda p, rate: p - rate * (p - ROUTER_TEMP_INIT),
         new_params, decay_map,
     )
 
 
-# ==========================================================================
-# ФИКС #7 (bias-балансировка экспертов, DeepSeek-V3 style) -- см. модульный
-# докстринг выше.
-# ==========================================================================
 EXPERT_BIAS_GAMMA = 0.02
 
 
 def _build_expert_bias_index_map(abstract_params):
-    """Присваивает каждому expert_bias-листу СТАТИЧЕСКИЙ (Python int, не
-    jnp-массив) индекс, в порядке обхода params-pytree через
-    tree_map_with_path."""
     counter = {"i": 0}
 
     def _mark(path, leaf):
@@ -146,8 +78,6 @@ def _build_expert_bias_index_map(abstract_params):
 
 
 def apply_expert_bias_update(new_params, bias_index_map, assignment_frac_stacked, gamma=EXPERT_BIAS_GAMMA):
-    """Decoupled, вне градиента, обновление expert_bias-листьев по правилу
-    DeepSeek-V3."""
     if assignment_frac_stacked is None:
         return new_params
 
@@ -163,22 +93,8 @@ def apply_expert_bias_update(new_params, bias_index_map, assignment_frac_stacked
     return jax.tree_util.tree_map(_update, new_params, bias_index_map)
 
 
-SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 5 * 60  # 9 часов минус запас на graceful stop
+SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 5 * 60
 
-
-# ==========================================================================
-# ДИАГНОСТИКА non-finite градиентов: относим каждый лист параметров к одной
-# из "подозреваемых" групп (GDN-2, Mamba2, MLA, MoE, embed, остальное),
-# затем на каждом шаге, где итоговый global_norm не конечен, ВОЗВРАЩАЕМ
-# (не печатаем -- см. ФИКС #3 выше) булев вектор -- у КАКИХ ИМЕННО групп
-# есть non-finite градиент.
-#
-# ФИКС #10 (см. модульный докстринг): эта группировка ("gdn2" одной кучей
-# на 16+ слоёв) остаётся КАК ЕСТЬ (дёшево, полезно как быстрый top-level
-# фильтр), но ДОПОЛНЕНА diagnostics.py's более гранулярной по-физическому-
-# слою группировкой ниже -- используйте _DIAG_GROUPS для "какой ТИП слоя
-# затронут", и _PARAM_LAYER_TAGS/layer_grad_* для "какой ИМЕННО слой".
-# ==========================================================================
 _DIAG_GROUPS = ("gdn2", "mamba2", "mla", "moe", "muon_decay", "embed", "other")
 
 
@@ -197,17 +113,12 @@ def _classify_leaf_group(path_str: str) -> str:
 
 
 def make_grad_group_map(params):
-    """Строит pytree той же формы, что params/grads, где каждый лист -- это
-    ИМЯ группы (питоновская строка, статична, не трейсится)."""
     return jax.tree_util.tree_map_with_path(
         lambda path, _: _classify_leaf_group(path_to_str(path)), params
     )
 
 
 def build_group_nonfinite_flags(grad_group_map):
-    """Возвращает ЧИСТУЮ функцию (avg_grads) -> jnp.ndarray формы
-    (len(_DIAG_GROUPS),) bool -- по каждой группе: есть ли в ней хоть
-    один non-finite лист."""
     leaves_g, _ = jax.tree_util.tree_flatten(grad_group_map)
 
     def _flags(avg_grads):
@@ -234,23 +145,27 @@ def make_tpu_mesh():
     return Mesh(mesh_devices, axis_names=("tpu_nodes",))
 
 
-# ФИКС #10: заполняется внутри make_shard_and_compile (нужен abstract_params,
-# которые строятся там же) и экспортируется как модульный атрибут -- train.py
-# импортирует их напрямую (`from train_setup import _PARAM_LAYER_TAGS,
-# _SOW_LAYER_TAGS`) уже ПОСЛЕ первого вызова make_shard_and_compile.
 _PARAM_LAYER_TAGS = None
 _SOW_LAYER_TAGS = None
+# ФИКС (локализация Muon orth_resid, см. модульный докстринг выше):
+# список путей muon-параметров, ПОРЯДОК СОВПАДАЕТ с worst_leaf_idx из
+# MuonState -- заполняется внутри make_shard_and_compile, экспортируется
+# для train.py.
+_MUON_LEAF_PATHS = None
 
 
 def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: int,
                            seq_len: int = 8192, accum_steps: int = 1,
-                           warmup_freeze_step=None):
-    """ФИКС #8 (переключаемый WARMUP_FREEZE_STEP, см. модульный докстринг
-    выше): warmup_freeze_step прокидывается напрямую в
+                           warmup_freeze_step=None, muon_diagnostic_disable: bool = False):
+    """warmup_freeze_step прокидывается напрямую в
     make_hybrid_optimizer(warmup_freeze_step=...). None -- обычный полный
     warmup/cosine-decay без заморозки; int -- LR-schedule заморожена на
-    этом шаге (см. optimizer.py's make_hybrid_optimizer докстринг)."""
-    global _PARAM_LAYER_TAGS, _SOW_LAYER_TAGS
+    этом шаге.
+
+    muon_diagnostic_disable: прокидывается в make_hybrid_optimizer -- если
+    True, ВСЕ muon-параметры переводятся на adamw_nodecay (полное
+    временное отключение Muon, см. чат)."""
+    global _PARAM_LAYER_TAGS, _SOW_LAYER_TAGS, _MUON_LEAF_PATHS
 
     mesh = make_tpu_mesh()
     n_devices = mesh.shape["tpu_nodes"]
@@ -263,14 +178,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     batch_axis = "tpu_nodes"
     set_model_mesh(mesh, batch_axis=batch_axis)
 
-    _opt_result = make_hybrid_optimizer(total_steps=total_steps, warmup_freeze_step=warmup_freeze_step)
+    _opt_result = make_hybrid_optimizer(
+        total_steps=total_steps, warmup_freeze_step=warmup_freeze_step,
+        muon_diagnostic_disable=muon_diagnostic_disable,
+    )
     if isinstance(_opt_result, (optax.GradientTransformation, optax.GradientTransformationExtraArgs)):
-        # optimizer.py ещё не обновлён -- вернул голый tx, lr_schedule нет.
         tx = _opt_result
         lr_schedule = None
-        print("[OPTIMIZER] ⚠️ make_hybrid_optimizer вернул голый tx (без lr_schedule) -- "
-              "train/lr_scale логироваться в W&B не будет, пока optimizer.py не обновлён "
-              "на возврат (tx, lr_schedule).")
+        print("[OPTIMIZER] ⚠️ make_hybrid_optimizer вернул голый tx (без lr_schedule).")
     else:
         tx, lr_schedule = _opt_result
     model = FullHybridMoEModel(cfg=config)
@@ -306,16 +221,25 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     grad_group_map = make_grad_group_map(abstract_params)
     _group_nonfinite_flags = build_group_nonfinite_flags(grad_group_map)
 
-    # ФИКС #10: по-физическому-слою тегирование + stats-функции (см.
-    # diagnostics.py и модульный докстринг выше). Работает и для grads
-    # (avg_grads), и для params (new_p) -- та же листовая структура.
     grad_layer_map = make_leaf_layer_map(abstract_params)
     _PARAM_LAYER_TAGS = param_layer_tags(grad_layer_map)
     _SOW_LAYER_TAGS = layer_tags_in_sow_order(config)
     _layer_grad_stats_fn = build_leaf_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
     _layer_weight_stats_fn = build_leaf_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
-    print(f"[DIAG] По-слойная диагностика (ФИКС #10): {len(_PARAM_LAYER_TAGS)} физических "
+    print(f"[DIAG] По-слойная диагностика: {len(_PARAM_LAYER_TAGS)} физических "
           f"тегов параметров ({_PARAM_LAYER_TAGS}), {len(_SOW_LAYER_TAGS)} sown-тегов активаций.")
+
+    # ФИКС (локализация Muon orth_resid, см. модульный докстринг выше):
+    # строим список путей muon-параметров ОДИН РАЗ здесь -- нужен train.py
+    # для расшифровки worst_leaf_idx (число из jit-графа) в реальный путь.
+    try:
+        _MUON_LEAF_PATHS = build_muon_leaf_paths(abstract_params, _optimizer_label_leaf)
+        print(f"[MUON-DIAG] Локализация включена: {len(_MUON_LEAF_PATHS)} muon-параметров "
+              f"проиндексированы для расшифровки worst_leaf_idx каждый шаг.")
+    except Exception as e:
+        _MUON_LEAF_PATHS = None
+        print(f"[MUON-DIAG] ⚠️ Не удалось построить _MUON_LEAF_PATHS ({e}) -- "
+              f"worst_leaf_idx будет логироваться как число без расшифровки пути.")
 
     def _decay_scale_leaf(path, param):
         path_str = path_to_str(path)
@@ -325,13 +249,10 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         return 0.3 if "router" in path_str else 1.0
 
     _router_grad_scale = jax.tree_util.tree_map_with_path(_router_scale_leaf, abstract_params)
-
     _decay_grad_scale = jax.tree_util.tree_map_with_path(_decay_scale_leaf, abstract_params)
-
     _router_temp_decay_map = jax.tree_util.tree_map_with_path(
         _router_temp_decay_leaf, abstract_params
     )
-
     _expert_bias_index_map = _build_expert_bias_index_map(abstract_params)
 
     opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
@@ -363,24 +284,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     def distributed_apply_step(p, s, accum_grads, n_accum, assignment_frac_stacked=None):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
-        # ФИКС #3: чистая функция, возвращает jnp-массив -- НЕ печатает
-        # ничего внутри jit. Разбор/печать/W&B -- на host-стороне в
-        # train.py, после device_get.
         group_nonfinite_flags = _group_nonfinite_flags(avg_grads)
-
-        # ФИКС #10: по-физическому-слою норма/max|abs|/nonfinite ГРАДИЕНТА
-        # -- на СЫРОМ avg_grads (до nan_to_num-санитизации ниже), чтобы
-        # nonfinite-флаг был содержательным (после nan_to_num всё уже
-        # искусственно конечно).
         layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite = _layer_grad_stats_fn(avg_grads)
 
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
         is_finite = jnp.isfinite(global_norm)
-        # clip_factor теперь только для логов/диагностики
         safe_norm = jnp.where(is_finite, global_norm, 1.0)
         clip_factor = jnp.where(is_finite, jnp.minimum(1.0, 1.0 / (safe_norm + 1e-6)), 0.0)
 
-        # only sanitize non-finite, без дополнительного ручного clip (optax clip уже есть в tx)
         avg_grads = jax.tree_util.tree_map(
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0),
             avg_grads,
@@ -399,28 +310,16 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         new_p = apply_router_temp_decay(new_p, _router_temp_decay_map)
         new_p = apply_expert_bias_update(new_p, _expert_bias_index_map, assignment_frac_stacked)
 
-        # ФИКС #10: по-физическому-слою норма/max|abs|/nonfinite ВЕСОВ
-        # (new_p) ПОСЛЕ апдейта -- независимый сигнал "разбухает ли слой
-        # сам по себе", в дополнение к градиенту В МОМЕНТ.
         layer_w_norms, layer_w_maxabs, layer_w_nonfinite = _layer_weight_stats_fn(new_p)
 
-        # ФИКС #10 (см. optimizer.py's ФИКС #4): Muon orth_resid ПОСЛЕ
-        # tx.update -- относится к апдейту, реально применённому на этом
-        # шаге.
-        muon_orth_resid = extract_muon_diagnostics(new_s)
+        # ФИКС (локализация, см. модульный докстринг выше):
+        # extract_muon_diagnostics теперь возвращает ПАРУ.
+        muon_orth_resid, muon_worst_leaf_idx = extract_muon_diagnostics(new_s)
 
-        # ФИКС #3: was_clipped тоже больше не печатается через
-        # jax.lax.cond(...jax.debug.print...) -- просто bool-скаляр,
-        # возвращаемый как обычный выход, ровно как is_finite уже был.
         was_clipped = jnp.any(jnp.stack([
             jnp.any(jnp.abs(leaf) >= 1e2) for leaf in jax.tree_util.tree_leaves(p)
         ]))
 
-        # ФИКС #9 (видимость zclip_skip, см. модульный докстринг выше):
-        # сырые поля ZClipState ПОСЛЕ tx.update -- host-side (train.py)
-        # пересчитывает z-score/drift_ratio из них тем же способом, что
-        # zclip_skip's update_fn, для логирования (НЕ для повторного
-        # принятия решения -- решение уже принято внутри tx.update).
         zclip_diag = extract_zclip_diagnostics(new_s)
 
         zero_accum = jax.tree_util.tree_map(jnp.zeros_like, accum_grads)
@@ -429,7 +328,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 zclip_diag,
                 layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
                 layer_w_norms, layer_w_maxabs, layer_w_nonfinite,
-                muon_orth_resid)
+                muon_orth_resid, muon_worst_leaf_idx)
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -453,10 +352,6 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "router_max_cos_per_layer": NamedSharding(mesh, P()),
         "router_max_cos": NamedSharding(mesh, P()),
         "assignment_frac": NamedSharding(mesh, P(None, None)),
-        # ФИКС #10: sharding-записи для ВСЕХ новых ВСЕГДА-включённых
-        # sow-диагностик из model.py -- optimizer.py's compute_loss
-        # собирает их под ЭТИМИ ЖЕ именами в aux_info, jit's out_shardings
-        # требует точного совпадения структуры pytree.
         "layer_delta_maxabs": NamedSharding(mesh, P(None)),
         "layer_delta_isfinite": NamedSharding(mesh, P(None)),
         "layer_resid_maxabs": NamedSharding(mesh, P(None)),
@@ -502,8 +397,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             {"input_ids": data_sharding, "labels": data_sharding},
             NamedSharding(mesh, P(None)),
             param_sharding,
-            NamedSharding(mesh, P()),   # <-- для collinearity_coef (скаляр)
-
+            NamedSharding(mesh, P()),
         ),
         out_shardings=(
             param_sharding,
@@ -511,12 +405,10 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             param_sharding,
             NamedSharding(mesh, P()),
             aux_info_sharding,
-            NamedSharding(mesh, P()),        # micro_grad_norm (скаляр)
+            NamedSharding(mesh, P()),
         ),
     )
 
-    # ФИКС #9: zclip_diag -- девятый выход distributed_apply_step, dict
-    # скаляров той же формы, что ZClipState.
     zclip_diag_sharding = {
         "ema_mean": NamedSharding(mesh, P()),
         "ema_var": NamedSharding(mesh, P()),
@@ -533,7 +425,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             opt_state_sharding,
             param_sharding,
             NamedSharding(mesh, P()),
-            NamedSharding(mesh, P(None, None)),   # <-- assignment_frac_stacked
+            NamedSharding(mesh, P(None, None)),
         ),
         out_shardings=(
             param_sharding,
@@ -542,11 +434,9 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P()),        # is_finite
             NamedSharding(mesh, P()),        # global_norm
             NamedSharding(mesh, P()),        # clip_factor
-            NamedSharding(mesh, P(None)),    # group_nonfinite_flags, shape (len(_DIAG_GROUPS),)
+            NamedSharding(mesh, P(None)),    # group_nonfinite_flags
             NamedSharding(mesh, P()),        # was_clipped
-            zclip_diag_sharding,              # ФИКС #9: zclip diagnostics
-            # ФИКС #10: по-физическому-слою диагностика (grads, weights) +
-            # Muon orth_resid.
+            zclip_diag_sharding,
             NamedSharding(mesh, P(None)),    # layer_grad_norms
             NamedSharding(mesh, P(None)),    # layer_grad_maxabs
             NamedSharding(mesh, P(None)),    # layer_grad_nonfinite
@@ -554,6 +444,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P(None)),    # layer_w_maxabs
             NamedSharding(mesh, P(None)),    # layer_w_nonfinite
             NamedSharding(mesh, P()),        # muon_orth_resid
+            NamedSharding(mesh, P()),        # muon_worst_leaf_idx  <-- НОВОЕ
         ),
     )
 
@@ -584,15 +475,12 @@ def resolve_source_files(output_dir, prefix):
             pairs.append((ids_path, lbls_path))
     if not pairs:
         raise FileNotFoundError(
-            f"Не найдены файлы для prefix={prefix!r} в {output_dir} -- ни объединённого "
-            f"{prefix}_input_ids.npy, ни шардов {prefix}_shard_ids_*.npy. Проверьте путь."
+            f"Не найдены файлы для prefix={prefix!r} в {output_dir}."
         )
     return pairs
 
 
 def build_manifest(file_pairs):
-    """Принимает и 2-tuple (ids_path, lbls_path), и 3-tuple
-    (ids_path, lbls_path, fraction)."""
     manifest = []
     total = 0
     for entry in file_pairs:
@@ -608,16 +496,6 @@ def build_manifest(file_pairs):
 def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_split=0.05,
                              dataset_fraction=1.0, fraction_seed=777, skip_batches=0,
                              mode="mixed"):
-    """
-    file_pairs: список (ids_path, lbls_path) ИЛИ (ids_path, lbls_path, fraction).
-
-    mode="mixed" (default) -- все источники в одном глобально перемешанном
-      пуле, один батч может содержать строки из НЕСКОЛЬКИХ источников.
-    mode="sequential" -- источники проходятся ПО ОЧЕРЕДИ целиком.
-    mode="round_robin" -- на каждом МИКРО-шаге ровно один источник,
-      источники чередуются по кругу, посещает каждый источник с РАВНОЙ
-      частотой независимо от размера, батч несёт "_source_idx".
-    """
     normalized_pairs = []
     for entry in file_pairs:
         if len(entry) == 3:
@@ -657,8 +535,6 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
             lbls_out[m] = lbls_full[:, :seq_len]
         return ids_out, lbls_out
 
-    # ---- per-source fraction: применяем К КАЖДОМУ источнику отдельно,
-    # ДО train/val split и ДО глобального dataset_fraction ----
     frac_rng_per_source = np.random.RandomState(fraction_seed)
     per_source_idx = []
     for s, (ids_path, _, n) in enumerate(manifest):
@@ -680,8 +556,7 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
         n_keep = int(len(all_idx) * dataset_fraction)
         all_idx = frac_rng.choice(all_idx, size=n_keep, replace=False)
         all_idx.sort()
-        print(f"[DATA] Общая подвыборка {dataset_fraction*100:.0f}%: {n_keep:,} блоков "
-              f"(после per-source фильтра, seed={fraction_seed})")
+        print(f"[DATA] Общая подвыборка {dataset_fraction*100:.0f}%: {n_keep:,} блоков.")
 
     pool_size = len(all_idx)
     val_size = int(pool_size * val_split)
@@ -784,7 +659,7 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
                 start_step = skip_first % max(n_steps, 1)
                 if start_step > 0:
                     print(f"[DATA] Resume: пропускаем первые {start_step} микрошагов "
-                          f"текущего прохода датасета (уже были пройдены раньше).")
+                          f"текущего прохода датасета.")
             first_pass = False
             for step in range(start_step, n_steps):
                 batch_idx = idx_local[step * batch_size: (step + 1) * batch_size]
@@ -803,7 +678,7 @@ def dataloader_multi_source(file_pairs, batch_size, data_sharding, seq_len, val_
     elif mode == "mixed":
         train_gen = _mixed_gen(train_idx_pool, True, skip_first=skip_batches)
     else:
-        raise ValueError(f"Неизвестный mode={mode!r}, ожидается 'mixed'/'sequential'/'round_robin'.")
+        raise ValueError(f"Неизвестный mode={mode!r}.")
 
     return (
         train_gen,
