@@ -395,8 +395,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
                 layer_w_norms, layer_w_maxabs, layer_w_nonfinite,
                 muon_orth_resid, muon_worst_leaf_idx,
-                group_grad_norms, group_weight_norms
-                muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs)   # НОВОЕ)
+                group_grad_norms, group_weight_norms,
+                muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs)
 
     def distributed_val_step(p, b):
         return compute_loss(
