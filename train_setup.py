@@ -380,7 +380,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
         # ФИКС (локализация, см. модульный докстринг выше):
         # extract_muon_diagnostics теперь возвращает ПАРУ.
-        muon_orth_resid, muon_worst_leaf_idx = extract_muon_diagnostics(new_s)
+        muon_orth_resid, muon_worst_leaf_idx, muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs = extract_muon_diagnostics(new_s)
 
         was_clipped = jnp.any(jnp.stack([
             jnp.any(jnp.abs(leaf) >= 1e2) for leaf in jax.tree_util.tree_leaves(p)
@@ -395,7 +395,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
                 layer_w_norms, layer_w_maxabs, layer_w_nonfinite,
                 muon_orth_resid, muon_worst_leaf_idx,
-                group_grad_norms, group_weight_norms)
+                group_grad_norms, group_weight_norms
+                muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs)   # НОВОЕ)
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -485,6 +486,9 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P()),        # muon_worst_leaf_idx
             NamedSharding(mesh, P(None)),    # group_grad_norms    <-- НОВОЕ
             NamedSharding(mesh, P(None)),    # group_weight_norms  <-- НОВОЕ
+            NamedSharding(mesh, P()),        # muon_worst_leaf_grad_norm    <-- НОВОЕ
+            NamedSharding(mesh, P()),        # muon_worst_leaf_grad_maxabs  <-- НОВОЕ
+
         ),
     )
 
