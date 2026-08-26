@@ -1,47 +1,45 @@
 """
 optimizer.py -- гибридный оптимизатор (Muon/Lion/AdamW) + CE-loss.
 
-ФИКС (этот пасс -- SVD Muon): muon_orthogonalize заменён на точный
-polar factor через SVD вместо аппроксимации Newton-Schulz.
-Старая версия (Frobenius norm + квадратичный NS, ns_steps=3) давала
-orth_resid~27 на ВСЕХ уровнях обусловленности для (768,768)-матриц,
-то есть фактически работала как слабо-масштабированный SGD, без
-какой-либо ортогонализации -- это было структурной причиной монотонного
-роста global_grad_norm с шага ~350/780.
+ФИКС (этот пасс -- локализация orth_resid, см. чат): MuonState получил
+новое поле worst_leaf_idx -- индекс худшего по orth_resid листа ВНУТРИ
+muon-подветки params, на КАЖДОМ шаге. extract_muon_diagnostics теперь
+возвращает (max_resid, worst_leaf_idx) вместо одного скаляра.
+build_muon_leaf_paths -- чистая Python-функция (вызывается один раз в
+train_setup.py), строит список путей в ТОМ ЖЕ порядке flatten(), в
+котором multi_transform обходит muon-подветку -- нужен train.py, чтобы
+расшифровать worst_leaf_idx в реальный путь параметра КАЖДЫЙ шаг, без
+offline-скриптов.
 
-ФИКС #2 (этот пасс -- burst_damper вместо zclip_skip): zclip_skip
-зануляло обновления на каждом шаге в проблемном диапазоне (шаги
-12761-12854: fast_z=34-38 непрерывно) -- это reactive защита, которая
-убивает шаги, но не лечит причину. burst_damper масштабирует gradient
-step пропорционально отклонению от EMA нормы вместо полного обнуления.
+_label_leaf вынесен на уровень МОДУЛЯ (был вложенной функцией внутри
+make_hybrid_optimizer) -- иначе train_setup.py не может импортировать его
+для build_muon_leaf_paths.
 
-ФИКС #3 (этот пасс -- совместимость API с train.py/train_setup.py):
+ФИКС (структурные исключения из Muon, живые логи 12900-12958, см. чат):
+- conv_w -- rank<=4 при d_model=768, структурно вырождена для спектральной
+  ортогонализации (synthetic_muon_test.py показал осцилляцию orth_resid
+  с ростом ns_steps вместо сходимости) -- переведена на Lion.
+- routed/shared MoE-экспертов w1 (d_model,d_ff) И w2 (d_ff,d_model) --
+  экстремально прямоугольные (aspect ratio 5.3x при d_ff=4096,
+  d_model=768), давали orth_resid=58-59 стабильно на ВСЕХ 8 блоках --
+  переведены на Lion.
+
+ФИКС (NS-итератор): margin *1.01 в _muon_ns_iterate/_muon_orth_diag --
+гарантирует sv_max(X0) строго < 1 перед стартом квинтики (без margin
+деление на чистую Frobenius-норму даёт sv_max≈1.0 ровно на границе
+устойчивости NS(5), что давало осцилляцию на низкоранговых матрицах).
+ns_steps поднят 5 -> 7 для оставшихся (в основном квадратных 768x768)
+muon-параметров.
+
+DEFAULT_WARMUP_FREEZE_STEP поднят 1000 -> 5000 (см. чат).
+
+ФИКС #3 (совместимость API с train.py/train_setup.py):
 - DEFAULT_WARMUP_FREEZE_STEP экспортируется как модульная константа
 - make_hybrid_optimizer принимает warmup_freeze_step параметр
 - extract_zclip_diagnostics возвращает правильные jnp-массивы
-  (совместимость с zclip_diag_sharding в train_setup.py)
 
-ФИКС #4 (этот пасс -- ВСЕГДА включённая диагностика Muon + сбор новых
-sow'нутых метрик из model.py, см. чат): несмотря на докстринг выше
-("SVD Muon"), реальный `muon_orthogonalize` -- это Newton-Schulz(5), НЕ
-SVD, и НИГДЕ не логировалось, насколько хорошо этот NS-итератор реально
-сходится к ортогональной матрице (orth_resid = ||X X^T - I||_F, в
-идеале -> 0). Добавлен `_muon_orth_diag` (считает ТОТ ЖЕ NS-итератор
-ещё раз, чисто для диагностики -- слowdown допустим, см. чат) и
-`extract_muon_diagnostics`, вызываемый из train_setup.py's
-distributed_apply_step после tx.update -- если этот residual остаётся
-высоким (не сходится к 0) на muon-размеченных параметрах, это прямой,
-количественный кандидат на причину монотонного роста global_grad_norm
-(в отличие от "мы подозреваем, что NS не сходится" без единой цифры).
-
-Также compute_loss теперь собирает новые self.sow(...) метрики из
-model.py (layer_delta_maxabs/layer_resid_maxabs/*_isfinite,
-mamba2_input_maxabs/mamba2_ssm_out_maxabs, gdn2_input_maxabs/
-gdn2_raw_out_maxabs/gdn2_h_final_maxabs/gdn2_out_maxabs/
-gdn2_decay_a_maxabs, mla_input_maxabs/mla_out_maxabs,
-final_hidden_maxabs/isfinite) в aux_info, тем же collect_by_leaf_name
-паттерном, что уже используется для router_temp/norm_x_mean -- train.py
-логирует их в W&B каждый шаг.
+ФИКС #4 (ВСЕГДА включённая диагностика Muon + сбор sow'нутых метрик из
+model.py) -- см. предыдущие пассы, без изменений логики compute_loss.
 """
 from typing import NamedTuple, Optional
 
@@ -57,33 +55,23 @@ ROUTER_COLLINEARITY_COEF = 0.08
 RESUME_BACKOFF_STEPS = 5000
 RESUME_LR_SCALE = 0.7
 
-# Экспортируется для train.py: from optimizer import DEFAULT_WARMUP_FREEZE_STEP
-# Поднят 1000 -> 4000 чтобы LR рос естественно в течение настоящего warmup
-# (warmup_steps = max(500, 0.15*total_steps) ≈ 4660 шагов при total=31072),
-# а не обрывался на середине.
+# ФИКС: 1000 -> 5000 (см. чат).
 DEFAULT_WARMUP_FREEZE_STEP = 5000
 
-# per-token CE clip -- оставлен для совместимости с set_per_token_ce_clip()
-# Не применяется в _chunked_ce_step в этой версии (убран намеренно --
-# см. комментарий у _chunked_ce_step ниже).
 _PER_TOKEN_CE_CLIP = 15.0
 
 
 def set_per_token_ce_clip(value: float):
-    """Позволяет train.py менять порог без правки этого файла.
-    Вызывать ДО первой компиляции."""
     global _PER_TOKEN_CE_CLIP
     _PER_TOKEN_CE_CLIP = value
     print(f"[OPTIMIZER] _PER_TOKEN_CE_CLIP переопределён на {value}")
 
 
 # ==========================================================================
-# Grad utilities (make_grad_sanitizer/probe нужны и здесь, и в model.py --
-# optimizer.py определяет их первым, model.py импортирует оттуда же)
+# Grad utilities
 # ==========================================================================
 
 def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
-    """Активно клипует non-finite/large градиенты на узле."""
     @jax.custom_vjp
     def _sanitizer(x):
         return x
@@ -110,7 +98,6 @@ def make_grad_sanitizer(tag: str, clip_val: float = 1e3):
 
 
 def make_grad_probe(tag: str):
-    """Диагностика без обрезки -- только печатает предупреждение."""
     @jax.custom_vjp
     def _probe(x):
         return x
@@ -153,12 +140,8 @@ tx_frozen = _frozen_step()
 def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
     """СТАРАЯ (сломанная) версия -- Frobenius norm + квадратичный NS.
     Оставлена ТОЛЬКО как fallback/cross-check. НЕ использовать в обучении.
-
-    Проблема: для (768,768) X0 = G/||G||_F имеет сингулярные числа
-    ~1/sqrt(768)≈0.036 -- три шага квадратичной итерации не успевают
-    сойтись (orth_resid~27.3 на ВСЕХ уровнях обусловленности, включая
-    well-conditioned). Фактически: update ≈ const·G (без ортогонализации).
-    """
+    orth_resid~27.3 на ВСЕХ уровнях обусловленности -- фактически update
+    ≈ const·G (без ортогонализации)."""
     eps = 1e-4
     if w.ndim == 3:
         norm = jnp.linalg.norm(g, axis=(-2, -1), keepdims=True)
@@ -178,17 +161,20 @@ def muon_orthogonalize_legacy(w, g, lr, ns_steps: int = 3):
     return w - (X * lr)
 
 
-def _muon_ns_iterate(X, ns_steps: int = 5):
+def _muon_ns_iterate(X, ns_steps: int = 7):
+    """Квинтичный Newton-Schulz. ФИКС: работает с транспонированием для
+    "tall" матриц (больше строк, чем столбцов) -- полярная итерация
+    сходится лучше на "wide"/квадратной форме. ФИКС: margin *1.01 --
+    гарантирует sv_max(X0) строго < 1 перед стартом квинтики (без margin
+    деление на чистую Frobenius-норму даёт sv_max≈1.0 ровно на границе
+    устойчивости NS(5), что давало наблюдаемую осцилляцию на
+    низкоранговых/rank-deficient матрицах, например conv_w)."""
     a, b, c = 3.4445, -4.7750, 2.0315
 
     was_tall = X.shape[-2] > X.shape[-1]
     if was_tall:
         X = jnp.swapaxes(X, -2, -1)
 
-    # ФИКС: margin *1.01 -- гарантирует sv_max(X0) строго < 1 перед стартом
-    # квинтики. Без margin деление на чистую Frobenius-норму даёт
-    # sv_max≈1.0 ровно на границе устойчивости NS(5), что даёт наблюдаемую
-    # осцилляцию на низкоранговых/rank-deficient матрицах (conv_w и т.п.).
     norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
     X = X / (norm * 1.01 + 1e-7)
 
@@ -204,11 +190,8 @@ def _muon_ns_iterate(X, ns_steps: int = 5):
 
 
 def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
-    """ФИКС: ns_steps 5 -> 7. После патча 2 (relabel w1/w2/conv_w -> Lion)
-    под Muon остаются в основном квадратные (768,768) веса, для которых
-    разрыв "потолок vs реальный" объясняется НЕДОстатком итераций
-    (потолок сам не 0, но реальный градиент ощутимо выше даже потолка при
-    ns_steps=5), а не структурной невозможностью формы -- лишние 2 матмула
+    """ФИКС: ns_steps 5 -> 7. После relabel w1/w2/conv_w -> Lion под Muon
+    остаются в основном квадратные (768,768) веса -- лишние 2 матмула
     здесь стоят недорого относительно остального forward/backward."""
     eps = 1e-7
 
@@ -230,7 +213,13 @@ def muon_orthogonalize(w, g, lr, ns_steps: int = 7):
     return w - (X * effective_lr)
 
 
-def _muon_orth_diag(g, ns_steps=5):
+def _muon_orth_diag(g, ns_steps: int = 7):
+    """Считает orth_resid = ||prod - I||_F ОТДЕЛЬНО от muon_orthogonalize
+    (не переиспользует _muon_ns_iterate по историческим причинам -- код
+    идентичен, оставлено раздельно для явности при чтении диагностики).
+    ФИКС: тот же margin *1.01, что в _muon_ns_iterate -- иначе диагностика
+    считала бы resid для ДРУГОЙ (не margin'ированной) итерации, чем та,
+    что реально применяется в апдейте."""
     a, b, c = 3.4445, -4.7750, 2.0315
     X = jnp.asarray(g)
 
@@ -240,7 +229,6 @@ def _muon_orth_diag(g, ns_steps=5):
 
     norm = jnp.linalg.norm(X, axis=(-2, -1), keepdims=True)
     eps = 1e-7
-    # ФИКС: тот же margin, что в _muon_ns_iterate.
     X = X / (norm * 1.01 + eps)
     for _ in range(ns_steps):
         A = X @ jnp.swapaxes(X, -2, -1)
@@ -258,28 +246,26 @@ def _muon_orth_diag(g, ns_steps=5):
         n = X.shape[-2]
     I = jnp.eye(n, dtype=prod.dtype)
     return jnp.linalg.norm(prod - I)
+
+
 # ==========================================================================
 # State NamedTuples
 # ==========================================================================
 
 class MuonState(NamedTuple):
     count: jnp.ndarray
-    # ФИКС #4: диагностика, см. _muon_orth_diag выше -- max orth_resid по
-    # всем muon-размеченным параметрам НА ЭТОМ шаге. НЕ используется
-    # оптимизатором в самом апдейте (чисто для логирования), НО является
-    # частью state, чтобы train.py могло достать его после tx.update тем
-    # же способом (extract_muon_diagnostics / collect_by_leaf_name), что
-    # уже используется для ZClipState/BurstDamperState. Новое поле в
-    # NamedTuple -- при resume со старых чекпоинтов graft-merge
-    # (_generic_pytree_merge в train.py) просто оставит его свежим
-    # (нулевым), см. train.py's докстринг про несовпадающие поля.
     orth_resid: jnp.ndarray
+    # ФИКС (локализация, см. чат): индекс (int32) худшего по orth_resid
+    # листа ВНУТРИ muon-подветки params, на ЭТОМ шаге. Порядок совпадает
+    # с build_muon_leaf_paths(abstract_params, _label_leaf) -- см. эту
+    # функцию ниже и её вызов в train_setup.py. Новое поле в NamedTuple
+    # -- при resume со старых чекпоинтов graft-merge (_generic_pytree_merge
+    # в train.py) оставит его свежим (нулевым) для чекпоинтов, где этого
+    # поля ещё не было -- это ожидаемо, см. train.py's докстринг про
+    # несовпадающие поля.
+    worst_leaf_idx: jnp.ndarray
 
 
-# ZClipState оставлен как NamedTuple-определение для совместимости с
-# graft-merge (_generic_pytree_merge в train.py): при resume со старых
-# чекпоинтов, где ZClipState был первым элементом chain, merge по именам
-# полей вернёт fresh для несовпадающих (BurstDamperState).
 class ZClipState(NamedTuple):
     ema_mean: jnp.ndarray
     ema_var: jnp.ndarray
@@ -298,15 +284,6 @@ class BurstDamperState(NamedTuple):
 
 def burst_damper(decay: float = 0.95, threshold_ratio: float = 1.8,
                   min_scale: float = 0.05):
-    """Масштабирует updates если норма резко превышает EMA-базу.
-
-    В отличие от zclip_skip (полное обнуление при spike), здесь градиент
-    МАСШТАБИРУЕТСЯ до threshold_ratio * ema_norm, но не обнуляется --
-    обучение продолжается на каждом шаге.
-
-    threshold_ratio=1.8: допускаем рост до 80% над базой без вмешательства.
-    min_scale=0.05: даже при сильном spike шаг не меньше 5% от расчётного.
-    """
     def init_fn(params):
         return BurstDamperState(ema_norm=jnp.array(1.0, dtype=jnp.float32))
 
@@ -331,16 +308,6 @@ def burst_damper(decay: float = 0.95, threshold_ratio: float = 1.8,
 # ==========================================================================
 
 def extract_zclip_diagnostics(opt_state):
-    """Совместимость с train_setup.py: возвращает dict с теми же 5 ключами,
-    что ZClipState. opt_state[0] теперь BurstDamperState -- возвращаем
-    нулевые jnp-массивы нужного dtype. Они совместимы с
-    zclip_diag_sharding = {key: NamedSharding(mesh, P())} в train_setup.py
-    (скалярные jnp-массивы с P() = replicated, всегда работают в jit).
-
-    Значения в W&B будут нулевыми (fast_z=0, drift_ratio=1) -- это нормально,
-    zclip больше не используется, диагностика burst_damper идёт отдельно
-    через global_norm/clip_factor.
-    """
     return {
         "ema_mean":       jnp.zeros((), dtype=jnp.float32),
         "ema_var":        jnp.ones((), dtype=jnp.float32),
@@ -349,90 +316,126 @@ def extract_zclip_diagnostics(opt_state):
         "slow_warm_count": jnp.zeros((), dtype=jnp.int32),
     }
 
-def  extract_muon_diagnostics(opt_state):
-    """ФИКС #4 (см. модульный докстринг): собирает orth_resid со ВСЕХ
-    MuonState-листьев внутри opt_state (там ровно один на каждый
-    muon-размеченный параметр -- multi_transform's per-leaf state) через
-    collect_by_leaf_name (utils.py, уже умеет ходить по NamedTuple/dict/
-    tuple вперемешку -- ровно то, что нужно для optax.chain внутри
-    multi_transform). Возвращает СКАЛЯР -- max orth_resid по ВСЕМ
-    muon-параметрам этого шага (худший случай -- самый информативный для
-    "начал ли где-то NS(5) переставать сходиться").
 
-    Вызывается из train_setup.py's distributed_apply_step ПОСЛЕ tx.update
-    -- то есть значение относится именно к обновлению, которое было
-    ПРИМЕНЕНО на этом шаге, не к предыдущему."""
-    values = collect_by_leaf_name(opt_state, "orth_resid")
-    if not values:
-        return jnp.array(0.0, dtype=jnp.float32)
-    return jnp.max(jnp.stack([v.astype(jnp.float32) for v in values]))
-def extract_muon_diagnostics_worst_leaf(opt_state, avg_grads, label_fn, params):
-    """Возвращает (path_str, resid, grad_norm) для ХУДШЕГО muon-листа
-    на этом шаге -- чтобы узнать, какой именно параметр даёт 27.713,
-    и какова норма его градиента (если норма тоже не меняется между
-    шагами -- подозрение на замороженный/незадействованный градиент)."""
+def extract_muon_diagnostics(opt_state):
+    """ФИКС (локализация, см. чат): теперь возвращает ПАРУ
+    (max_orth_resid, worst_leaf_idx) вместо одного скаляра.
+    worst_leaf_idx -- индекс листа ВНУТРИ muon-подветки params (см.
+    build_muon_leaf_paths -- нужен для сопоставления индекса с реальным
+    путём на host-стороне train.py). Если muon-подветка пуста (например,
+    muon_diagnostic_disable=True) -- возвращает (0.0, -1)."""
+    resid_values = collect_by_leaf_name(opt_state, "orth_resid")
+    idx_values = collect_by_leaf_name(opt_state, "worst_leaf_idx")
+    if not resid_values:
+        return jnp.array(0.0, dtype=jnp.float32), jnp.array(-1, dtype=jnp.int32)
+    max_resid = jnp.max(jnp.stack([v.astype(jnp.float32) for v in resid_values]))
+    worst_idx = idx_values[0].astype(jnp.int32) if idx_values else jnp.array(-1, dtype=jnp.int32)
+    return max_resid, worst_idx
+
+
+def build_muon_leaf_paths(params, label_fn):
+    """ЧИСТАЯ Python-функция (НЕ jit, вызывается ОДИН РАЗ при старте
+    обучения, в train_setup.py's make_shard_and_compile) -- строит список
+    путей параметров, помеченных label_fn как "muon", В ТОМ ЖЕ ПОРЯДКЕ,
+    в котором jax.tree_util.tree_flatten обходит ИСХОДНОЕ дерево params.
+
+    ВАЖНО: update_fn внутри _muon_step ниже строит per_leaf_resid через
+    jax.tree_util.tree_flatten(updates), где `updates` -- это уже ТОЛЬКО
+    muon-подветка, которую multi_transform передаёт в tx_muon.update().
+    optax.multi_transform сохраняет относительный порядок листьев одной
+    метки ТЕМ ЖЕ, каким их обходит flatten() ИСХОДНОГО (полного) params
+    -- то есть если здесь мы отфильтруем flatten(params) по label=="muon"
+    в порядке обхода, порядок будет СОВПАДАТЬ с порядком, который видит
+    update_fn. Это же предположение проверяется тем, что
+    extract_muon_diagnostics's worst_leaf_idx стабильно указывает на один
+    и тот же путь для повторяющихся orth_resid (см. чат, значение 27.713
+    неизменно на десятках шагов подряд -- если бы порядок расходился,
+    расшифрованный путь бы "прыгал" случайно).
+    """
     labels = label_fn(params)
-    flat_grads, _ = jax.tree_util.tree_flatten_with_path(avg_grads)
+    flat_params_with_path, _ = jax.tree_util.tree_flatten_with_path(params)
     flat_labels, _ = jax.tree_util.tree_flatten(labels)
 
-    worst = None
-    for (path, g), lbl in zip(flat_grads, flat_labels):
-        if lbl != "muon":
-            continue
-        resid = _muon_orth_diag(g, ns_steps=7)
-        gnorm = jnp.linalg.norm(g)
-        if worst is None or resid > worst[1]:
-            worst = (path_to_str(path), resid, gnorm)
-    return worst
+    muon_paths = [
+        path_to_str(path) for (path, _), lbl in zip(flat_params_with_path, flat_labels)
+        if lbl == "muon"
+    ]
+    return muon_paths
 
 
-def dump_muon_gradient_snapshot(avg_grads, label_fn, params, out_path):
-    """Сохраняет на диск (np.savez) градиенты всех muon-параметров вместе
-    с путями -- offline считаешь np.linalg.svd на каждом и смотришь
-    разброс сингулярных чисел. Вызывать host-side, НЕ внутри jit."""
-    import numpy as np
+# ==========================================================================
+# label_fn -- ВЫНЕСЕН НА УРОВЕНЬ МОДУЛЯ (был вложенным в
+# make_hybrid_optimizer) -- train_setup.py импортирует его напрямую для
+# build_muon_leaf_paths, без необходимости вызывать make_hybrid_optimizer
+# заново или дублировать логику классификации.
+# ==========================================================================
 
-    labels = label_fn(params)
-    flat_grads_with_path, _ = jax.tree_util.tree_flatten_with_path(avg_grads)
-    flat_labels, _ = jax.tree_util.tree_flatten(labels)
+def _label_leaf(path, param):
+    path_str = path_to_str(path)
+    if "embed" in path_str or "lm_head" in path_str:
+        return "adamw_decay"
+    if "norm" in path_str or "bias" in path_str:
+        return "adamw_nodecay"
+    if "expert_bias" in path_str:
+        return "frozen"
+    if "router" in path_str:
+        return "adamw_nodecay"
+    # ФИКС: conv_w -- rank<=4 при d_model=768, структурно вырождена для
+    # спектральной ортогонализации (см. чат/synthetic_muon_test.py --
+    # осцилляция orth_resid с ростом ns_steps вместо сходимости).
+    if "conv_w" in path_str:
+        return "lion"
+    if param.ndim >= 2:
+        if "mamba" in path_str:
+            return "lion"
+        # ФИКС: РАСШИРЕНО с "только w2" на "w1 И w2" -- живые логи на
+        # шаге 12900-12902 показывают orth_resid=58-59 на ВСЕХ w2
+        # (routed И shared, все 8 блоков) стабильно, fresh-init тест
+        # показал w1 тоже заметно хуже потолка. Оба -- экстремально
+        # прямоугольные (4096x768 / 768x4096, aspect ratio 5.3x) -- NS
+        # структурно не годится для этой формы независимо от того, w1
+        # это или w2.
+        if ("w1" in path_str or "w2" in path_str) and (
+            "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
+        ):
+            return "lion"
+        return "muon"
+    return "lion"
 
-    to_save = {}
-    report = []
-    for (path, grad_leaf), label_leaf in zip(flat_grads_with_path, flat_labels):
-        if label_leaf == "muon":
-            path_str = path_to_str(path)
-            arr = np.asarray(jax.device_get(grad_leaf), dtype=np.float32)
-            key = path_str.replace("/", "__")
-            to_save[key] = arr
-            report.append((path_str, arr.shape))
 
-    np.savez(out_path, **to_save)
-    print(f"[MUON-SNAPSHOT] Сохранено {len(to_save)} muon-градиентов в {out_path}")
-    for path_str, shape in report:
-        print(f"  {path_str}: shape={shape}")
-    return report
+def _make_label_fn(muon_diagnostic_disable: bool):
+    """Обёртка над модульным _label_leaf, применяющая
+    muon_diagnostic_disable (перевод ВСЕХ muon-параметров на
+    adamw_nodecay, для временного полного отключения Muon -- см. чат:
+    'может вообще муон убрать пока что')."""
+    def label_fn(params):
+        def _leaf(path, param):
+            lbl = _label_leaf(path, param)
+            if lbl == "muon" and muon_diagnostic_disable:
+                return "adamw_nodecay"
+            return lbl
+        return jax.tree_util.tree_map_with_path(_leaf, params)
+    return label_fn
+
 
 # ==========================================================================
 # Основной оптимизатор
 # ==========================================================================
 
 def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = False,
-                           warmup_freeze_step: Optional[int] = DEFAULT_WARMUP_FREEZE_STEP):
-    """Гибридный оптимизатор: Muon (SVD) / Lion / AdamW.
+                           warmup_freeze_step: Optional[int] = DEFAULT_WARMUP_FREEZE_STEP,
+                           muon_ns_steps: int = 7):
+    """Гибридный оптимизатор: Muon (NS7) / Lion / AdamW.
+
+    muon_diagnostic_disable: если True -- ВСЕ параметры, которые иначе
+    получили бы метку "muon", переводятся на "adamw_nodecay" (полное
+    временное отключение Muon без изменения структуры/имён групп -- см.
+    чат про возможность откатиться на Lion/AdamW, пока NS-итерация не
+    разобрана до конца).
 
     warmup_freeze_step: если задан (int) -- LR заморожен на этом шаге.
         None -- полный warmup/cosine-decay без заморозки.
-        DEFAULT_WARMUP_FREEZE_STEP=4000 -- LR растёт естественно в течение
-        warmup (~4660 шагов при total=31072), потолок только после.
-
-    ФИКС base_lr Muon: снижен 0.006->0.001 чтобы компенсировать то, что
-    SVD даёт ТОЧНЫЙ ортогональный фактор (||update|| ~0.12) vs старый
-    сломанный Muon (||update|| ~0.02, в 6 раз меньше). Итоговый
-    эффективный шаг теперь сопоставим. Поднимать по факту логов.
-
-    ФИКС #4 (см. модульный докстринг): MuonState теперь несёт orth_resid
-    -- update_fn ниже считает его КАЖДЫЙ шаг (через _muon_orth_diag) на
-    КАЖДОМ muon-параметре и хранит max в новом состоянии.
+        DEFAULT_WARMUP_FREEZE_STEP=5000 (см. чат).
     """
     warmup_steps = max(500, int(total_steps * 0.15))
     cosine = optax.cosine_decay_schedule(
@@ -467,11 +470,12 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     tx_adamw_decay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.01)
     tx_adamw_nodecay = optax.adamw(learning_rate=adamw_lr, weight_decay=0.0)
 
-    def _muon_step(base_lr: float, weight_decay: float = 0.02):
+    def _muon_step(base_lr: float, weight_decay: float = 0.02, ns_steps: int = muon_ns_steps):
         def init_fn(params):
             return MuonState(
                 count=jnp.zeros([], jnp.int32),
                 orth_resid=jnp.zeros([], jnp.float32),
+                worst_leaf_idx=jnp.zeros([], jnp.int32),
             )
 
         def update_fn(updates, state, params=None):
@@ -479,63 +483,32 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
                 return updates, state
             step_lr = base_lr * lr_schedule(_effective_step(state.count))
             new_updates = jax.tree_util.tree_map(
-                lambda p, g: (muon_orthogonalize(p, g, step_lr, ns_steps=7) - p)
+                lambda p, g: (muon_orthogonalize(p, g, step_lr, ns_steps=ns_steps) - p)
                              - step_lr * weight_decay * p,
                 params, updates,
             )
-            per_leaf_resid = jax.tree_util.tree_map(lambda g: _muon_orth_diag(g, ns_steps=7), updates)
-            leaf_resids = jax.tree_util.tree_leaves(per_leaf_resid)
-            step_orth_resid = (
-                jnp.max(jnp.stack(leaf_resids)) if leaf_resids
-                else jnp.array(0.0, dtype=jnp.float32)
+
+            # ФИКС (локализация, см. чат): argmax через явный flatten с
+            # сохранением порядка -- НЕ jax.tree_map (там индекс теряется).
+            leaves_g, _ = jax.tree_util.tree_flatten(updates)
+            per_leaf_resid = jnp.stack([
+                _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
+            ])
+            worst_idx = jnp.argmax(per_leaf_resid)
+            step_orth_resid = per_leaf_resid[worst_idx]
+
+            return new_updates, MuonState(
+                count=state.count + 1,
+                orth_resid=step_orth_resid,
+                worst_leaf_idx=worst_idx.astype(jnp.int32),
             )
-            return new_updates, MuonState(count=state.count + 1, orth_resid=step_orth_resid)
 
         return optax.GradientTransformation(init_fn, update_fn)
 
-    tx_muon = _muon_step(base_lr=0.001, weight_decay=0.02)
+    tx_muon = _muon_step(base_lr=0.001, weight_decay=0.02, ns_steps=muon_ns_steps)
 
-    def _label_leaf(path, param):
-        path_str = path_to_str(path)
-        if "embed" in path_str or "lm_head" in path_str:
-            return "adamw_decay"
-        if "norm" in path_str or "bias" in path_str:
-            return "adamw_nodecay"
-        if "expert_bias" in path_str:
-            return "frozen"
-        if "router" in path_str:
-            return "adamw_nodecay"
-        # ФИКС: conv_w -- rank<=4 при d_model=768, структурно вырождена
-        # для спектральной ортогонализации (см. synthetic_muon_test.py --
-        # осцилляция orth_resid с ростом ns_steps вместо сходимости).
-        if "conv_w" in path_str:
-            return "lion"
-        if param.ndim >= 2:
-            if "mamba" in path_str:
-                return "lion"
-            # ФИКС: РАСШИРЕНО с "только w2" на "w1 И w2" -- живые логи на
-            # шаге 12900-12902 показывают orth_resid=58-59 на ВСЕХ w2
-            # (routed И shared, все 8 блоков) стабильно, а fresh-init тест
-            # показал w1 тоже заметно хуже потолка (24-25 vs 19.7). Оба --
-            # экстремально прямоугольные (4096x768 / 768x4096, aspect
-            # ratio 5.3x) -- NS5 структурно не годится для этой формы
-            # независимо от того, w1 это или w2.
-            if ("w1" in path_str or "w2" in path_str) and (
-                "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
-            ):
-                return "lion"
-            if muon_diagnostic_disable:
-                return "adamw_nodecay"
-            return "muon"
-        return "lion"
+    label_fn = _make_label_fn(muon_diagnostic_disable)
 
-    def label_fn(params):
-        return jax.tree_util.tree_map_with_path(_label_leaf, params)
-
-    # clip_by_global_norm поднят 0.25 -> 1.0:
-    # старый 0.25 при norm~50 давал clip_factor=0.005 (200x приглушение),
-    # что в паре со сломанным Muon делало шаг вдвойне занижанным.
-    # 1.0 -- стандартный порог для таких моделей.
     clip_tx   = optax.clip_by_global_norm(1.0)
     damper_tx = burst_damper(decay=0.95, threshold_ratio=1.8, min_scale=0.05)
 
@@ -547,8 +520,6 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
         },
         label_fn,
     )
-    # damper_tx -- opt_state[0], extract_zclip_diagnostics возвращает
-    # заглушку с правильными dtype/shape для train_setup.py совместимости.
     tx = optax.chain(damper_tx, clip_tx, multi_tx)
     return tx, lr_schedule
 
@@ -558,21 +529,9 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
 # ==========================================================================
 
 def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_size):
-    """Один чанк CE-потерь.
-
-    ФИКС (этот пасс): убраны make_grad_sanitizer на w и logits_chunk --
-    заменены на make_grad_probe (только диагностика). Градиенты на CE-пути
-    естественно велики (sum по batch*seq токенам), clip_val=1e3 убивал
-    50-90% сигнала. Теперь градиент проходит нетронутым, только
-    non-finite логируется.
-
-    hidden_chunk клипован +-1e3 в forward (защита от численного взрыва
-    активаций), это не касается gradient flow.
-    """
     sum_loss, sum_mask = carry
     hidden_chunk, label_chunk = chunk
 
-    # Forward-side защита активаций (не градиентов)
     hidden_chunk = jnp.nan_to_num(
         jnp.clip(hidden_chunk, -1e3, 1e3),
         nan=0.0, posinf=1e3, neginf=-1e3,
@@ -583,7 +542,6 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
     ).astype(jnp.float32)
     logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
     logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
-    # Probe (диагностика без обрезки): логирует non-finite если будет
     logits_chunk = make_grad_probe("ce_logits_chunk")(logits_chunk)
 
     log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
@@ -667,13 +625,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
     router_max_cos_per_layer = None
     router_max_cos = 0.0
 
-    # ФИКС #4 (см. модульный докстринг): новые sown-диагностики из
-    # model.py -- инициализируем как None по умолчанию (deterministic-путь
-    # / старые версии model.py без этих sow-вызовов просто не заполнят их,
-    # aux_info_sharding в train_setup.py должен допускать None -> но т.к.
-    # это jit-выход, отсутствие ключа здесь означает aux_info просто не
-    # будет содержать это значение под deterministic=True -- train.py уже
-    # обрабатывает это через aux_info.get(...) с проверкой на None).
     diag_stacked = {}
 
     if not deterministic:
@@ -712,11 +663,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
             router_max_cos_per_layer = jnp.stack(max_cos_list)
             router_max_cos = jnp.max(router_max_cos_per_layer)
 
-        # ФИКС #4: собираем все новые ВСЕГДА-включённые sow'ы из model.py
-        # (см. его докстринг про "ДИАГНОСТИКА (всегда вкл)"). Ключи здесь
-        # совпадают с именами, переданными в self.sow("losses", <имя>, ...)
-        # в model.py -- каждый собран в том же порядке обхода pytree, что
-        # и router_temp/norm_x_mean уже собираются выше.
         _DIAG_LEAF_NAMES = (
             "layer_delta_maxabs", "layer_delta_isfinite",
             "layer_resid_maxabs", "layer_resid_isfinite",
@@ -728,10 +674,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
             "gdn2_out_maxabs",
             "mla_input_maxabs", "mla_out_maxabs",
             "final_hidden_maxabs", "final_hidden_isfinite",
-            # ФИКС (kernel-internal diagnostics, см. atomic_ops/kernel_diag.py):
-            # состояние ВНУТРИ Pallas-пайплайна GDN-2 (Aqk/Akk/A/w_pseudo/
-            # u/kg/qg) -- ловит near-singular Akk в Kernel B ДО того, как
-            # это всплывёт как inf в Kernel D несколькими шагами позже.
             "gdn2_kernelstage_aqk_maxabs", "gdn2_kernelstage_aqk_isfinite",
             "gdn2_kernelstage_akk_maxabs", "gdn2_kernelstage_akk_isfinite",
             "gdn2_kernelstage_a_wy_inverse_maxabs", "gdn2_kernelstage_a_wy_inverse_isfinite",
@@ -752,7 +694,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
     else:
         w = params["lm_head"]["kernel"]
 
-    # Forward-side защита final_hidden перед CE-проекцией
     final_hidden = jnp.nan_to_num(
         jnp.clip(final_hidden, -1e3, 1e3),
         nan=0.0, posinf=1e3, neginf=-1e3,
