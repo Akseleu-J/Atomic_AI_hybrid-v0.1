@@ -366,25 +366,24 @@ def  extract_muon_diagnostics(opt_state):
     if not values:
         return jnp.array(0.0, dtype=jnp.float32)
     return jnp.max(jnp.stack([v.astype(jnp.float32) for v in values]))
-def extract_muon_diagnostics_per_leaf(opt_state):
-    """Возвращает {path_str: orth_resid} для КАЖДОГО muon-листа отдельно.
-    Вызывать offline/редко (Python-side дерево путей, не для каждого jit-шага).
+def extract_muon_diagnostics_worst_leaf(opt_state, avg_grads, label_fn, params):
+    """Возвращает (path_str, resid, grad_norm) для ХУДШЕГО muon-листа
+    на этом шаге -- чтобы узнать, какой именно параметр даёт 27.713,
+    и какова норма его градиента (если норма тоже не меняется между
+    шагами -- подозрение на замороженный/незадействованный градиент)."""
+    labels = label_fn(params)
+    flat_grads, _ = jax.tree_util.tree_flatten_with_path(avg_grads)
+    flat_labels, _ = jax.tree_util.tree_flatten(labels)
 
-    Использование после restore:
-        diag = extract_muon_diagnostics_per_leaf(opt_state)
-        for path, resid in sorted(diag.items(), key=lambda kv: -float(kv[1])):
-            print(f"{float(resid):8.3f}  {path}")
-    """
-    result = {}
-
-    def _mark(path, leaf):
-        path_str = path_to_str(path)
-        if "orth_resid" in path_str and hasattr(leaf, "shape"):
-            result[path_str] = leaf
-        return leaf
-
-    jax.tree_util.tree_map_with_path(_mark, opt_state)
-    return result
+    worst = None
+    for (path, g), lbl in zip(flat_grads, flat_labels):
+        if lbl != "muon":
+            continue
+        resid = _muon_orth_diag(g, ns_steps=7)
+        gnorm = jnp.linalg.norm(g)
+        if worst is None or resid > worst[1]:
+            worst = (path_to_str(path), resid, gnorm)
+    return worst
 
 
 def dump_muon_gradient_snapshot(avg_grads, label_fn, params, out_path):
