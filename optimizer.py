@@ -220,7 +220,8 @@ class MuonState(NamedTuple):
     count: jnp.ndarray
     orth_resid: jnp.ndarray
     worst_leaf_idx: jnp.ndarray
-
+    worst_leaf_grad_norm: jnp.ndarray      # НОВОЕ
+    worst_leaf_grad_maxabs: jnp.ndarray    # НОВОЕ
 
 class ZClipState(NamedTuple):
     ema_mean: jnp.ndarray
@@ -274,16 +275,18 @@ def extract_zclip_diagnostics(opt_state):
 
 
 def extract_muon_diagnostics(opt_state):
-    """Возвращает (max_orth_resid, worst_leaf_idx). worst_leaf_idx -- индекс
-    листа ВНУТРИ muon-подветки params (см. build_muon_leaf_paths). Если
-    muon-подветка пуста -- (0.0, -1)."""
     resid_values = collect_by_leaf_name(opt_state, "orth_resid")
     idx_values = collect_by_leaf_name(opt_state, "worst_leaf_idx")
+    norm_values = collect_by_leaf_name(opt_state, "worst_leaf_grad_norm")
+    maxabs_values = collect_by_leaf_name(opt_state, "worst_leaf_grad_maxabs")
     if not resid_values:
-        return jnp.array(0.0, dtype=jnp.float32), jnp.array(-1, dtype=jnp.int32)
+        z = jnp.array(0.0, dtype=jnp.float32)
+        return z, jnp.array(-1, dtype=jnp.int32), z, z
     max_resid = jnp.max(jnp.stack([v.astype(jnp.float32) for v in resid_values]))
     worst_idx = idx_values[0].astype(jnp.int32) if idx_values else jnp.array(-1, dtype=jnp.int32)
-    return max_resid, worst_idx
+    worst_norm = norm_values[0].astype(jnp.float32) if norm_values else jnp.array(0.0, dtype=jnp.float32)
+    worst_maxabs = maxabs_values[0].astype(jnp.float32) if maxabs_values else jnp.array(0.0, dtype=jnp.float32)
+    return max_resid, worst_idx, worst_norm, worst_maxabs
 
 
 def build_muon_leaf_paths(params, label_fn):
@@ -382,30 +385,44 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
                 count=jnp.zeros([], jnp.int32),
                 orth_resid=jnp.zeros([], jnp.float32),
                 worst_leaf_idx=jnp.zeros([], jnp.int32),
+                worst_leaf_grad_norm=jnp.zeros([], jnp.float32),      # НОВОЕ
+                worst_leaf_grad_maxabs=jnp.zeros([], jnp.float32),    # НОВОЕ
             )
 
         def update_fn(updates, state, params=None):
-            if params is None:
-                return updates, state
-            step_lr = base_lr * lr_schedule(_effective_step(state.count))
-            new_updates = jax.tree_util.tree_map(
-                lambda p, g: (muon_orthogonalize(p, g, step_lr, ns_steps=ns_steps) - p)
-                             - step_lr * weight_decay * p,
-                params, updates,
-            )
+          if params is None:
+              return updates, state
+          step_lr = base_lr * lr_schedule(_effective_step(state.count))
+          new_updates = jax.tree_util.tree_map(
+              lambda p, g: (muon_orthogonalize(p, g, step_lr, ns_steps=ns_steps) - p)
+                           - step_lr * weight_decay * p,
+              params, updates,
+          )
 
-            leaves_g, _ = jax.tree_util.tree_flatten(updates)
-            per_leaf_resid = jnp.stack([
-                _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
-            ])
-            worst_idx = jnp.argmax(per_leaf_resid)
-            step_orth_resid = per_leaf_resid[worst_idx]
+          leaves_g, _ = jax.tree_util.tree_flatten(updates)
+          per_leaf_resid = jnp.stack([
+              _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
+           ])
+          worst_idx = jnp.argmax(per_leaf_resid)
+          step_orth_resid = per_leaf_resid[worst_idx]
 
-            return new_updates, MuonState(
-                count=state.count + 1,
-                orth_resid=step_orth_resid,
-                worst_leaf_idx=worst_idx.astype(jnp.int32),
-            )
+          # НОВОЕ: норма и maxabs градиента ИМЕННО худшего листа -- дёшево
+          # (один-два reduce поверх уже посчитанного stacked tensor нельзя,
+          # т.к. листья разной формы, но динамический индекс через lax.switch
+          # избыточен -- проще посчитать по ВСЕМ листьям через tree_map и
+          # выбрать через jnp.take на flat-массиве скаляров).
+          leaf_norms = jnp.stack([jnp.linalg.norm(g.astype(jnp.float32)) for g in leaves_g])
+          leaf_maxabs = jnp.stack([jnp.max(jnp.abs(g.astype(jnp.float32))) for g in leaves_g])
+          worst_leaf_grad_norm = leaf_norms[worst_idx]
+          worst_leaf_grad_maxabs = leaf_maxabs[worst_idx]
+
+          return new_updates, MuonState(
+              count=state.count + 1,
+              orth_resid=step_orth_resid,
+              worst_leaf_idx=worst_idx.astype(jnp.int32),
+              worst_leaf_grad_norm=worst_leaf_grad_norm,
+              worst_leaf_grad_maxabs=worst_leaf_grad_maxabs,
+        )
 
         return optax.GradientTransformation(init_fn, update_fn)
 
