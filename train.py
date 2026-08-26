@@ -551,13 +551,14 @@ def main_execution():
     # ЗДЕСЬ, сразу ПОСЛЕ вызова.
     from train_setup import _PARAM_LAYER_TAGS, _SOW_LAYER_TAGS, _MUON_LEAF_PATHS
 
-    if _MUON_LEAF_PATHS:
+        if _MUON_LEAF_PATHS:
         print(f"[MUON-DIAG] Всего muon-параметров: {len(_MUON_LEAF_PATHS)}")
         for i, p in enumerate(_MUON_LEAF_PATHS):
             marker = "  <-- ХУДШИЙ (idx=8)" if i == 8 else ""
             print(f"  muon[{i}] = {p}{marker}")
-else:
-    print("[MUON-DIAG] ⚠️ _MUON_LEAF_PATHS пуст/None — локализация недоступна.")
+    else:
+        print("[MUON-DIAG] ⚠️ _MUON_LEAF_PATHS пуст/None — локализация недоступна.")
+
     print(f"[LR-DIAG] warmup_steps={max(500, int(total_train_steps * 0.20))}, "
           f"total_train_steps={total_train_steps} -- opt_state (momentum + count) теперь "
           f"реально восстанавливается из чекпоинта при resume, так что warmup БОЛЬШЕ НЕ "
@@ -902,6 +903,19 @@ else:
 
                 _muon_orth_resid_val = float(jax.device_get(muon_orth_resid))
                 _muon_worst_idx_val = int(jax.device_get(muon_worst_leaf_idx))  # у вас уже есть muon_worst_leaf_idx в unpacking
+                _muon_worst_grad_norm_val = float(jax.device_get(muon_worst_leaf_grad_norm))
+                _muon_worst_grad_maxabs_val = float(jax.device_get(muon_worst_leaf_grad_maxabs))
+
+                if _MUON_LEAF_PATHS and 0 <= _muon_worst_idx_val < len(_MUON_LEAF_PATHS):
+                    _muon_worst_path = _MUON_LEAF_PATHS[_muon_worst_idx_val]
+                else:
+                    _muon_worst_path = f"<idx={_muon_worst_idx_val}, путь неизвестен>"
+
+                _muon_orth_resid_val = float(jax.device_get(muon_orth_resid))
+                _muon_worst_idx_val = int(jax.device_get(muon_worst_leaf_idx))
+                _muon_worst_grad_norm_val = float(jax.device_get(muon_worst_leaf_grad_norm))
+                _muon_worst_grad_maxabs_val = float(jax.device_get(muon_worst_leaf_grad_maxabs))
+
                 if _MUON_LEAF_PATHS and 0 <= _muon_worst_idx_val < len(_MUON_LEAF_PATHS):
                     _muon_worst_path = _MUON_LEAF_PATHS[_muon_worst_idx_val]
                 else:
@@ -909,10 +923,8 @@ else:
 
                 if _muon_orth_resid_val > 5.0:
                     print(f"[MUON-DIAG] ⚠️ Newton-Schulz orth_resid={_muon_orth_resid_val:.3f} "
-                          f"на global_step={global_step + 1} -- ХУДШИЙ ПАРАМЕТР: {_muon_worst_path}")
-
-                wandb_step_diag_metrics["train/muon_worst_leaf_idx"] = _muon_worst_idx_val
-                wandb_step_diag_metrics["train/muon_worst_leaf_path"] = _muon_worst_path
+                          f"на global_step={global_step + 1} -- ХУДШИЙ ПАРАМЕТР: {_muon_worst_path} "
+                          f"(grad_norm={_muon_worst_grad_norm_val:.4e}, grad_maxabs={_muon_worst_grad_maxabs_val:.4e})")
 
                 _layer_grad_norms_np = jax.device_get(layer_grad_norms)
                 _layer_grad_maxabs_np = jax.device_get(layer_grad_maxabs)
@@ -928,7 +940,9 @@ else:
                 # булевый nonfinite-флаг.
                 _group_grad_norms_np = jax.device_get(group_grad_norms)
                 _group_weight_norms_np = jax.device_get(group_weight_norms)
-
+                for _name, _gn, _wn in zip(_DIAG_GROUPS, _group_grad_norms_np, _group_weight_norms_np):
+                    wandb_step_diag_metrics[f"group_grad_norm/{_name}"] = float(_gn)
+                    wandb_step_diag_metrics[f"group_weight_norm/{_name}"] = float(_wn)
                 _layer_diag_metrics = {}
                 for _tag, _gn, _gm, _gnf, _wn, _wm, _wnf in zip(
                     _PARAM_LAYER_TAGS, _layer_grad_norms_np, _layer_grad_maxabs_np, _layer_grad_nonfinite_np,
@@ -962,6 +976,9 @@ else:
                     "train/param_clip_triggered": int(_was_clipped_val),
                     "train/muon_orth_resid": _muon_orth_resid_val,
                     "train/muon_worst_leaf_idx": _muon_worst_idx_val,
+                    "train/muon_worst_leaf_path": _muon_worst_path,
+                    "train/muon_worst_leaf_grad_norm": _muon_worst_grad_norm_val,
+                    "train/muon_worst_leaf_grad_maxabs": _muon_worst_grad_maxabs_val,
                 }
                 # ФИКС (этот пасс): за оптимизаторскую группу теперь пишем
                 # И nonfinite-флаг, И grad/weight L2-норму -- детальнее,
