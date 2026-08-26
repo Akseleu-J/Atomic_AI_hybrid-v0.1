@@ -1507,8 +1507,17 @@ def main_execution():
                             wandb_step_metrics[f"sow/{_sow_name}_min"] = float(jnp.min(jax.device_get(_v)))
 
                     if aux_info.get("final_hidden_maxabs") is not None:
+                        # ФИКС (TypeError: only 0-dimensional arrays can be
+                        # converted to Python scalars): final_hidden_maxabs
+                        # can come back as a non-scalar array from
+                        # collect_by_leaf_name (same reason every other
+                        # *_maxabs field in this block is already wrapped
+                        # in jnp.max(...) before float() -- see
+                        # layer_delta_maxabs/gdn2_*_maxabs above). Bare
+                        # float() crashes the moment more than one value
+                        # is collected for this leaf name.
                         wandb_step_metrics["sow/final_hidden_maxabs"] = float(
-                            jax.device_get(aux_info["final_hidden_maxabs"])
+                            jnp.max(jax.device_get(aux_info["final_hidden_maxabs"]))
                         )
 
                     wandb_logging.log_metrics(global_step, wandb_step_metrics)
