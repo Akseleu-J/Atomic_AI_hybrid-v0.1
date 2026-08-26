@@ -1,14 +1,46 @@
 """
-train_setup.py -- диагностика non-finite по группам параметров, TPU mesh /
-шардинг / компиляция train-step'ов, multi-source dataloader.
+train_setup.py -- диагностика non-finite ПО ОПТИМИЗАТОРСКИМ ГРУППАМ, TPU
+mesh / шардинг / компиляция train-step'ов, multi-source dataloader.
 
-ФИКС (этот пасс -- локализация Muon orth_resid, см. чат): построение
-_MUON_LEAF_PATHS через optimizer.build_muon_leaf_paths -- модульный
-атрибут, экспортируемый для train.py, чтобы КАЖДЫЙ шаг расшифровывать
-worst_leaf_idx (число из jit-графа, см. MuonState.worst_leaf_idx) в
-реальный путь параметра, без offline-скриптов. distributed_apply_step
-теперь возвращает 17 значений вместо 16 -- добавлен muon_worst_leaf_idx
-СРАЗУ ПОСЛЕ muon_orth_resid.
+ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к оптимизатору, см. чат):
+раньше _DIAG_GROUPS группировала параметры по АРХИТЕКТУРНОМУ типу ядра
+(gdn2/mamba2/mla/moe/embed/other, через _classify_leaf_group -- ручное
+сопоставление по подстрокам пути). Это дублировало то, что optimizer.py
+и так уже решает через _label_leaf (какой ИМЕННО optax-трансформ
+(muon/lion/adamw_decay/adamw_nodecay/frozen) обновляет этот лист), и не
+отвечало напрямую на вопрос "какой оптимизатор сейчас нестабилен" --
+приходилось смотреть и на группу, и отдельно на muon_orth_resid.
+
+Теперь _DIAG_GROUPS == те же метки, что использует
+optimizer.py's multi_transform (тот же `_label_leaf`, импортирован как
+`_optimizer_label_leaf`). "non-finite в группе muon" теперь означает
+буквально "не-finite в подветке параметров, которую обновляет Muon" -- без
+необходимости смотреть внутрь конкретного Pallas-ядра (GDN-2/Mamba2/MLA).
+
+Плюс: build_group_norms_fn -- НОВОЕ, даёт L2-норму градиента И весов ПО
+КАЖДОЙ optimizer-группе каждый эффективный шаг (не только булевый
+nonfinite-флаг) -- видно, что РАСТЁТ, до того как оно реально сломается.
+distributed_apply_step теперь возвращает 19 значений вместо 17 --
+добавлены group_grad_norms, group_weight_norms В САМОМ КОНЦЕ.
+
+ФИКС (этот пасс -- критический краш компиляции): aux_info_sharding раньше
+содержал ~30 ключей для kernel/activation-level sow()-значений
+(gdn2_kernelstage_*, mamba2_ssm_out_*, mla_*, layer_delta_*, layer_resid_*,
+final_hidden_*, ...), которых compute_loss() (optimizer.py) БОЛЬШЕ НЕ
+возвращает -- соответствующие self.sow(...) вызовы удалены из model.py
+(см. его докстринг "диагностика сведена ТОЛЬКО к оптимизатору").
+jax.jit(..., out_shardings=aux_info_sharding) требует, чтобы дерево
+out_shardings СТРУКТУРНО совпадало с реальным выходом функции -- лишние
+ключи в out_shardings ломают компиляцию compiled_train_micro при первом
+же реальном вызове (не при импорте модуля -- падает ровно в тот момент,
+когда пытаешься реально запустить обучение). Оставлены только ключи,
+которые compute_loss реально кладёт в aux_info при return_aux=True.
+
+ФИКС (локализация Muon orth_resid, предыдущий пасс, без изменений в этом
+пассе): построение _MUON_LEAF_PATHS через optimizer.build_muon_leaf_paths
+-- модульный атрибут, экспортируемый для train.py, чтобы КАЖДЫЙ шаг
+расшифровывать worst_leaf_idx (число из jit-графа, см.
+MuonState.worst_leaf_idx) в реальный путь параметра, без offline-скриптов.
 
 Остальное -- без изменений логики относительно предыдущего пасса
 (ФИКС #1-10, см. прежний докстринг ниже).
@@ -95,27 +127,24 @@ def apply_expert_bias_update(new_params, bias_index_map, assignment_frac_stacked
 
 SESSION_TIME_BUDGET_SECONDS = 9 * 3600 - 5 * 60
 
-_DIAG_GROUPS = ("gdn2", "mamba2", "mla", "moe", "muon_decay", "embed", "other")
-
-
-def _classify_leaf_group(path_str: str) -> str:
-    if "gdn2" in path_str:
-        return "gdn2"
-    if "mamba2" in path_str:
-        return "mamba2"
-    if "mla" in path_str:
-        return "mla"
-    if "experts_block" in path_str or "moe" in path_str or "router" in path_str:
-        return "moe"
-    if "embed" in path_str or "lm_head" in path_str:
-        return "embed"
-    return "other"
+# ==========================================================================
+# ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к оптимизатору): группы
+# теперь = метки optax multi_transform (см. optimizer.py's _label_leaf),
+# не архитектурный тип ядра. "moe"/"muon_decay" отдельных групп больше нет
+# -- MoE-эксперты и roter уже классифицируются как lion/adamw_nodecay
+# самим _label_leaf (см. optimizer.py), так что их nonfinite/norm-статус
+# виден через ТУ ЖЕ группу, что реально их обновляет.
+# ==========================================================================
+_DIAG_GROUPS = ("muon", "lion", "adamw_decay", "adamw_nodecay", "frozen")
 
 
 def make_grad_group_map(params):
-    return jax.tree_util.tree_map_with_path(
-        lambda path, _: _classify_leaf_group(path_to_str(path)), params
-    )
+    """ФИКС (этот пасс): группировка листьев теперь по ОПТИМИЗАТОРСКОЙ
+    метке (_label_leaf из optimizer.py -- та же функция, что
+    multi_transform реально использует для выбора трансформа), а не по
+    архитектурному типу ядра. Один источник истины для "какая группа
+    отвечает за какие параметры" -- optimizer.py, не дублируется здесь."""
+    return jax.tree_util.tree_map_with_path(_optimizer_label_leaf, params)
 
 
 def build_group_nonfinite_flags(grad_group_map):
@@ -136,6 +165,33 @@ def build_group_nonfinite_flags(grad_group_map):
         return jnp.stack(flags)
 
     return _flags
+
+
+def build_group_norms_fn(grad_group_map, groups):
+    """НОВОЕ (этот пасс): L2-норма ПО КАЖДОЙ оптимизаторской группе --
+    те же группы, что build_group_nonfinite_flags, но с реальной
+    величиной, а не только булевым флагом. Одна и та же функция
+    применяется и к avg_grads (-> group_grad_norms), и к new_p
+    (-> group_weight_norms) -- обе имеют ту же листовую структуру, что и
+    grad_group_map. Даёт видимость "что растёт" в конкретной группе
+    оптимизатора ДО того, как она реально уйдёт в non-finite."""
+    leaves_g, _ = jax.tree_util.tree_flatten(grad_group_map)
+    idx_by_group = {grp: [i for i, gg in enumerate(leaves_g) if gg == grp] for grp in groups}
+
+    def _norms(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        norms = []
+        for grp in groups:
+            idxs = idx_by_group[grp]
+            if not idxs:
+                norms.append(jnp.array(0.0, dtype=jnp.float32))
+                continue
+            safe = [jnp.nan_to_num(leaves[i].astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0) for i in idxs]
+            sq = sum(jnp.sum(jnp.square(s)) for s in safe)
+            norms.append(jnp.sqrt(sq))
+        return jnp.stack(norms)
+
+    return _norms
 
 
 def make_tpu_mesh():
@@ -218,8 +274,16 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
 
     param_sharding = jax.tree_util.tree_map_with_path(_get_shard_spec, abstract_params)
 
+    # ФИКС (этот пасс -- диагностика сведена ТОЛЬКО к оптимизатору):
+    # grad_group_map теперь строится через _optimizer_label_leaf (см.
+    # make_grad_group_map выше), и добавлены _group_grad_norms_fn /
+    # _group_weight_norms_fn -- по-группная L2-норма, не только флаг.
     grad_group_map = make_grad_group_map(abstract_params)
     _group_nonfinite_flags = build_group_nonfinite_flags(grad_group_map)
+    _group_grad_norms_fn = build_group_norms_fn(grad_group_map, _DIAG_GROUPS)
+    _group_weight_norms_fn = build_group_norms_fn(grad_group_map, _DIAG_GROUPS)
+    print(f"[DIAG] По-оптимизаторская диагностика: группы {_DIAG_GROUPS} "
+          f"(nonfinite-флаг + grad/weight L2-норма на группу, каждый эффективный шаг).")
 
     grad_layer_map = make_leaf_layer_map(abstract_params)
     _PARAM_LAYER_TAGS = param_layer_tags(grad_layer_map)
@@ -285,6 +349,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
         group_nonfinite_flags = _group_nonfinite_flags(avg_grads)
+        group_grad_norms = _group_grad_norms_fn(avg_grads)
         layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite = _layer_grad_stats_fn(avg_grads)
 
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
@@ -311,6 +376,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         new_p = apply_expert_bias_update(new_p, _expert_bias_index_map, assignment_frac_stacked)
 
         layer_w_norms, layer_w_maxabs, layer_w_nonfinite = _layer_weight_stats_fn(new_p)
+        group_weight_norms = _group_weight_norms_fn(new_p)
 
         # ФИКС (локализация, см. модульный докстринг выше):
         # extract_muon_diagnostics теперь возвращает ПАРУ.
@@ -328,7 +394,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 zclip_diag,
                 layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
                 layer_w_norms, layer_w_maxabs, layer_w_nonfinite,
-                muon_orth_resid, muon_worst_leaf_idx)
+                muon_orth_resid, muon_worst_leaf_idx,
+                group_grad_norms, group_weight_norms)
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -337,6 +404,12 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             deterministic=True,
         )
 
+    # ФИКС (этот пасс -- критический краш компиляции, см. модульный
+    # докстринг выше): убраны ~30 ключей для kernel/activation-level
+    # sow()-значений, которых compute_loss() БОЛЬШЕ НЕ возвращает (эти
+    # self.sow(...) удалены из model.py). Оставлены только ключи, которые
+    # compute_loss реально кладёт в aux_info при return_aux=True (см.
+    # optimizer.py's compute_loss -- финальный `aux_info = {...}` словарь).
     aux_info_sharding = {
         "ce_loss": NamedSharding(mesh, P()),
         "aux_loss": NamedSharding(mesh, P()),
@@ -352,41 +425,6 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "router_max_cos_per_layer": NamedSharding(mesh, P()),
         "router_max_cos": NamedSharding(mesh, P()),
         "assignment_frac": NamedSharding(mesh, P(None, None)),
-        "layer_delta_maxabs": NamedSharding(mesh, P(None)),
-        "layer_delta_isfinite": NamedSharding(mesh, P(None)),
-        "layer_resid_maxabs": NamedSharding(mesh, P(None)),
-        "layer_resid_isfinite": NamedSharding(mesh, P(None)),
-        "mamba2_input_maxabs": NamedSharding(mesh, P(None)),
-        "mamba2_input_isfinite": NamedSharding(mesh, P(None)),
-        "mamba2_A_maxabs": NamedSharding(mesh, P(None)),
-        "mamba2_ssm_out_pre_norm_maxabs": NamedSharding(mesh, P(None)),
-        "mamba2_ssm_out_pre_norm_isfinite": NamedSharding(mesh, P(None)),
-        "mamba2_ssm_out_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_input_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_input_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_decay_a_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_raw_out_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_raw_out_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_h_final_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_out_maxabs": NamedSharding(mesh, P(None)),
-        "mla_input_maxabs": NamedSharding(mesh, P(None)),
-        "mla_out_maxabs": NamedSharding(mesh, P(None)),
-        "final_hidden_maxabs": NamedSharding(mesh, P(None)),
-        "final_hidden_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_aqk_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_aqk_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_akk_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_akk_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_a_wy_inverse_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_a_wy_inverse_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_w_pseudo_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_w_pseudo_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_u_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_u_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_kg_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_kg_isfinite": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_qg_maxabs": NamedSharding(mesh, P(None)),
-        "gdn2_kernelstage_qg_isfinite": NamedSharding(mesh, P(None)),
     }
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
@@ -444,7 +482,9 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P(None)),    # layer_w_maxabs
             NamedSharding(mesh, P(None)),    # layer_w_nonfinite
             NamedSharding(mesh, P()),        # muon_orth_resid
-            NamedSharding(mesh, P()),        # muon_worst_leaf_idx  <-- НОВОЕ
+            NamedSharding(mesh, P()),        # muon_worst_leaf_idx
+            NamedSharding(mesh, P(None)),    # group_grad_norms    <-- НОВОЕ
+            NamedSharding(mesh, P(None)),    # group_weight_norms  <-- НОВОЕ
         ),
     )
 
