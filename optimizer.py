@@ -406,9 +406,22 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
           leaves_g, _ = jax.tree_util.tree_flatten(updates)
           per_leaf_resid = jnp.stack([
               _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
-           ])
-          worst_idx = jnp.argmax(per_leaf_resid)
+          ])
+
+          leaf_norms_pre = jnp.stack([jnp.linalg.norm(g.astype(jnp.float32)) for g in leaves_g])
+          _EPS_GRAD = 1e-8
+          per_leaf_resid_masked = jnp.where(leaf_norms_pre < _EPS_GRAD, -jnp.inf, per_leaf_resid)
+
+          worst_idx = jnp.argmax(per_leaf_resid_masked)
           step_orth_resid = per_leaf_resid[worst_idx]
+
+          _valid_mask = leaf_norms_pre >= _EPS_GRAD
+          step_mean_orth_resid = jnp.sum(jnp.where(_valid_mask, per_leaf_resid, 0.0)) / jnp.maximum(jnp.sum(_valid_mask), 1)
+
+          leaf_norms = leaf_norms_pre
+          leaf_maxabs = jnp.stack([jnp.max(jnp.abs(g.astype(jnp.float32))) for g in leaves_g])
+          worst_leaf_grad_norm = leaf_norms[worst_idx]
+          worst_leaf_grad_maxabs = leaf_maxabs[worst_idx]
           step_mean_orth_resid = jnp.mean(per_leaf_resid)   # НОВОЕ
 
           # НОВОЕ: норма и maxabs градиента ИМЕННО худшего листа -- дёшево
