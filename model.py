@@ -887,6 +887,16 @@ class FullHybridMoEModel(nn.Module):
             dtype=jnp.bfloat16,
         )
         x_input = embed_layer(input_ids)
+        # ФИКС: embed используется ДВАЖДЫ -- как input lookup (здесь) и как
+        # выходная проекция логитов (tied, защищена ce_w_embed_or_lmhead в
+        # optimizer.py). Это ДВА независимых градиентных пути в один и тот же
+        # параметр -- градиенты суммируются. CE-барьеры защищают только путь #2;
+        # non-finite, родившийся где угодно во ВСЕЙ остальной модели (любой блок,
+        # любой слой), попадает в embed через путь #1, полностью минуя CE-барьеры
+        # -- это объясняет, почему embed уходит non-finite, а
+        # ce_logits_chunk/ce_w_embed_or_lmhead/final_hidden_pre_ce ни разу не
+        # сработали.
+        x_input = make_grad_sanitizer("embed_input_lookup", clip_val=1e3)(x_input)
         x = x_input
         causal_mask = jnp.tril(jnp.ones((l, l))).astype(jnp.bool_)[None, None, :, :]
 
