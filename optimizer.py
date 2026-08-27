@@ -327,6 +327,21 @@ def _label_leaf(path, param):
             "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
         ):
             return "lion"
+        # ФИКС: q_proj/k_proj внутри DAR/Intra-attention (HybridDARAttention,
+        # IntraBlockAttention) -- маленькие d_latent-размерные вспомогательные
+        # проекции маршрутизации, НЕ магистраль модели. Эмпирически (см.
+        # [MUON-DIAG] логи, global_step=7011-7020) дают хронически вырожденный
+        # (низкого ранга) градиент -- orth_resid стабильно ~sqrt(dim), т.к.
+        # Newton-Schulz структурно не может полностью ортогонализировать
+        # вырожденную матрицу, независимо от величины градиента (Muon
+        # нормирует градиент перед NS, так что даже tiny grad_norm даёт
+        # полноразмерное after-lr обновление в плохо определённом
+        # направлении). Тот же класс проблемы, что уже привёл conv_w и
+        # routed MoE w1/w2 на Lion -- тот же фикс.
+        if ("dar" in path_str or "intra" in path_str) and (
+            "k_proj" in path_str or "q_proj" in path_str
+        ):
+            return "lion"
         return "muon"
     return "lion"
 
