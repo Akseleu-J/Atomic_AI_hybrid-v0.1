@@ -107,6 +107,37 @@ def build_leaf_stats_fn(leaf_tag_map, tags):
         return jnp.stack(norms), jnp.stack(maxabs), jnp.stack(nonfinite)
 
     return _stats
+def build_leaf_raw_stats_fn(leaf_tag_map, tags):
+    """Как build_leaf_stats_fn, но maxabs/nonfinite_count считаются на
+    СЫРЫХ значениях (без nan_to_num до подсчёта) -- существующий
+    build_leaf_stats_fn санитизирует ДО вычисления normы/maxabs, что
+    маскирует реальную величину NaN/inf-выброса (см. чат: "здоровые"
+    normы 0.1-0.3 на шагах, где nonfinite-флаг сработал). Здесь maxabs
+    считается ТОЛЬКО по конечной части (как kernel_d_pipeline._stage_diag),
+    плюс отдельно -- сколько именно элементов non-finite, чтобы отличить
+    "один залётный NaN" от "массового обвала"."""
+    leaves_tag, _ = jax.tree_util.tree_flatten(leaf_tag_map)
+    idx_by_tag = {t: [i for i, tt in enumerate(leaves_tag) if tt == t] for t in tags}
+
+    def _stats(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        raw_maxabs, nonfinite_count = [], []
+        for tag in tags:
+            idxs = idx_by_tag[tag]
+            if not idxs:
+                raw_maxabs.append(jnp.array(0.0, dtype=jnp.float32))
+                nonfinite_count.append(jnp.array(0, dtype=jnp.int32))
+                continue
+            raws = [leaves[i].astype(jnp.float32) for i in idxs]
+            finite_masks = [jnp.isfinite(r) for r in raws]
+            n_nf = sum(jnp.sum(jnp.logical_not(m)).astype(jnp.int32) for m in finite_masks)
+            finite_only = [jnp.where(m, r, 0.0) for r, m in zip(raws, finite_masks)]
+            mx = jnp.max(jnp.stack([jnp.max(jnp.abs(f)) for f in finite_only]))
+            raw_maxabs.append(mx)
+            nonfinite_count.append(n_nf)
+        return jnp.stack(raw_maxabs), jnp.stack(nonfinite_count)
+
+    return _stats
 
 
 class HostLayerBurstTracker:
