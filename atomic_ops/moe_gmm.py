@@ -548,6 +548,12 @@ class GmmMoEJ(nn.Module):
         def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
             T_rep = flat_x_local.shape[0]  # = k * T_local_device
             group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
+            # ФИКС (диагностика NaN в gmm/tgmm, см. чат): эксперт с
+            # group_sizes==0 -- классический edge-case для grouped-matmul
+            # кернелов. Sow'им min/max по группе, чтобы на инцидентном шаге
+            # видеть, не был ли какой-то эксперт полностью пуст.
+            _min_group_size = jnp.min(group_sizes)
+            _max_group_size = jnp.max(group_sizes)
             perm = jnp.argsort(expert_idx_local, stable=True)
             inv_perm = jnp.argsort(perm)
 
@@ -555,7 +561,7 @@ class GmmMoEJ(nn.Module):
             grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
             out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
 
-            return jnp.take(out_sorted, inv_perm, axis=0)  # (T_rep, d), тот же порядок, что flat_x_local
+            return jnp.take(out_sorted, inv_perm, axis=0), _min_group_size, _max_group_size
 
         # flat_x_rep: (k*T, d) -- k конкатенированных копий flat_x, в
         # порядке [копия под top-1-выбор для каждого токена][копия под
@@ -567,32 +573,18 @@ class GmmMoEJ(nn.Module):
 
         if mesh is not None and batch_axis is not None:
             def _dispatch_local_topk(flat_x_local, top_idx_local, top_gate_local, W1_local, W2_local):
-                # Внутри shard_map: flat_x_local -- (T_local, d),
-                # top_idx_local/top_gate_local -- (T_local, k).
                 flat_x_rep_local = jnp.concatenate([flat_x_local] * k, axis=0)
                 expert_idx_rep_local = jnp.concatenate(
                     [top_idx_local[:, j] for j in range(k)], axis=0
                 )
-                out_rep_local = _dispatch_and_ffn(flat_x_rep_local, expert_idx_rep_local, W1_local, W2_local)
-                # ФИКС: split+weighted-combine (M3') ПЕРЕНЕСЕНЫ ВНУТРЬ shard_map.
-                # Причина: out_rep_local имеет форму (k*T_local, d) --
-                # если вернуть её КАК ЕСТЬ наружу под out_specs=P(batch_axis,
-                # None), shard_map соберёт глобальный массив КОНКАТЕНАЦИЕЙ
-                # ПО УСТРОЙСТВАМ вдоль batch_axis: [dev0: copy0,copy1][dev1:
-                # copy0,copy1]... -- а код снаружи ожидал бы порядок
-                # [copy0_ВСЕ][copy1_ВСЕ]. Эти два порядка совпадают ТОЛЬКО
-                # при n_devices=1 -- при n_devices>1 расходятся, давая
-                # finite, но НЕВЕРНЫЙ результат (см. M5-topk2 тест,
-                # rel_err=0.157). Комбинирование должно происходить на
-                # ЛОКАЛЬНЫХ per-device T_local-строках, ДО того как
-                # shard_map соберёт результат по batch_axis -- тогда наружу
-                # уходит уже готовый (T_local, d), без всякой k-неоднозначности.
-                out_chunks_local = jnp.split(out_rep_local, k, axis=0)  # k x (T_local, d)
+                out_rep_local, _min_gs, _max_gs = _dispatch_and_ffn(
+                    flat_x_rep_local, expert_idx_rep_local, W1_local, W2_local
+                )
+                out_chunks_local = jnp.split(out_rep_local, k, axis=0)
                 combined_local = jnp.zeros_like(flat_x_local, dtype=jnp.float32)
                 for j in range(k):
                     combined_local = combined_local + out_chunks_local[j].astype(jnp.float32) * top_gate_local[:, j:j+1]
-                return combined_local  # (T_local, d) -- однозначно совпадает с out_specs
-
+                return combined_local, _min_gs, _max_gs
             in_specs = (
                 P(batch_axis, None),   # flat_x
                 P(batch_axis, None),   # top_idx
@@ -600,26 +592,28 @@ class GmmMoEJ(nn.Module):
                 P(None, None, None),   # W1
                 P(None, None, None),   # W2
             )
-            out_specs = P(batch_axis, None)
+            out_specs = (P(batch_axis, None), P(), P())
             sharded_dispatch = jax.shard_map(
                 _dispatch_local_topk, mesh=mesh,
                 in_specs=in_specs, out_specs=out_specs,
                 check_vma=False,
             )
-            routed_out = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
+            routed_out, _min_gs_all, _max_gs_all = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
             if mesh is None:
                 raise RuntimeError(
                     "GmmMoEJ: get_model_mesh() вернул None во время трассировки — "
                     "set_model_mesh() должен быть вызван до первого model.init()/jit."
                )
+            self.sow("losses", "moe_min_group_size", jnp.min(_min_gs_all))
+            self.sow("losses", "moe_max_group_size", jnp.max(_max_gs_all))
         else:
-            # без mesh: split+combine остаются снаружи, как было -- здесь
-            # неоднозначности порядка нет, потому что shard_map не участвует.
-            routed_out_rep = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
+            routed_out_rep, _min_gs, _max_gs = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
             out_chunks = jnp.split(routed_out_rep, k, axis=0)
             routed_out = jnp.zeros_like(flat_x, dtype=jnp.float32)
             for j in range(k):
                 routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1]
+            self.sow("losses", "moe_min_group_size", _min_gs)
+            self.sow("losses", "moe_max_group_size", _max_gs)
         # ==================================================================
         # M3': combine -- разбить (k*T, d) обратно на k кусков по T строк
         # каждый (тот же порядок конкатенации, что при dispatch), взвесить
