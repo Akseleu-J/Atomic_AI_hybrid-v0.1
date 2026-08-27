@@ -327,17 +327,13 @@ def _label_leaf(path, param):
             "expert" in path_str or "moe" in path_str or "routed" in path_str or "shared" in path_str
         ):
             return "lion"
-        # ФИКС: q_proj/k_proj внутри DAR/Intra-attention (HybridDARAttention,
-        # IntraBlockAttention) -- маленькие d_latent-размерные вспомогательные
-        # проекции маршрутизации, НЕ магистраль модели. Эмпирически (см.
-        # [MUON-DIAG] логи, global_step=7011-7020) дают хронически вырожденный
-        # (низкого ранга) градиент -- orth_resid стабильно ~sqrt(dim), т.к.
-        # Newton-Schulz структурно не может полностью ортогонализировать
-        # вырожденную матрицу, независимо от величины градиента (Muon
-        # нормирует градиент перед NS, так что даже tiny grad_norm даёт
-        # полноразмерное after-lr обновление в плохо определённом
-        # направлении). Тот же класс проблемы, что уже привёл conv_w и
-        # routed MoE w1/w2 на Lion -- тот же фикс.
+        # ФИКС (см. чат): q_proj/k_proj внутри DAR/Intra-attention
+        # (HybridDARAttention, IntraBlockAttention) -- маленькие
+        # d_latent-размерные вспомогательные проекции маршрутизации, не
+        # магистраль модели. Эмпирически стабильно дают вырожденный
+        # (низкого ранга) градиент -- orth_resid~sqrt(dim) независимо от
+        # величины градиента (Muon нормирует градиент перед NS). Тот же
+        # класс проблемы, что уже привёл conv_w и routed MoE w1/w2 на Lion.
         if ("dar" in path_str or "intra" in path_str) and (
             "k_proj" in path_str or "q_proj" in path_str
         ):
@@ -403,9 +399,9 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
                 count=jnp.zeros([], jnp.int32),
                 orth_resid=jnp.zeros([], jnp.float32),
                 worst_leaf_idx=jnp.zeros([], jnp.int32),
-                worst_leaf_grad_norm=jnp.zeros([], jnp.float32),      # НОВОЕ
-                worst_leaf_grad_maxabs=jnp.zeros([], jnp.float32),    # НОВОЕ
-                mean_orth_resid=jnp.zeros([], jnp.float32),   # НОВОЕ
+                worst_leaf_grad_norm=jnp.zeros([], jnp.float32),
+                worst_leaf_grad_maxabs=jnp.zeros([], jnp.float32),
+                mean_orth_resid=jnp.zeros([], jnp.float32),
             )
 
         def update_fn(updates, state, params=None):
@@ -423,17 +419,17 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
               _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
            ])
 
-          # ФИКС: абсолютный порог 1e-8 не ловит "структурно слабые, но не
-          # нулевые" градиенты (intra/k_proj_1 и т.п., grad_norm~1e-4..1e-2) --
-          # они дают orth_resid=sqrt(dim)-артефакт вырожденной матрицы и
-          # маскируют собой реально растущие листья. Порог теперь
-          # ОТНОСИТЕЛЬНЫЙ -- лист считается "вырожденным" для целей
-          # диагностики, если его grad_norm на порядки меньше медианы по
-          # всем muon-листьям на этом шаге, а не по фиксированной константе.
+          # ФИКС (маскировка вырожденных по градиенту листьев, см. чат):
+          # лист с ~нулевым grad_norm даёт orth_resid == sqrt(dim) --
+          # константный артефакт ортогонализации нулевой/почти нулевой
+          # матрицы, не реальная нестабильность NS. Порог ОТНОСИТЕЛЬНЫЙ
+          # (к медиане по группе на этом шаге), т.к. абсолютный порог не
+          # ловит "структурно слабые, но не нулевые" градиенты (см. кейс
+          # dar/intra k_proj_1 -- grad_norm~1e-4, но НЕ ноль).
           leaf_norms_pre = jnp.stack([jnp.linalg.norm(g.astype(jnp.float32)) for g in leaves_g])
           _median_norm = jnp.median(leaf_norms_pre)
-          _REL_EPS = 1e-2   # лист "вырожден", если его grad_norm < 1% от медианы группы
-          _ABS_EPS = 1e-8   # абсолютный пол на случай median==0 (все градиенты нулевые)
+          _REL_EPS = 1e-2   # лист "вырожден", если grad_norm < 1% от медианы группы
+          _ABS_EPS = 1e-8   # абсолютный пол на случай median==0
           _dead_mask = leaf_norms_pre < jnp.maximum(_REL_EPS * _median_norm, _ABS_EPS)
           per_leaf_resid_masked = jnp.where(_dead_mask, -jnp.inf, per_leaf_resid)
 
@@ -496,7 +492,16 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
     ).astype(jnp.float32)
     logits_chunk = jnp.nan_to_num(logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4)
     logits_chunk = jnp.clip(logits_chunk, -1e4, 1e4)
-    logits_chunk = make_grad_probe("ce_logits_chunk")(logits_chunk)
+    # ФИКС (non-finite кластер на шагах 7343/7350/7353 -- см. чат):
+    # make_grad_probe раньше только ДЕТЕКТИРОВАЛ non-finite в backward,
+    # ничего не чинил. Forward-клип выше НЕ защищает backward: если inf
+    # возникает внутри операции, породившей logits_chunk, ДО этого клипа,
+    # backward дифференцирует именно через ту операцию, и NaN просачивается
+    # в cotangent независимо от forward-санитизации. Заменено на активный
+    # sanitizer -- клипует/чинит градиент, текущий назад через эту точку,
+    # ДО того как он попадёт в hidden_chunk (-> final_hidden -> последний
+    # слой модели) и, через tied embedding, в w (-> embed).
+    logits_chunk = make_grad_sanitizer("ce_logits_chunk", clip_val=1e3)(logits_chunk)
 
     log_probs = jax.nn.log_softmax(logits_chunk, axis=-1)
 
@@ -523,6 +528,15 @@ def _chunked_ce_step(carry, chunk, w, smooth_positive, smooth_negative, vocab_si
 def chunked_cross_entropy(final_hidden, labels, w, label_smoothing, chunk_size=256):
     b, l, d = final_hidden.shape
     vocab_size = w.shape[-1]
+
+    # ФИКС (тот же non-finite кластер): явный барьер на градиент w
+    # (embed.T при tied_embeddings=True, либо lm_head.kernel) -- это
+    # ЕДИНСТВЕННЫЙ путь, которым CE-backward достигает embed напрямую.
+    # Без него один экстремальный чанк (редкий/некорректный токен,
+    # полностью замаскированное окно и т.п.) может протолкнуть non-finite
+    # прямо в adamw_decay-группу, минуя ЛЮБУЮ другую защиту в модели --
+    # embed больше нигде не защищён градиентным sanitizer'ом.
+    w = make_grad_sanitizer("ce_w_embed_or_lmhead", clip_val=1e3)(w)
 
     flat_hidden = final_hidden.reshape(b * l, d)
     flat_labels = labels.reshape(b * l)
@@ -614,13 +628,6 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
         if max_cos_list:
             router_max_cos_per_layer = jnp.stack(max_cos_list)
             router_max_cos = jnp.max(router_max_cos_per_layer)
-
-        # ФИКС (этот пасс): kernel/activation-level diag collection
-        # (layer_delta_*, layer_resid_*, mamba2_*, gdn2_*, gdn2_kernelstage_*,
-        # mla_*, final_hidden_*) удалён -- эти self.sow(...) больше не
-        # существуют в model.py, оптимизаторская диагностика (per-group/
-        # per-layer grad/weight stats, muon) полностью живёт в
-        # train_setup.py и не зависит от этого блока.
     else:
         final_hidden = outputs
 
@@ -633,6 +640,14 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
         jnp.clip(final_hidden, -1e3, 1e3),
         nan=0.0, posinf=1e3, neginf=-1e3,
     )
+    # ФИКС (тот же non-finite кластер, см. чат -- шаги 7343/7350/7353):
+    # forward-клип выше не защищает backward. final_hidden -- прямой выход
+    # последнего слоя последнего блока (в вашем случае оказался
+    # block_7/layer_22) И прямой вход в CE -- без барьера на backward
+    # non-finite, родившийся внутри CE (chunked_cross_entropy/logits),
+    # проходит напрямую в градиент этого слоя, минуя все остальные защиты
+    # модели (которые стоят ВНУТРИ блоков, а не на этой стыковой точке).
+    final_hidden = make_grad_sanitizer("final_hidden_pre_ce", clip_val=1e3)(final_hidden)
 
     ce_loss = chunked_cross_entropy(
         final_hidden, labels, w, cfg.label_smoothing, chunk_size=ce_chunk_size)
