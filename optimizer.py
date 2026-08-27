@@ -281,6 +281,7 @@ def extract_muon_diagnostics(opt_state):
     norm_values = collect_by_leaf_name(opt_state, "worst_leaf_grad_norm")
     maxabs_values = collect_by_leaf_name(opt_state, "worst_leaf_grad_maxabs")
     mean_values = collect_by_leaf_name(opt_state, "mean_orth_resid")   # НОВОЕ
+    
     if not resid_values:
         z = jnp.array(0.0, dtype=jnp.float32)
         return z, jnp.array(-1, dtype=jnp.int32), z, z
@@ -592,6 +593,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
     aux_loss = z_loss = collinearity_loss = 0.0
     router_max_cos_per_layer = None
     router_max_cos = 0.0
+    min_group_size_stacked = None
+    max_group_size_stacked = None
 
     if not deterministic:
         final_hidden, sowed_vars = outputs
@@ -610,6 +613,9 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
         norm_x_max        = collect_by_leaf_name(losses, "norm_x_max")
         norm_x_min        = collect_by_leaf_name(losses, "norm_x_min")
         assignment_fracs  = collect_by_leaf_name(losses, "assignment_frac")
+        min_group_sizes    = collect_by_leaf_name(losses, "moe_min_group_size")
+        max_group_sizes    = collect_by_leaf_name(losses, "moe_max_group_size")
+
 
         aux_loss        = jnp.sum(jnp.stack(aux_losses))   if aux_losses   else 0.0
         z_loss          = jnp.sum(jnp.stack(z_losses))     if z_losses     else 0.0
@@ -624,6 +630,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
         if norm_x_mean:       norm_x_mean_stacked         = jnp.stack(norm_x_mean)
         if norm_x_max:        norm_x_max_stacked          = jnp.stack(norm_x_max)
         if norm_x_min:        norm_x_min_stacked          = jnp.stack(norm_x_min)
+        if min_group_sizes:   min_group_size_stacked = jnp.stack(min_group_sizes)
+        if max_group_sizes:   max_group_size_stacked = jnp.stack(max_group_sizes)
 
         if max_cos_list:
             router_max_cos_per_layer = jnp.stack(max_cos_list)
@@ -677,6 +685,8 @@ def compute_loss(params, model_fn, batch, cfg: ModelConfig,
             "router_max_cos_per_layer":   router_max_cos_per_layer,
             "router_max_cos":             router_max_cos,
             "assignment_frac":            assignment_frac_stacked,
+            "moe_min_group_size":         min_group_size_stacked,
+            "moe_max_group_size":         max_group_size_stacked,
         }
         return total_loss, aux_info
     return total_loss
