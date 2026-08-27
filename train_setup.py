@@ -361,7 +361,11 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         # nonfinite-флаг для этого же слоя сработал. Отдельная функция считает
         # maxabs ТОЛЬКО по конечной части + отдельно количество non-finite
         # элементов -- различает "один залётный NaN" от "массового обвала".
-        _layer_grad_raw_stats_fn = build_leaf_raw_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
+                # ФИКС: сырая диагностика ДО nan_to_num'а внутри avg_grads (см.
+        # чуть ниже -- avg_grads реально санитизируется через несколько
+        # строк, здесь мы ещё смотрим на "живые" значения ПОСЛЕ деления
+        # на n_accum, но ДО принудительной замены NaN на 0).
+        layer_grad_raw_maxabs, layer_grad_nonfinite_count = _layer_grad_raw_stats_fn(avg_grads)
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
         is_finite = jnp.isfinite(global_norm)
         safe_norm = jnp.where(is_finite, global_norm, 1.0)
@@ -408,8 +412,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 group_grad_norms, group_weight_norms,
                 muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs, 
                 muon_mean_orth_resid,
-                layer_grad_raw_maxabs, layer_grad_nonfinite_count)   # НОВОЕ, в самом конце
-
+                layer_grad_raw_maxabs, layer_grad_nonfinite_count)   
     def distributed_val_step(p, b):
         return compute_loss(
             p, model_apply_wrapped, b, config,
