@@ -66,8 +66,9 @@ from optimizer import (
 )
 from utils import path_to_str
 from diagnostics import (
-    make_leaf_layer_map, param_layer_tags, layer_tags_in_sow_order, build_leaf_stats_fn,
+    make_leaf_layer_map, param_layer_tags, layer_tags_in_sow_order, build_leaf_stats_fn, build_leaf_raw_stats_fn,
 )
+from diagnostics import build_leaf_raw_stats_fn
 
 DATASET_FRACTION = 1
 DATASET_FRACTION_SEED = 777
@@ -289,6 +290,7 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
     _PARAM_LAYER_TAGS = param_layer_tags(grad_layer_map)
     _SOW_LAYER_TAGS = layer_tags_in_sow_order(config)
     _layer_grad_stats_fn = build_leaf_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
+    _layer_grad_raw_stats_fn = build_leaf_raw_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
     _layer_weight_stats_fn = build_leaf_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
     print(f"[DIAG] По-слойная диагностика: {len(_PARAM_LAYER_TAGS)} физических "
           f"тегов параметров ({_PARAM_LAYER_TAGS}), {len(_SOW_LAYER_TAGS)} sown-тегов активаций.")
@@ -352,7 +354,14 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         group_nonfinite_flags = _group_nonfinite_flags(avg_grads)
         group_grad_norms = _group_grad_norms_fn(avg_grads)
         layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite = _layer_grad_stats_fn(avg_grads)
-
+        # ФИКС (диагностика замаскированных non-finite, см. чат): существующий
+        # build_leaf_stats_fn применяет nan_to_num ДО вычисления normы/maxabs
+        # -- это маскирует реальную величину NaN/inf-выброса, из-за чего
+        # layer_grad_norm выглядел "здоровым" (0.1-0.3) даже на шагах, где
+        # nonfinite-флаг для этого же слоя сработал. Отдельная функция считает
+        # maxabs ТОЛЬКО по конечной части + отдельно количество non-finite
+        # элементов -- различает "один залётный NaN" от "массового обвала".
+        _layer_grad_raw_stats_fn = build_leaf_raw_stats_fn(grad_layer_map, _PARAM_LAYER_TAGS)
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
         is_finite = jnp.isfinite(global_norm)
         safe_norm = jnp.where(is_finite, global_norm, 1.0)
@@ -398,7 +407,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
                 muon_orth_resid, muon_worst_leaf_idx,
                 group_grad_norms, group_weight_norms,
                 muon_worst_leaf_grad_norm, muon_worst_leaf_grad_maxabs, 
-                muon_mean_orth_resid)   # НОВОЕ, в самом конце
+                muon_mean_orth_resid,
+                layer_grad_raw_maxabs, layer_grad_nonfinite_count)   # НОВОЕ, в самом конце
 
     def distributed_val_step(p, b):
         return compute_loss(
@@ -491,6 +501,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
             NamedSharding(mesh, P()),        # muon_worst_leaf_grad_norm    <-- НОВОЕ
             NamedSharding(mesh, P()),        # muon_worst_leaf_grad_maxabs  <-- НОВОЕ
             NamedSharding(mesh, P()),        # muon_mean_orth_resid   <-- НОВОЕ
+            NamedSharding(mesh, P(None)),    # layer_grad_raw_maxabs      <-- НОВОЕ
+            NamedSharding(mesh, P(None)),    # layer_grad_nonfinite_count <-- НОВОЕ
 
         ),
     )
