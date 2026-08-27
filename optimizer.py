@@ -37,7 +37,7 @@ from utils import collect_by_leaf_name, path_to_str
 ROUTER_COLLINEARITY_COEF = 0.08
 
 RESUME_BACKOFF_STEPS = 5000
-RESUME_LR_SCALE = 0.7
+RESUME_LR_SCALE = 0.4     # было 0.7 -- холоднее старт
 
 DEFAULT_WARMUP_FREEZE_STEP = 5000
 
@@ -365,7 +365,7 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
     )
 
     def resume_backoff(step):
-        RAMP_STEPS = 1000.0
+        RAMP_STEPS = 3000.0
         ramp_start = RESUME_BACKOFF_STEPS - RAMP_STEPS
         frac = jnp.clip((step - ramp_start) / RAMP_STEPS, 0.0, 1.0)
         return RESUME_LR_SCALE + (1.0 - RESUME_LR_SCALE) * frac
@@ -406,30 +406,29 @@ def make_hybrid_optimizer(total_steps: int, muon_diagnostic_disable: bool = Fals
           leaves_g, _ = jax.tree_util.tree_flatten(updates)
           per_leaf_resid = jnp.stack([
               _muon_orth_diag(g, ns_steps=ns_steps) for g in leaves_g
-          ])
+           ])
 
+          # ФИКС: абсолютный порог 1e-8 не ловит "структурно слабые, но не
+          # нулевые" градиенты (intra/k_proj_1 и т.п., grad_norm~1e-4..1e-2) --
+          # они дают orth_resid=sqrt(dim)-артефакт вырожденной матрицы и
+          # маскируют собой реально растущие листья. Порог теперь
+          # ОТНОСИТЕЛЬНЫЙ -- лист считается "вырожденным" для целей
+          # диагностики, если его grad_norm на порядки меньше медианы по
+          # всем muon-листьям на этом шаге, а не по фиксированной константе.
           leaf_norms_pre = jnp.stack([jnp.linalg.norm(g.astype(jnp.float32)) for g in leaves_g])
-          _EPS_GRAD = 1e-8
-          per_leaf_resid_masked = jnp.where(leaf_norms_pre < _EPS_GRAD, -jnp.inf, per_leaf_resid)
+          _median_norm = jnp.median(leaf_norms_pre)
+          _REL_EPS = 1e-2   # лист "вырожден", если его grad_norm < 1% от медианы группы
+          _ABS_EPS = 1e-8   # абсолютный пол на случай median==0 (все градиенты нулевые)
+          _dead_mask = leaf_norms_pre < jnp.maximum(_REL_EPS * _median_norm, _ABS_EPS)
+          per_leaf_resid_masked = jnp.where(_dead_mask, -jnp.inf, per_leaf_resid)
 
           worst_idx = jnp.argmax(per_leaf_resid_masked)
           step_orth_resid = per_leaf_resid[worst_idx]
 
-          _valid_mask = leaf_norms_pre >= _EPS_GRAD
+          _valid_mask = jnp.logical_not(_dead_mask)
           step_mean_orth_resid = jnp.sum(jnp.where(_valid_mask, per_leaf_resid, 0.0)) / jnp.maximum(jnp.sum(_valid_mask), 1)
 
           leaf_norms = leaf_norms_pre
-          leaf_maxabs = jnp.stack([jnp.max(jnp.abs(g.astype(jnp.float32))) for g in leaves_g])
-          worst_leaf_grad_norm = leaf_norms[worst_idx]
-          worst_leaf_grad_maxabs = leaf_maxabs[worst_idx]
-          _valid_mask = leaf_norms_pre >= _EPS_GRAD
-          step_mean_orth_resid = jnp.sum(jnp.where(_valid_mask, per_leaf_resid, 0.0)) / jnp.maximum(jnp.sum(_valid_mask), 1)
-          # НОВОЕ: норма и maxabs градиента ИМЕННО худшего листа -- дёшево
-          # (один-два reduce поверх уже посчитанного stacked tensor нельзя,
-          # т.к. листья разной формы, но динамический индекс через lax.switch
-          # избыточен -- проще посчитать по ВСЕМ листьям через tree_map и
-          # выбрать через jnp.take на flat-массиве скаляров).
-          leaf_norms = jnp.stack([jnp.linalg.norm(g.astype(jnp.float32)) for g in leaves_g])
           leaf_maxabs = jnp.stack([jnp.max(jnp.abs(g.astype(jnp.float32))) for g in leaves_g])
           worst_leaf_grad_norm = leaf_norms[worst_idx]
           worst_leaf_grad_maxabs = leaf_maxabs[worst_idx]
