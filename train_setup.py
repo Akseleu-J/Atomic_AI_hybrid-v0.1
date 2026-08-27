@@ -438,6 +438,8 @@ def make_shard_and_compile(config: ModelConfig, total_steps: int, batch_size: in
         "router_max_cos_per_layer": NamedSharding(mesh, P()),
         "router_max_cos": NamedSharding(mesh, P()),
         "assignment_frac": NamedSharding(mesh, P(None, None)),
+        "moe_min_group_size": NamedSharding(mesh, P(None)),
+        "moe_max_group_size": NamedSharding(mesh, P(None)),
     }
     compiled_train_micro = jax.jit(
         distributed_train_step_micro,
