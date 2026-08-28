@@ -628,7 +628,7 @@ class GmmMoEJ(nn.Module):
         # concatenate -- используется для обратного split на combine.
         # ==================================================================
         
-        def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
+       def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
             T_rep = flat_x_local.shape[0]
             group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
             perm = jnp.argsort(expert_idx_local, stable=True)
@@ -662,21 +662,24 @@ class GmmMoEJ(nn.Module):
                 combined_local = jnp.zeros_like(flat_x_local, dtype=jnp.float32)
                 for j in range(k):
                     combined_local = combined_local + out_chunks_local[j].astype(jnp.float32) * top_gate_local[:, j:j+1]
+                # ФИКС: min/max group_sizes прокидываются наружу третьим/четвёртым
+                # выходом shard_map -- нужно добавить соответствующий out_spec ниже.
                 return combined_local, _min_gs, _max_gs
             in_specs = (
                 P(batch_axis, None),   # flat_x
                 P(batch_axis, None),   # top_idx
                 P(batch_axis, None),   # top_gate
                 P(None, None, None),   # W1
-                P(None, None, None),   # W2
+                 P(None, None, None),   # W2
             )
-            out_specs = (P(batch_axis, None), P(), P())
+            out_specs = (P(batch_axis, None), P(), P())   # ФИКС: +2 скалярных выхода
             sharded_dispatch = jax.shard_map(
                 _dispatch_local_topk, mesh=mesh,
                 in_specs=in_specs, out_specs=out_specs,
                 check_vma=False,
             )
-            routed_out, _min_gs_all, _max_gs_all = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
+            routed_out, _moe_min_group, _moe_max_group = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
+
             if mesh is None:
                 raise RuntimeError(
                     "GmmMoEJ: get_model_mesh() вернул None во время трассировки — "
@@ -685,13 +688,21 @@ class GmmMoEJ(nn.Module):
             self.sow("losses", "moe_min_group_size", jnp.min(_min_gs_all))
             self.sow("losses", "moe_max_group_size", jnp.max(_max_gs_all))
         else:
-            routed_out_rep, _min_gs, _max_gs = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
+            routed_out_rep, _moe_min_group, _moe_max_group = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
             out_chunks = jnp.split(routed_out_rep, k, axis=0)
             routed_out = jnp.zeros_like(flat_x, dtype=jnp.float32)
             for j in range(k):
-                routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1]
-            self.sow("losses", "moe_min_group_size", _min_gs)
-            self.sow("losses", "moe_max_group_size", _max_gs)
+                routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1])
+            combined = shared_out.astype(jnp.float32) + routed_out
+            combined = _sanitize(combined)
+
+            # ФИКС: sow group_sizes min/max -- единое место после обеих веток
+            # (mesh/non-mesh), чтобы не дублировать sow-вызов.
+            self.sow("losses", "moe_min_group_size", _moe_min_group)
+            self.sow("losses", "moe_max_group_size", _moe_max_group)
+
+            self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
+            return combined.reshape(b, l, d).astype(x.dtype)
         # ==================================================================
         # M3': combine -- разбить (k*T, d) обратно на k кусков по T строк
         # каждый (тот же порядок конкатенации, что при dispatch), взвесить
