@@ -692,7 +692,7 @@ class GmmMoEJ(nn.Module):
             out_chunks = jnp.split(routed_out_rep, k, axis=0)
             routed_out = jnp.zeros_like(flat_x, dtype=jnp.float32)
             for j in range(k):
-                routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1])
+                routed_out = routed_out + out_chunks[j].astype(jnp.float32) * top_gate[:, j:j+1]
             combined = shared_out.astype(jnp.float32) + routed_out
             combined = _sanitize(combined)
 
