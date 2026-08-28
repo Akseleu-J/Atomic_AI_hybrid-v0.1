@@ -628,19 +628,19 @@ class GmmMoEJ(nn.Module):
         # concatenate -- используется для обратного split на combine.
         # ==================================================================
         
-    def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
-        T_rep = flat_x_local.shape[0]
-        group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
-        perm = jnp.argsort(expert_idx_local, stable=True)
-        inv_perm = jnp.argsort(perm)
+        def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
+            T_rep = flat_x_local.shape[0]
+            group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
+            perm = jnp.argsort(expert_idx_local, stable=True)
+            inv_perm = jnp.argsort(perm)
 
-        x_sorted = jnp.take(flat_x_local, perm, axis=0)
-        # ФИКС: diag_tag включает scope-путь (block_N/moe) -- различает,
-        # в каком именно блоке впервые сработал probe.
-        grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret, diag_tag=_moe_tag)
-        out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
+            x_sorted = jnp.take(flat_x_local, perm, axis=0)
+            # ФИКС: diag_tag включает scope-путь (block_N/moe) -- различает,
+            # в каком именно блоке впервые сработал probe.
+            grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret, diag_tag=_moe_tag)
+            out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
 
-        return jnp.take(out_sorted, inv_perm, axis=0)
+            return jnp.take(out_sorted, inv_perm, axis=0)
         # flat_x_rep: (k*T, d) -- k конкатенированных копий flat_x, в
         # порядке [копия под top-1-выбор для каждого токена][копия под
         # top-2-выбор для каждого токена]...
