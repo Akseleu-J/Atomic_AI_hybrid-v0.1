@@ -860,22 +860,22 @@ class BlockDAR(nn.Module):
             [history_blocks, block_delta[None, ...]], axis=0
         )
 
-         # в BlockDAR.__call__, после вычисления moe_out:
-         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
-         moe_out = GmmMoEJ(cfg=self.cfg, top_k=self.cfg.top_k, name="moe")(
-             norm_2, deterministic=deterministic, rngs=rngs
-         )
-         moe_out = make_grad_probe(f"moe_out_block{self.block_idx}")(moe_out)
-         moe_finite = jnp.all(jnp.isfinite(moe_out))
-         jax.lax.cond(
-           jnp.logical_not(moe_finite),
-             lambda: jax.debug.print("[FWD-DIAG] ⚠️ non-finite moe_out: block={b}", b=self.block_idx),
-              lambda: None,
-         )
+        # в BlockDAR.__call__, после вычисления moe_out:
+        norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
+        moe_out = GmmMoEJ(cfg=self.cfg, top_k=self.cfg.top_k, name="moe")(
+            norm_2, deterministic=deterministic, rngs=rngs
+        )
+        moe_out = make_grad_probe(f"moe_out_block{self.block_idx}")(moe_out)
+        moe_finite = jnp.all(jnp.isfinite(moe_out))
+        jax.lax.cond(
+         jnp.logical_not(moe_finite),
+            lambda: jax.debug.print("[FWD-DIAG] ⚠️ non-finite moe_out: block={b}", b=self.block_idx),
+             lambda: None,
+        )
 
-         output = jnp.nan_to_num(jnp.clip(current_x + moe_out, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
+        output = jnp.nan_to_num(jnp.clip(current_x + moe_out, -1e3, 1e3), nan=0.0, posinf=1e3, neginf=-1e3)
 
-         return output, new_history
+        return output, new_history
 
 
 class FullHybridMoEModel(nn.Module):
