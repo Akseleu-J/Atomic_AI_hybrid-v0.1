@@ -628,7 +628,7 @@ class GmmMoEJ(nn.Module):
         # concatenate -- используется для обратного split на combine.
         # ==================================================================
         
-       def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
+        def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
             T_rep = flat_x_local.shape[0]
             group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
             perm = jnp.argsort(expert_idx_local, stable=True)
