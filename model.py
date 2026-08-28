@@ -853,18 +853,22 @@ class BlockDAR(nn.Module):
                 nan=0.0, posinf=_resid_clip, neginf=-_resid_clip,
             )
 
-        block_delta = sum(local_deltas)
-        new_history = jnp.concatenate(
-            [history_blocks, block_delta[None, ...]], axis=0
-        )
+       # перед new_history:
+       block_delta = sum(local_deltas)
+       block_delta = make_grad_probe(f"block_delta_block{self.block_idx}")(block_delta)
+       new_history = jnp.concatenate(
+           [history_blocks, block_delta[None, ...]], axis=0
+       )
 
+        # в BlockDAR.__call__, после вычисления moe_out:
         norm_2 = nn.RMSNorm(epsilon=1e-6, name="norm_2")(current_x).astype(current_x.dtype)
         moe_out = GmmMoEJ(cfg=self.cfg, top_k=self.cfg.top_k, name="moe")(
             norm_2, deterministic=deterministic, rngs=rngs
         )
+        moe_out = make_grad_probe(f"moe_out_block{self.block_idx}")(moe_out)
         moe_finite = jnp.all(jnp.isfinite(moe_out))
         jax.lax.cond(
-            jnp.logical_not(moe_finite),
+         jnp.logical_not(moe_finite),
             lambda: jax.debug.print("[FWD-DIAG] ⚠️ non-finite moe_out: block={b}", b=self.block_idx),
             lambda: None,
         )
