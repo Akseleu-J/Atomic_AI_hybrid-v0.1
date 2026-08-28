@@ -461,6 +461,16 @@ class GmmMoEJ(nn.Module):
     ФИКС (shared expert grad protection): см. module docstring's
     "ФИКС (этот пасс -- shared expert...)" -- shared_out теперь тоже
     проходит через _moe_grad_sanitizer.
+
+    ФИКС (этот пасс -- NameError в шардированной ветке): sharded_dispatch
+    возвращает (routed_out, _moe_min_group, _moe_max_group) -- предыдущая
+    версия sow'ила несуществующие _min_gs_all/_max_gs_all (NameError при
+    первом же forward с mesh is not None, т.е. при любом реальном
+    TPU-обучении через train_setup.py, где mesh создаётся всегда) и
+    содержала недостижимую/бессмысленную проверку `if mesh is None: raise`
+    ПОСЛЕ того, как мы уже внутри ветки `mesh is not None`. Оба дефекта
+    убраны -- используются реально возвращённые _moe_min_group/
+    _moe_max_group, проверка удалена.
     """
     cfg: object
     interpret: bool = False
@@ -470,22 +480,14 @@ class GmmMoEJ(nn.Module):
     def __call__(self, x, deterministic: bool = True, rngs=None):
         b, l, d = x.shape
         flat_x = x.reshape(-1, d)
-        # ФИКС (live router diagnostics -- replaces offline synthetic
-        # replay, which twice proved the router's forward math is
-        # structurally bounded and can't be the source of a runaway on its
-        # own; see project notes on test_synthetic_router_collapse*.py).
-        # tag is unique per block via the flax scope path (e.g.
-        # "block_3/moe"), evaluated at trace time -- one distinct probe
-        # per real MoE block, not a single shared one.
         _moe_tag = "/".join(str(p) for p in self.scope.path) if self.scope is not None else "moe"
         flat_x_for_router = _moe_grad_sanitizer(f"moe_router_input_grad_{_moe_tag}")(flat_x)
-        
-        # ---- новая диагностика: ||flat_x|| (по строкам) ----
+
         _norm_per_token = jnp.linalg.norm(flat_x_for_router, axis=1, keepdims=False)
         self.sow("losses", "norm_x_mean", jnp.mean(_norm_per_token))
         self.sow("losses", "norm_x_max", jnp.max(_norm_per_token))
         self.sow("losses", "norm_x_min", jnp.min(_norm_per_token))
-        # ----------------------------------------------------
+
         T = flat_x.shape[0]
         E_routed = self.cfg.num_experts - 1
         k = self.top_k
@@ -499,59 +501,34 @@ class GmmMoEJ(nn.Module):
         shared_h = jax.nn.gelu(shared_h)
         shared_h = nn.Dropout(rate=self.cfg.dropout_rate)(shared_h, deterministic=deterministic)
         shared_out = nn.Dense(self.cfg.d_model, name="shared_w2", dtype=jnp.bfloat16)(shared_h)
-        # ФИКС (этот пасс -- см. module docstring "ФИКС (этот пасс --
-        # shared expert...)"): shared_w1/shared_w2 были ЕДИНСТВЕННЫМ узлом
-        # в GmmMoEJ без градиентной защиты -- routed-путь уже санитизирован
-        # на каждом шаге backward внутри _core_bwd. Активный клип (не
-        # только детект), тот же паттерн, что уже используется для
-        # flat_x_for_router выше.
         shared_out = _moe_grad_sanitizer(f"moe_shared_expert_grad_{_moe_tag}")(shared_out)
 
         # ---- routing: top-k среди E_routed ----
-        # ФИКС (router collapse): router.kernel -- явный self.param (не
-        # nn.Dense), т.к. нужен прямой доступ к сырой матрице ДЛЯ
-        # нормализации столбцов ПЕРЕД матмулом. Форма (d_model, E_routed)
-        # -- та же, что раньше выдавал nn.Dense(E_routed, use_bias=False),
-        # так что чекпоинт-совместимость по ЭТОМУ параметру сохранена
-        # (веса можно даже restore'ить напрямую, если имя/форма совпадают
-        # -- restore обычно матчит по имени пути, "router"/"kernel").
         router_kernel = self.param(
             "router", nn.initializers.lecun_normal(), (d, E_routed), jnp.float32
         )
-        # L2-нормализация СТОЛБЦОВ (одно направление на эксперта) --
-        # структурный потолок на величину логита, не зависящий от того,
-        # насколько разрослась норма router_kernel под оптимизатором.
         router_kernel_normed = router_kernel * jax.lax.rsqrt(
             jnp.sum(router_kernel ** 2, axis=0, keepdims=True) + 1e-6
         )
 
-        # ДОБАВИТЬ: штраф за схожесть направлений экспертов (router_max_cos=0.96 —
-        # это и есть измеренное этим членом). Считаем только off-diagonal Грам-матрицу.
         gram = jnp.dot(router_kernel_normed.T, router_kernel_normed,
-                        precision=jax.lax.Precision.HIGHEST)  # (E_routed, E_routed), диагональ ~1.0
+                        precision=jax.lax.Precision.HIGHEST)
         eye = jnp.eye(E_routed, dtype=gram.dtype)
-        off_diag_sq = jnp.square(gram - eye) * (1.0 - eye)   # обнулить диагональ явно
+        off_diag_sq = jnp.square(gram - eye) * (1.0 - eye)
         router_collinearity = jnp.sum(off_diag_sq) / (E_routed * (E_routed - 1))
         self.sow("losses", "router_collinearity", router_collinearity)
 
-        _max_cos_offdiag = jnp.max(jnp.abs(gram - eye))       # тот же max_cos, что вы мерили офлайн
+        _max_cos_offdiag = jnp.max(jnp.abs(gram - eye))
         self.sow("losses", "router_max_cos", _max_cos_offdiag)
         router_temp = self.param(
             "router_temp", nn.initializers.constant(_ROUTER_TEMP_INIT), ()
         )
-        router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)   # структурный потолок
-        # ФИКС (router saturation): нормируем вход по L2, чтобы logit ∈ [-temp, temp]
+        router_temp_clipped = jnp.clip(router_temp, 1.0, 15.0)
         flat_x_normed_for_router = _safe_normalize(flat_x_for_router.astype(jnp.float32))
         router_logits = jnp.dot(
-        flat_x_normed_for_router, router_kernel_normed, precision=jax.lax.Precision.HIGHEST
+            flat_x_normed_for_router, router_kernel_normed, precision=jax.lax.Precision.HIGHEST
         ) * router_temp_clipped
-        # ФИКС (live diagnostics, forward side): capture pre-clip logit
-        # magnitude and pre-normalization column norm BEFORE the existing
-        # narrow clip/sanitize -- these are the two forward-side
-        # early-warning signals the offline snapshot script computed
-        # after-the-fact; sowing them here makes them visible every real
-        # step, not just at the one step a non-finite snapshot happened to
-        # catch.
+
         _max_abs_logit_preclip = jnp.max(jnp.abs(router_logits))
         _min_col_norm = jnp.min(jnp.sqrt(jnp.sum(router_kernel ** 2, axis=0)))
         self.sow("losses", "max_abs_logit_preclip", _max_abs_logit_preclip)
@@ -575,17 +552,12 @@ class GmmMoEJ(nn.Module):
                 noise_rng, router_logits.shape, dtype=router_logits.dtype
             )
 
-        # M1': top-k выбор + перенормировка гейтов ВНУТРИ выбранной пары
-        # (не softmax по всем E_routed -- иначе вес каждого выбранного
-        # эксперта занижен относительно "честного" top-k распределения).
         expert_bias = self.param("expert_bias", nn.initializers.zeros, (E_routed,), jnp.float32)
-        self.sow("losses", "expert_bias", expert_bias)  # для W&B, тот же паттерн что router_temp
+        self.sow("losses", "expert_bias", expert_bias)
 
         router_logits_biased = router_logits + jax.lax.stop_gradient(expert_bias)[None, :]
         top_vals, top_idx = jax.lax.top_k(router_logits_biased, k=k)
         top_idx = top_idx.astype(jnp.int32)
-        # ВАЖНО: вес гейта считается по НЕбиасированным логитам выбранных экспертов --
-        # bias влияет только на ВЫБОР top-k, не на итоговый вес (как в DeepSeek-V3).
         top_vals_unbiased = jnp.take_along_axis(router_logits, top_idx, axis=-1)
         top_gate = jax.nn.softmax(top_vals_unbiased, axis=-1)
         _assign_counts = jnp.zeros((E_routed,), dtype=jnp.float32)
@@ -595,11 +567,7 @@ class GmmMoEJ(nn.Module):
             )
         assignment_frac = _assign_counts / (T * k)
         self.sow("losses", "assignment_frac", assignment_frac)
- 
-        # aux_loss/z_loss считаются по ПОЛНОМУ softmax(router_logits) --
-        # это диагностика балансировки роутера как такового (Switch-style
-        # load-balancing loss смотрит на распределение по ВСЕМ экспертам,
-        # не только выбранным), а не по факту 2T-дисптача.
+
         full_probs = jax.nn.softmax(router_logits, axis=-1)
         full_probs = jnp.nan_to_num(full_probs, nan=0.0, posinf=0.0, neginf=0.0)
         mean_probs = jnp.mean(full_probs, axis=0)
@@ -607,12 +575,6 @@ class GmmMoEJ(nn.Module):
         self.sow("losses", "z_loss", jnp.mean(jnp.square(
             jax.scipy.special.logsumexp(router_logits, axis=-1))))
         self.sow("losses", "expert_utilization", mean_probs)
-        # ФИКС (диагностика): router_temp сам по себе -- полезный
-        # индикатор ("растёт ли температура сама по себе, компенсируя
-        # узкий clip"). Сожено сюда же, тем же collect_by_leaf_name-путём,
-        # что и остальные MoE-метрики -- optimizer.py уже собирает
-        # aux_loss/z_loss/expert_utilization по имени листа, router_temp
-        # добавлен по аналогии для W&B-видимости.
         self.sow("losses", "router_temp", router_temp)
 
         d_model, d_ff = self.cfg.d_model, self.cfg.d_ff
@@ -621,15 +583,7 @@ class GmmMoEJ(nn.Module):
         W2 = self.param("routed_w2", nn.initializers.lecun_normal(),
                          (E_routed, d_ff, d_model), jnp.bfloat16)
 
-        # ==================================================================
-        # M2': дублирование токенов под 2T-диспетчинг (k копий на токен,
-        # каждая помечена одним из k выбранных экспертов, взвешена своим
-        # перенормированным гейтом). Порядок по оси-k сохраняется через
-        # concatenate -- используется для обратного split на combine.
-        # ==================================================================
-        
         def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
-            T_rep = flat_x_local.shape[0]  # = k * T_local_device
             group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
             perm = jnp.argsort(expert_idx_local, stable=True)
             inv_perm = jnp.argsort(perm)
@@ -638,22 +592,15 @@ class GmmMoEJ(nn.Module):
             grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret, diag_tag=_moe_tag)
             out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
 
-            out_unsorted = jnp.take(out_sorted, inv_perm, axis=0)  # (T_rep, d), тот же порядок, что flat_x_local
-            # ФИКС: min/max group_sizes для диагностики -- возвращаются явно, а не
-            # sow'ятся здесь напрямую, т.к. эта функция вызывается ВНУТРИ
-            # jax.shard_map (см. _dispatch_local_topk ниже) -- self.sow там
-            # недоступен/небезопасен, поэтому значения прокидываются наружу через
-            # return и sow'ятся уже СНАРУЖИ shard_map, в основном теле __call__.
+            out_unsorted = jnp.take(out_sorted, inv_perm, axis=0)
             _min_gs = jnp.min(group_sizes).astype(jnp.float32)
             _max_gs = jnp.max(group_sizes).astype(jnp.float32)
             return out_unsorted, _min_gs, _max_gs
-        # flat_x_rep: (k*T, d) -- k конкатенированных копий flat_x, в
-        # порядке [копия под top-1-выбор для каждого токена][копия под
-        # top-2-выбор для каждого токена]...
+
         flat_x_rep = jnp.concatenate([flat_x] * k, axis=0)
         expert_idx_rep = jnp.concatenate(
             [top_idx[:, j] for j in range(k)], axis=0
-        )  # (k*T,)
+        )
 
         if mesh is not None and batch_axis is not None:
             def _dispatch_local_topk(flat_x_local, top_idx_local, top_gate_local, W1_local, W2_local):
@@ -668,9 +615,8 @@ class GmmMoEJ(nn.Module):
                 combined_local = jnp.zeros_like(flat_x_local, dtype=jnp.float32)
                 for j in range(k):
                     combined_local = combined_local + out_chunks_local[j].astype(jnp.float32) * top_gate_local[:, j:j+1]
-                # ФИКС: min/max group_sizes прокидываются наружу третьим/четвёртым
-                # выходом shard_map -- нужно добавить соответствующий out_spec ниже.
                 return combined_local, _min_gs, _max_gs
+
             in_specs = (
                 P(batch_axis, None),   # flat_x
                 P(batch_axis, None),   # top_idx
@@ -678,7 +624,7 @@ class GmmMoEJ(nn.Module):
                 P(None, None, None),   # W1
                 P(None, None, None),   # W2
             )
-            out_specs = (P(batch_axis, None), P(), P())   # ФИКС: +2 скалярных выхода
+            out_specs = (P(batch_axis, None), P(), P())
             sharded_dispatch = jax.shard_map(
                 _dispatch_local_topk, mesh=mesh,
                 in_specs=in_specs, out_specs=out_specs,
@@ -686,13 +632,19 @@ class GmmMoEJ(nn.Module):
             )
             routed_out, _moe_min_group, _moe_max_group = sharded_dispatch(flat_x, top_idx, top_gate, W1, W2)
 
-            if mesh is None:
-                raise RuntimeError(
-                    "GmmMoEJ: get_model_mesh() вернул None во время трассировки — "
-                    "set_model_mesh() должен быть вызван до первого model.init()/jit."
-               )
-            self.sow("losses", "moe_min_group_size", jnp.min(_min_gs_all))
-            self.sow("losses", "moe_max_group_size", jnp.max(_max_gs_all))
+            # ФИКС: используем реально возвращённые _moe_min_group/_moe_max_group
+            # (уже скаляры -- P() out_spec), а не несуществующие _min_gs_all/
+            # _max_gs_all, и не вызываем jnp.min/jnp.max поверх скаляра. Убрана
+            # недостижимая проверка `if mesh is None: raise` (мы уже внутри
+            # ветки `mesh is not None`).
+            self.sow("losses", "moe_min_group_size", _moe_min_group)
+            self.sow("losses", "moe_max_group_size", _moe_max_group)
+
+            combined = shared_out.astype(jnp.float32) + routed_out
+            combined = _sanitize(combined)
+
+            self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
+            return combined.reshape(b, l, d).astype(x.dtype)
         else:
             routed_out_rep, _moe_min_group, _moe_max_group = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
             out_chunks = jnp.split(routed_out_rep, k, axis=0)
@@ -702,21 +654,8 @@ class GmmMoEJ(nn.Module):
             combined = shared_out.astype(jnp.float32) + routed_out
             combined = _sanitize(combined)
 
-            # ФИКС: sow group_sizes min/max -- единое место после обеих веток
-            # (mesh/non-mesh), чтобы не дублировать sow-вызов.
             self.sow("losses", "moe_min_group_size", _moe_min_group)
             self.sow("losses", "moe_max_group_size", _moe_max_group)
 
             self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
             return combined.reshape(b, l, d).astype(x.dtype)
-        # ==================================================================
-        # M3': combine -- разбить (k*T, d) обратно на k кусков по T строк
-        # каждый (тот же порядок конкатенации, что при dispatch), взвесить
-        # top_gate[:, j] и просуммировать.
-        # ==================================================================
-
-        combined = shared_out.astype(jnp.float32) + routed_out
-        combined = _sanitize(combined)
-
-        self.sow("losses", "moe_dropped_ratio", jnp.zeros((), dtype=jnp.float32))
-        return combined.reshape(b, l, d).astype(x.dtype)
