@@ -252,7 +252,35 @@ def _moe_grad_sanitizer(tag: str, clip_val: float = 1e3):
 
     _sanitizer.defvjp(_fwd, _bwd)
     return _sanitizer
+def _moe_grad_probe(tag: str):
+    """Как model.py's make_grad_probe -- ТОЛЬКО детектирует non-finite во
+    входящем backward-градиенте, не чинит. Нужен, чтобы локализовать
+    ТОЧНУЮ операцию внутри gmm/tgmm forward+backward цепочки, где
+    non-finite впервые появляется -- в отличие от _sanitize (который уже
+    есть на каждом шаге), probe ничего не маскирует и печатает ПЕРВОЕ
+    место появления."""
+    @jax.custom_vjp
+    def _probe(x):
+        return x
 
+    def _fwd(x):
+        return x, None
+
+    def _bwd(_, g):
+        finite = jnp.all(jnp.isfinite(g))
+        max_abs = jnp.max(jnp.abs(jnp.where(jnp.isfinite(g), g, 0.0)))
+        jax.lax.cond(
+            jnp.logical_not(finite),
+            lambda: jax.debug.print(
+                "[MOE-GMM-DIAG] 🔴 non-finite ВХОДЯЩИЙ градиент в узле: " + tag +
+                "  (max_abs конечной части={m:.3e})", m=max_abs,
+            ),
+            lambda: None,
+        )
+        return (g,)
+
+    _probe.defvjp(_fwd, _bwd)
+    return _probe
 def _sanitize(x, clip=_SANITIZE_CLIP):
     return jnp.nan_to_num(jnp.clip(x, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
 
@@ -263,7 +291,7 @@ def _auto_tile(m, k, n, m_pref=128, k_pref=128, n_pref=128):
     return (_pick(m, m_pref), _pick(k, k_pref), _pick(n, n_pref))
 
 
-def _make_grouped_ffn_core(interpret=False):
+def _make_grouped_ffn_core(interpret=False, diag_tag="moe"):
 
     def _fwd_math(x_sorted, W1, W2, group_sizes):
         x_f = x_sorted.astype(jnp.float32)
@@ -273,9 +301,29 @@ def _make_grouped_ffn_core(interpret=False):
         T, d_model = x_f.shape
         _, _, d_ff = W1_f.shape
 
+        # ФИКС (диагностика, см. чат): group_sizes min/max -- прямая
+        # проверка гипотезы "вырожденная (0- или почти-0-токенная) группа
+        # ломает gmm/tgmm". Sown КАЖДЫЙ forward-вызов, недорого (пара
+        # reduce поверх уже вычисленного bincount).
+        _min_group = jnp.min(group_sizes).astype(jnp.float32)
+        _max_group = jnp.max(group_sizes).astype(jnp.float32)
+
         h_pre = gmm(x_f, W1_f, group_sizes,
                     tiling=_auto_tile(T, d_model, d_ff),
                     interpret=interpret, preferred_element_type=jnp.float32)
+        # ФИКС: probe ДО _sanitize -- ловит non-finite ИЗ САМОГО gmm-вызова
+        # (h_pre), прежде чем _sanitize его замаскирует.
+        h_pre_finite = jnp.all(jnp.isfinite(h_pre))
+        h_pre_maxabs = jnp.max(jnp.abs(jnp.where(jnp.isfinite(h_pre), h_pre, 0.0)))
+        jax.lax.cond(
+            jnp.logical_or(jnp.logical_not(h_pre_finite), h_pre_maxabs > 1e2),
+            lambda: jax.debug.print(
+                "[MOE-GMM-FWD-DIAG] " + diag_tag + ": gmm(x,W1) h_pre "
+                "finite={f} maxabs={m:.3e} min_group={mn:.0f} max_group={mx:.0f}",
+                f=h_pre_finite, m=h_pre_maxabs, mn=_min_group, mx=_max_group,
+            ),
+            lambda: None,
+        )
         h_pre = _sanitize(h_pre)
 
         h, gelu_vjp = jax.vjp(jax.nn.gelu, h_pre)
@@ -283,22 +331,26 @@ def _make_grouped_ffn_core(interpret=False):
         out = gmm(h, W2_f, group_sizes,
                   tiling=_auto_tile(T, d_ff, d_model),
                   interpret=interpret, preferred_element_type=jnp.float32)
+        out_finite = jnp.all(jnp.isfinite(out))
+        out_maxabs = jnp.max(jnp.abs(jnp.where(jnp.isfinite(out), out, 0.0)))
+        jax.lax.cond(
+            jnp.logical_or(jnp.logical_not(out_finite), out_maxabs > 1e2),
+            lambda: jax.debug.print(
+                "[MOE-GMM-FWD-DIAG] " + diag_tag + ": gmm(h,W2) out "
+                "finite={f} maxabs={m:.3e}", f=out_finite, m=out_maxabs,
+            ),
+            lambda: None,
+        )
         out = _sanitize(out)
-        return out, h, gelu_vjp
+        return out, h, gelu_vjp, group_sizes
 
-    # NOTE: no more nondiff_argnums -- group_sizes is now an ordinary
-    # (traced-safe) positional argument. custom_vjp is fine with an
-    # integer-dtype argument as long as bwd returns a float0 cotangent
-    # for it (see _core_bwd below).
     @jax.custom_vjp
     def _core(x_sorted, W1, W2, group_sizes):
-        out, _, _ = _fwd_math(x_sorted, W1, W2, group_sizes)
+        out, _, _, _ = _fwd_math(x_sorted, W1, W2, group_sizes)
         return out.astype(x_sorted.dtype)
 
     def _core_fwd(x_sorted, W1, W2, group_sizes):
-        out, h, gelu_vjp = _fwd_math(x_sorted, W1, W2, group_sizes)
-        # group_sizes carried through residuals now (it used to be closed
-        # over via nondiff_argnums and handed to _core_bwd separately).
+        out, h, gelu_vjp, group_sizes = _fwd_math(x_sorted, W1, W2, group_sizes)
         residuals = (x_sorted, W1, W2, group_sizes, h, gelu_vjp)
         return out.astype(x_sorted.dtype), residuals
 
@@ -307,6 +359,18 @@ def _make_grouped_ffn_core(interpret=False):
         x_f = x_sorted.astype(jnp.float32)
         W1_f = W1.astype(jnp.float32)
         W2_f = W2.astype(jnp.float32)
+
+        # ФИКС: probe на ВХОДЯЩИЙ cotangent dout -- если он уже non-finite
+        # ЗДЕСЬ, источник находится ВЫШЕ по графу (не внутри самого MoE
+        # блока), и всё нижеследующее -- уже вторичный эффект.
+        dout_finite = jnp.all(jnp.isfinite(dout))
+        jax.lax.cond(
+            jnp.logical_not(dout_finite),
+            lambda: jax.debug.print(
+                "[MOE-GMM-BWD-DIAG] 🔴 " + diag_tag + ": ВХОДЯЩИЙ dout "
+                "уже non-finite ДО входа в MoE backward -- источник ВЫШЕ по графу"),
+            lambda: None,
+        )
         dout_f = _sanitize(dout.astype(jnp.float32))
 
         T, d_model = x_f.shape
@@ -315,12 +379,24 @@ def _make_grouped_ffn_core(interpret=False):
         dW2 = tgmm(h.T, dout_f, group_sizes,
                    tiling=_auto_tile(d_ff, T, d_model),
                    interpret=interpret, preferred_element_type=jnp.float32)
+        dW2_finite = jnp.all(jnp.isfinite(dW2))
+        jax.lax.cond(
+            jnp.logical_not(dW2_finite),
+            lambda: jax.debug.print("[MOE-GMM-BWD-DIAG] 🔴 " + diag_tag + ": tgmm dW2 non-finite"),
+            lambda: None,
+        )
         dW2 = _sanitize(dW2)
 
         W2_T = jnp.swapaxes(W2_f, 1, 2)
         dh = gmm(dout_f, W2_T, group_sizes,
                  tiling=_auto_tile(T, d_model, d_ff),
                  interpret=interpret, preferred_element_type=jnp.float32)
+        dh_finite = jnp.all(jnp.isfinite(dh))
+        jax.lax.cond(
+            jnp.logical_not(dh_finite),
+            lambda: jax.debug.print("[MOE-GMM-BWD-DIAG] 🔴 " + diag_tag + ": gmm dh non-finite"),
+            lambda: None,
+        )
         dh = _sanitize(dh)
 
         (dh_pre,) = gelu_vjp(dh)
@@ -329,18 +405,26 @@ def _make_grouped_ffn_core(interpret=False):
         dW1 = tgmm(x_f.T, dh_pre, group_sizes,
                    tiling=_auto_tile(d_model, T, d_ff),
                    interpret=interpret, preferred_element_type=jnp.float32)
+        dW1_finite = jnp.all(jnp.isfinite(dW1))
+        jax.lax.cond(
+            jnp.logical_not(dW1_finite),
+            lambda: jax.debug.print("[MOE-GMM-BWD-DIAG] 🔴 " + diag_tag + ": tgmm dW1 non-finite"),
+            lambda: None,
+        )
         dW1 = _sanitize(dW1)
 
         W1_T = jnp.swapaxes(W1_f, 1, 2)
         dx = gmm(dh_pre, W1_T, group_sizes,
                  tiling=_auto_tile(T, d_ff, d_model),
                  interpret=interpret, preferred_element_type=jnp.float32)
+        dx_finite = jnp.all(jnp.isfinite(dx))
+        jax.lax.cond(
+            jnp.logical_not(dx_finite),
+            lambda: jax.debug.print("[MOE-GMM-BWD-DIAG] 🔴 " + diag_tag + ": gmm dx non-finite"),
+            lambda: None,
+        )
         dx = _sanitize(dx)
 
-        # group_sizes is integer-dtyped and carries no gradient -- JAX's
-        # tangent type for an integer leaf is float0, and custom_vjp bwd
-        # must return a value of that dtype/shape for it (not None, not an
-        # int32 zeros array -- both are rejected).
         dgroup_sizes = jnp.zeros(group_sizes.shape, dtype=jax.dtypes.float0)
 
         return (
@@ -352,7 +436,6 @@ def _make_grouped_ffn_core(interpret=False):
 
     _core.defvjp(_core_fwd, _core_bwd)
     return _core
-
 
 class GmmMoEJ(nn.Module):
     """Top-k=2 версия. Каждый токен маршрутизируется к ДВУМ из E_routed
@@ -545,24 +628,19 @@ class GmmMoEJ(nn.Module):
         # concatenate -- используется для обратного split на combine.
         # ==================================================================
         
-        def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
-            T_rep = flat_x_local.shape[0]  # = k * T_local_device
-            group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
-            # ФИКС (диагностика NaN в gmm/tgmm, см. чат): эксперт с
-            # group_sizes==0 -- классический edge-case для grouped-matmul
-            # кернелов. Sow'им min/max по группе, чтобы на инцидентном шаге
-            # видеть, не был ли какой-то эксперт полностью пуст.
-            _min_group_size = jnp.min(group_sizes)
-            _max_group_size = jnp.max(group_sizes)
-            perm = jnp.argsort(expert_idx_local, stable=True)
-            inv_perm = jnp.argsort(perm)
+    def _dispatch_and_ffn(flat_x_local, expert_idx_local, W1_local, W2_local):
+        T_rep = flat_x_local.shape[0]
+        group_sizes = jnp.bincount(expert_idx_local, length=E_routed).astype(jnp.int32)
+        perm = jnp.argsort(expert_idx_local, stable=True)
+        inv_perm = jnp.argsort(perm)
 
-            x_sorted = jnp.take(flat_x_local, perm, axis=0)
-            grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret)
-            out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
+        x_sorted = jnp.take(flat_x_local, perm, axis=0)
+        # ФИКС: diag_tag включает scope-путь (block_N/moe) -- различает,
+        # в каком именно блоке впервые сработал probe.
+        grouped_ffn = _make_grouped_ffn_core(interpret=self.interpret, diag_tag=_moe_tag)
+        out_sorted = grouped_ffn(x_sorted.astype(jnp.bfloat16), W1_local, W2_local, group_sizes)
 
-            return jnp.take(out_sorted, inv_perm, axis=0), _min_group_size, _max_group_size
-
+        return jnp.take(out_sorted, inv_perm, axis=0)
         # flat_x_rep: (k*T, d) -- k конкатенированных копий flat_x, в
         # порядке [копия под top-1-выбор для каждого токена][копия под
         # top-2-выбор для каждого токена]...
