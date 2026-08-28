@@ -697,7 +697,7 @@ class GmmMoEJ(nn.Module):
                )
             self.sow("losses", "moe_min_group_size", jnp.min(_min_gs_all))
             self.sow("losses", "moe_max_group_size", jnp.max(_max_gs_all))
-       else:
+        else:
             routed_out_rep, _moe_min_group, _moe_max_group = _dispatch_and_ffn(flat_x_rep, expert_idx_rep, W1, W2)
             out_chunks = jnp.split(routed_out_rep, k, axis=0)
             routed_out = jnp.zeros_like(flat_x, dtype=jnp.float32)
